@@ -1,0 +1,58 @@
+﻿name: Auto Post to WordPress
+
+on:
+  schedule:
+    - cron: "0 0,12 * * *"   # UTC 00:00, 12:00 → KST 09:00, 21:00
+  workflow_dispatch: {}
+
+concurrency:
+  group: autopost
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create .env from Secrets
+        run: |
+          cat > .env << 'EOF'
+          WP_URL=${{ secrets.WP_URL }}
+          WP_USER=${{ secrets.WP_USER }}
+          WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
+          POST_STATUS=${{ secrets.POST_STATUS }}
+          KEYWORDS_CSV=keywords.csv
+          SCHEDULE_KST_HOUR=9
+          TAGS=${{ secrets.TAGS }}
+          EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
+          ALLOW_CREATE_TERMS=false
+          AD_METHOD=${{ secrets.AD_METHOD }}
+          AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
+          AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
+          NUM_IMAGES=3
+          IMAGE_SIZE=1024x1024
+          IMAGE_QUALITY_WEBP=82
+          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
+          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+          EOF
+
+      - name: Rotate keywords
+        run: python rotate_keywords.py
+
+      - name: Post 1 article
+        run: python auto_wp_gpt.py
