@@ -1,139 +1,178 @@
-# update_keywords.py : 네이버 뉴스 API + NewsAPI.org 기반 키워드 (엔티티/인코딩/바이그램 개선, 2개 저장)
-import os, csv, re, sys, html, unicodedata
+# update_keywords.py
+# 소스: Naver Search API(뉴스), NewsAPI(top-headlines, KR), Google News RSS(KR)
+# 목표: 최소 5~20개 키워드 수집 → 랜덤 섞기 → 첫 줄은 오늘의 랜덤 키워드로 배치 → keywords.csv 생성
+import os, re, csv, io, json, random, time
 import requests
-from collections import Counter
-from dotenv import load_dotenv
+from urllib.parse import quote
+from xml.etree import ElementTree as ET
 
-load_dotenv()
-NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID")
-NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY")
+# ─ env
+KEYWORDS_CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
 
-if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
-    print("[오류] .env에 NAVER_CLIENT_ID, NAVER_CLIENT_SECRET 설정 필요", file=sys.stderr); sys.exit(1)
-if not NEWSAPI_KEY:
-    print("[오류] .env에 NEWSAPI_KEY 설정 필요", file=sys.stderr); sys.exit(1)
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID") or ""
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET") or ""
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY") or ""
 
-STOPWORDS = {
-    # 조사/접속사/보조어
-    "은","는","이","가","을","를","과","와","도","만","로","으로","에서","에게","께","의",
-    "및","등","또","또한","그리고","그러나","하지만","보다","관련","대해","대한","위해",
-    # 흔한 동사/형용사
-    "하다","한다","했다","된다","됐다","있다","없다","이어","로서","였다","됐다",
-    # 보도 관용어/불필요
-    "속보","단독","종합","기자","사진","영상","인터뷰","전문","기사","보도",
-    # 날짜/숫자
-    "오늘","어제","내일","현재","지난","이번","당시","년","월","일","시","분","초",
-    "0","1","2","3","4","5","6","7","8","9",
-    # 너무 일반적인 상위개념
-    "정부","정책","경제","사회","세계","한국","국내","해외","코로나",
-    # 의미 빈약/노이즈
-    "사건","사고","quot","nbsp"
-}
+MIN_COUNT = 5       # 최소 키워드 개수
+MAX_COUNT = 20      # 최대 키워드 개수
 
-def norm(s: str) -> str:
-    if not s: return ""
-    s = html.unescape(s)                         # &quot; 등 엔티티 해제
-    s = unicodedata.normalize("NFC", s)          # 한글 정규화
-    s = re.sub(r"[^가-힣0-9A-Za-z\s]", " ", s)   # 특수문자 제거
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# ─ 유틸
+STOPWORDS = set("""
+단독 속보 이슈 현장 종합 인터뷰 업데이트 기자 사진 영상 포토 단체 공식 발표
+논란 결과 이유 변화 분석 전망 관련 오늘 어제 내일 방금 지금 해당 주요
+""".split())
 
-def tokenize(text: str):
-    toks = []
-    for w in text.split():
-        if len(w) <= 1: continue
-        if re.fullmatch(r"\d+", w): continue
-        lw = w.lower()
-        if lw in STOPWORDS: continue
-        toks.append(lw)
-    return toks
+def clean_title(t: str) -> str:
+    if not t:
+        return ""
+    t = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|〈.*?〉|「.*?」|『.*?』|<.*?>", " ", t)
+    t = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", t)
+    t = re.sub(r"[\"'“”‘’•·…~_=+^#@%&*|/:;]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
-def extract_bigrams(toks):
-    res = []
-    for a,b in zip(toks, toks[1:]):
-        if a in STOPWORDS or b in STOPWORDS: continue
-        if len(a) <= 1 or len(b) <= 1: continue
-        if re.search(r"\d", a+b): continue
-        # 최소 한 글자는 한글 포함(너무 일반 영문 제외)
-        if not (re.search(r"[가-힣]", a) or re.search(r"[가-힣]", b)): 
-            continue
-        res.append(f"{a} {b}")
-    return res
-
-def naver_news_titles(query="이슈", display=50):
-    url = "https://openapi.naver.com/v1/search/news.json"
-    headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
-    params = {"query": query, "display": display, "sort": "sim"}
-    r = requests.get(url, headers=headers, params=params, timeout=15); r.raise_for_status()
-    data = r.json()
-    titles = []
-    for it in data.get("items", []):
-        titles.append(norm(it.get("title","")))
-        titles.append(norm(it.get("description","")))
-    return [t for t in titles if t]
-
-def newsapi_titles(page_size=100):
-    url = "https://newsapi.org/v2/top-headlines"
-    params = {"country":"kr","pageSize":page_size,"apiKey":NEWSAPI_KEY}
-    r = requests.get(url, params=params, timeout=15); r.raise_for_status()
-    data = r.json()
-    titles=[]
-    for art in data.get("articles", []):
-        titles.append(norm(art.get("title","")))
-        titles.append(norm(art.get("description","")))
-    return [t for t in titles if t]
-
-def pick_keywords(titles, want=2):
-    uni, bi = Counter(), Counter()
+def extract_candidates(titles: list[str]) -> list[str]:
+    cands = []
     for t in titles:
-        toks = tokenize(t)
-        if not toks: continue
-        uni.update(toks)
-        bi.update(extract_bigrams(toks))
+        t = clean_title(t)
+        if not t: 
+            continue
+        # 1) 긴 구절 우선: "한글 단어 2~12자" 가 2~4개 이어진 구절을 시도
+        phrases = re.findall(r"(?:[가-힣A-Za-z0-9]{2,12}(?:\s|$)){2,4}", t)
+        for p in phrases:
+            p = p.strip()
+            if 4 <= len(p) <= 28:
+                cands.append(p)
 
-    scored = Counter()
-    for k,c in bi.items(): scored[k] += c*4   # 바이그램 가중치↑
-    for k,c in uni.items(): scored[k] += c
+        # 2) 백업: 개별 단어 기반 2~3어 조합
+        words = [w for w in re.findall(r"[가-힣A-Za-z0-9]{2,}", t) if w not in STOPWORDS]
+        for i in range(len(words)-1):
+            pair = f"{words[i]} {words[i+1]}"
+            if 4 <= len(pair) <= 28:
+                cands.append(pair)
+        for i in range(len(words)-2):
+            tri = f"{words[i]} {words[i+1]} {words[i+2]}"
+            if 6 <= len(tri) <= 32:
+                cands.append(tri)
+    # 정리
+    uniq = []
+    seen = set()
+    for s in cands:
+        s = re.sub(r"\s+", " ", s).strip()
+        if s and s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
 
-    result=[]
-    for term,_ in scored.most_common():
-        if len(term.replace(" ",""))<2: continue
-        # 유니그램이 너무 일반적이면 패스
-        if " " not in term and term in {"정부","정책","경제","사회","세계","한국"}: continue
-        if term in result: continue
-        result.append(term)
-        if len(result)>=want: break
+# ─ 소스 1: Google News RSS (무료, 키 필요 없음)
+def fetch_google_news_titles() -> list[str]:
+    titles = []
+    try:
+        url = "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko"
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for item in root.findall(".//item/title"):
+            titles.append(item.text or "")
+    except Exception as e:
+        print(f"[경고] Google News RSS 실패: {e}")
+    return titles
 
-    # 부족하면 유니그램으로 보충
-    if len(result)<want:
-        for ug,_ in uni.most_common():
-            if ug not in result and ug not in STOPWORDS and len(ug)>1:
-                result.append(ug)
-            if len(result)>=want: break
-    return result
+# ─ 소스 2: NewsAPI (무료 키 필요)
+def fetch_newsapi_titles() -> list[str]:
+    titles = []
+    if not NEWSAPI_KEY:
+        return titles
+    try:
+        url = f"https://newsapi.org/v2/top-headlines?country=kr&pageSize=50&apiKey={NEWSAPI_KEY}"
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        for art in data.get("articles", []):
+            titles.append(art.get("title") or "")
+    except Exception as e:
+        print(f"[경고] NewsAPI 실패: {e}")
+    return titles
+
+# ─ 소스 3: Naver Search API (뉴스) - 넓은 쿼리로 분산 수집
+def fetch_naver_news_titles() -> list[str]:
+    titles = []
+    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET):
+        return titles
+    headers = {
+        "X-Naver-Client-Id": NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
+    }
+    queries = ["속보", "오늘", "현장", "브리핑", "발표", "이슈", "분석"]
+    for q in queries:
+        try:
+            url = f"https://openapi.naver.com/v1/search/news.json?query={quote(q)}&display=30&sort=sim"
+            r = requests.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            for it in data.get("items", []):
+                titles.append(it.get("title") or "")
+            time.sleep(0.2)  # 속도 제한 완화
+        except Exception as e:
+            print(f"[경고] Naver API 실패({q}): {e}")
+    return titles
 
 def main():
-    titles = []
-    try:
-        titles += naver_news_titles("이슈", 70)
-        titles += naver_news_titles("사건", 70)
-    except Exception as e:
-        print("[경고] 네이버 뉴스 수집 실패:", e, file=sys.stderr)
-    try:
-        titles += newsapi_titles(100)
-    except Exception as e:
-        print("[경고] NewsAPI 수집 실패:", e, file=sys.stderr)
+    all_titles = []
+    all_titles += fetch_google_news_titles()
+    all_titles += fetch_newsapi_titles()
+    all_titles += fetch_naver_news_titles()
 
-    hot = pick_keywords(titles, want=2) if titles else []
+    if not all_titles:
+        print("[오류] 어떤 소스에서도 제목을 가져오지 못했습니다.")
+        return
 
-    # ⚠️ Windows에서 한글 깨짐 방지: utf-8-sig(BOM)로 저장
-    with open("keywords.csv","w",newline="",encoding="utf-8-sig") as f:
-        w=csv.writer(f)
-        for kw in hot:
+    cands = extract_candidates(all_titles)
+    random.shuffle(cands)
+    # 한국어 위주 + 길이/중복 필터
+    filtered = []
+    seen = set()
+    for s in cands:
+        if len(s) < 4 or len(s) > 32:
+            continue
+        if not re.search(r"[가-힣]", s):
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        filtered.append(s)
+        if len(filtered) >= MAX_COUNT:
+            break
+
+    # 최저 개수 보장
+    if len(filtered) < MIN_COUNT:
+        # 타이틀 원문에서라도 더 뽑아 보충
+        more = [clean_title(t) for t in all_titles if t]
+        for m in more:
+            if m and m not in seen and 4 <= len(m) <= 40:
+                filtered.append(m)
+                seen.add(m)
+            if len(filtered) >= MIN_COUNT:
+                break
+
+    if not filtered:
+        print("[오류] 키워드 후보를 구성하지 못했습니다.")
+        return
+
+    # 오늘의 랜덤 1개를 맨 위로 (auto_wp_gpt.py는 첫 줄을 사용)
+    random.shuffle(filtered)
+    today = random.choice(filtered)
+    filtered.remove(today)
+    keywords = [today] + filtered
+
+    # 파일 저장 (UTF-8, 개행 고정)
+    with io.open(KEYWORDS_CSV, "w", encoding="utf-8", newline="\n") as f:
+        w = csv.writer(f)
+        for kw in keywords:
             w.writerow([kw])
 
-    print("오늘의 키워드:", hot)
+    print(f"[완료] 키워드 {len(keywords)}개 저장 (첫 줄: '{today}')")
 
 if __name__ == "__main__":
     main()
