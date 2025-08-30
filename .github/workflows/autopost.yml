@@ -2,7 +2,7 @@
 
 on:
   schedule:
-    - cron: "0 0,12 * * *"   # UTC 00:00, 12:00 → KST 09:00, 21:00
+    - cron: "0 1,8 * * *"   # UTC 01:00, 08:00 → KST 10:00, 17:00
   workflow_dispatch: {}
 
 concurrency:
