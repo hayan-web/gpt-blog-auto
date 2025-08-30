@@ -1,4 +1,4 @@
-﻿name: Auto Post to WordPress
+name: Auto Post to WordPress
 
 on:
   schedule:
@@ -51,8 +51,12 @@ jobs:
           NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
           EOF
 
-      - name: Rotate keywords
-        run: python rotate_keywords.py
+      - name: Update keywords (fetch 5~20 and shuffle)
+        run: python update_keywords.py
+
+      # rotate는 랜덤 선정과 충돌할 수 있어 생략 (원하면 유지 가능)
+      # - name: Rotate keywords
+      #   run: python rotate_keywords.py
 
       - name: Post 1 article
         run: python auto_wp_gpt.py
