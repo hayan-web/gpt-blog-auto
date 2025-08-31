@@ -26,7 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ Secrets 필수값 존재 확인 (없으면 바로 실패)
+      # ✅ Secrets 필수값 존재 확인
       - name: Check required secrets
         run: |
           test -n "${{ secrets.WP_URL }}" || (echo "WP_URL missing" && exit 1)
@@ -63,8 +63,31 @@ jobs:
       - name: Update keywords (fetch 5~20 and shuffle)
         run: python update_keywords.py
 
-      - name: Post 1 article
-        run: python auto_wp_gpt.py
+      # 🐞 디버그: auto_wp_gpt.py 파일/환경/실행 확인
+      - name: Show auto_wp_gpt.py head/tail
+        run: |
+          echo "===== head(auto_wp_gpt.py) ====="
+          sed -n '1,80p' auto_wp_gpt.py || true
+          echo "===== tail(auto_wp_gpt.py) ====="
+          tail -n 60 auto_wp_gpt.py || true
+
+      - name: Verbose run auto_wp_gpt.py
+        run: |
+          python - <<'PY'
+          import os, runpy, sys
+          print("[DBG] Python", sys.version)
+          print("[DBG] CWD", os.getcwd())
+          print("[DBG] Env sanity:", {k:bool(os.getenv(k)) for k in ["WP_URL","WP_USER","WP_APP_PASSWORD","OPENAI_API_KEY","OPENAI_MODEL"]})
+          try:
+              runpy.run_path("auto_wp_gpt.py", run_name="__main__")
+              print("[DBG] auto_wp_gpt.py finished with exit 0")
+          except SystemExit as e:
+              print("[DBG] SystemExit:", e.code)
+              raise
+          except Exception as e:
+              print("[DBG] Exception:", repr(e))
+              raise
+          PY
 
       # ✅ (선택) 발행 후 키워드 회전
       - name: Rotate keywords (move used keyword to bottom)
