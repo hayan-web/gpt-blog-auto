@@ -2,7 +2,7 @@ name: Auto Post to WordPress
 
 on:
   schedule:
-    - cron: "0 1,8 * * *"   # 매일 KST 10:00, 17:00 실행 (UTC 01:00, 08:00)
+    - cron: "*/15 * * * *"   # 15분마다 깨어나서 시각 확인 후 필요한 때만 실행
   workflow_dispatch: {}
 
 concurrency:
@@ -12,22 +12,41 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
+      - name: Should run now? (UTC→KST 가드)
+        id: gate
+        shell: bash
+        run: |
+          H=$(date -u +%H)
+          M=$(date -u +%M)
+          # KST=UTC+9 → KST 10:00/17:00 == UTC 01:00/08:00
+          if { [ "$H" = "01" ] || [ "$H" = "08" ]; } && [ "$M" = "00" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Will run (UTC $H:$M, matches KST schedule)"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "⏭️ Skip (UTC $H:$M)"
+          fi
+
       - name: Checkout
+        if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
+        if: steps.gate.outputs.run == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ Secrets 필수값 존재 확인
       - name: Check required secrets
+        if: steps.gate.outputs.run == 'true'
         run: |
           test -n "${{ secrets.WP_URL }}" || (echo "WP_URL missing" && exit 1)
           test -n "${{ secrets.WP_USER }}" || (echo "WP_USER missing" && exit 1)
@@ -36,6 +55,7 @@ jobs:
           test -n "${{ secrets.OPENAI_MODEL }}" || (echo "OPENAI_MODEL missing" && exit 1)
 
       - name: Create .env from Secrets
+        if: steps.gate.outputs.run == 'true'
         run: |
           cat > .env << 'EOF'
           WP_URL=${{ secrets.WP_URL }}
@@ -60,11 +80,12 @@ jobs:
           NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
           EOF
 
-      - name: Update keywords (fetch 5~20 and shuffle)
+      - name: Update keywords
+        if: steps.gate.outputs.run == 'true'
         run: python update_keywords.py
 
-      # 🐞 디버그: auto_wp_gpt.py 파일/환경/실행 확인
       - name: Show auto_wp_gpt.py head/tail
+        if: steps.gate.outputs.run == 'true'
         run: |
           echo "===== head(auto_wp_gpt.py) ====="
           sed -n '1,80p' auto_wp_gpt.py || true
@@ -72,6 +93,7 @@ jobs:
           tail -n 60 auto_wp_gpt.py || true
 
       - name: Verbose run auto_wp_gpt.py
+        if: steps.gate.outputs.run == 'true'
         run: |
           python - <<'PY'
           import os, runpy, sys
@@ -82,13 +104,11 @@ jobs:
               runpy.run_path("auto_wp_gpt.py", run_name="__main__")
               print("[DBG] auto_wp_gpt.py finished with exit 0")
           except SystemExit as e:
-              print("[DBG] SystemExit:", e.code)
-              raise
+              print("[DBG] SystemExit:", e.code); raise
           except Exception as e:
-              print("[DBG] Exception:", repr(e))
-              raise
+              print("[DBG] Exception:", repr(e)); raise
           PY
 
-      # ✅ (선택) 발행 후 키워드 회전
-      - name: Rotate keywords (move used keyword to bottom)
+      - name: Rotate keywords
+        if: steps.gate.outputs.run == 'true'
         run: python rotate_keywords.py
