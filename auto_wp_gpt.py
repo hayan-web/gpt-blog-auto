@@ -1,7 +1,7 @@
 # auto_wp_gpt.py : 글 1개 자동 발행 (디버그 강화판)
 # - 이미지: WebP 우선, 실패 시 PNG 폴백 + MIME 자동
 # - 디버그: 카테고리/태그/미디어/포스트 API 응답 코드·본문 일부 출력
-# - 레이아웃: [광고] → [요약+본문1] → [상단 이미지 2] → <hr> → [중간광고] → [중간 이미지 1] → [본문2]
+# - 레이아웃: [광고] → [요약/본문1] → [상단 이미지 2] → <hr> → [중간광고] → [중간 이미지 1] → [본문2]
 # - 스타일: 글로벌 1회 + 본문 스타일 스니펫 2회
 
 import os, csv, re, io, base64, time, json
@@ -447,6 +447,10 @@ def main():
     plain  = re.sub(r"<[^>]+>", " ", html)
     cat_names = choose_categories(keyword, plain)
     print("[DBG] category guess:", cat_names)
+
+    # ✅ 무조건 '전체글' 포함
+    if "전체글" in EXISTING_CATEGORIES and "전체글" not in cat_names:
+        cat_names.append("전체글")
 
     cat_ids = []
     for name in cat_names:
