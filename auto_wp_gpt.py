@@ -1,7 +1,7 @@
 # auto_wp_gpt.py : 글 1개 자동 발행 (디버그 강화판)
 # - 이미지: WebP 우선, 실패 시 PNG 폴백 + MIME 자동
 # - 디버그: 카테고리/태그/미디어/포스트 API 응답 코드·본문 일부 출력
-# - 레이아웃: [광고] → [요약/본문1] → [상단 이미지 2] → <hr> → [중간광고] → [중간 이미지 1] → [본문2]
+# - 레이아웃: [광고] → [요약/본문1] → [상단 이미지 2] → <hr> → [중간광고] → [본문2]
 # - 스타일: 글로벌 1회 + 본문 스타일 스니펫 2회
 
 import os, csv, re, io, base64, time, json
@@ -41,8 +41,8 @@ AD_HTML         = os.getenv("AD_HTML", "").encode("utf-8", "ignore").decode("utf
 AD_HTML_FILE    = os.getenv("AD_HTML_FILE", "").strip()
 AD_INSERT_MIDDLE= os.getenv("AD_INSERT_MIDDLE", "true").lower()=="true"  # 중간 광고 삽입 여부
 
-# ── 이미지 옵션 (3장 고정) ──────────────────────────────
-NUM_IMAGES      = 3
+# ── 이미지 옵션 (2장 고정) ──────────────────────────────
+NUM_IMAGES      = 2
 IMAGE_SIZE      = os.getenv("IMAGE_SIZE", "1024x1024")
 IMAGE_QUALITY_WEBP  = int(os.getenv("IMAGE_QUALITY_WEBP","82"))
 IMAGE_PROMPT_STYLE  = "중립적 다큐 사진, 자연스러운 색감, 텍스트/워터마크 없음, 과도한 인물 클로즈업 피함, 폭력/성적/범죄/정치 선동 배제"
@@ -342,11 +342,11 @@ def assemble_post(title:str, body1_html:str, body2_html:str, figures_top:list[st
     parts.append(ad_top)
     parts.append(body1_html)
     parts.append(mod_a)
-    if figures_top: parts.append("\n".join(figures_top))
+    if figures_top: parts.append("\n".join(figures_top))  # 상단 이미지 2장
     parts.append("<hr class='soft'>")
     if AD_INSERT_MIDDLE:
         parts.append(load_ad_block())
-    if figures_mid: parts.append("\n".join(figures_mid))
+    # 2장 고정: figures_mid는 사용하지 않음
     parts.append(mod_b)
     parts.append(body2_html)
     html = "\n".join(parts)
@@ -440,7 +440,7 @@ def main():
             figures.append(placeholder_figure("이미지 준비 중"))
 
     featured_id = next((m for m in media_ids if m), None)
-    figures_top, figures_mid = figures[:2], figures[2:3]  # 총 3장
+    figures_top, figures_mid = figures[:2], []  # 2장 고정: 상단 2장, 중간 0장
 
     html   = assemble_post(title, body1, body2, figures_top, figures_mid, keyword)
 
@@ -448,7 +448,7 @@ def main():
     cat_names = choose_categories(keyword, plain)
     print("[DBG] category guess:", cat_names)
 
-    # ✅ 무조건 '전체글' 포함
+    # 항상 '전체글' 포함
     if "전체글" in EXISTING_CATEGORIES and "전체글" not in cat_names:
         cat_names.append("전체글")
 
