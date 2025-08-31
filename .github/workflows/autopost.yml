@@ -2,7 +2,7 @@ name: Auto Post to WordPress
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # 10분마다 실행 (임시 진단용)
+    - cron: "0 1,8 * * *"   # 매일 KST 10:00, 17:00 실행 (UTC 01:00, 08:00)
   workflow_dispatch: {}
 
 concurrency:
@@ -25,6 +25,15 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # ✅ Secrets 필수값 존재 확인 (없으면 바로 실패)
+      - name: Check required secrets
+        run: |
+          test -n "${{ secrets.WP_URL }}" || (echo "WP_URL missing" && exit 1)
+          test -n "${{ secrets.WP_USER }}" || (echo "WP_USER missing" && exit 1)
+          test -n "${{ secrets.WP_APP_PASSWORD }}" || (echo "WP_APP_PASSWORD missing" && exit 1)
+          test -n "${{ secrets.OPENAI_API_KEY }}" || (echo "OPENAI_API_KEY missing" && exit 1)
+          test -n "${{ secrets.OPENAI_MODEL }}" || (echo "OPENAI_MODEL missing" && exit 1)
 
       - name: Create .env from Secrets
         run: |
@@ -54,9 +63,9 @@ jobs:
       - name: Update keywords (fetch 5~20 and shuffle)
         run: python update_keywords.py
 
-      # rotate는 랜덤 선정과 충돌할 수 있어 생략 (원하면 유지 가능)
-      # - name: Rotate keywords
-      #   run: python rotate_keywords.py
-
       - name: Post 1 article
         run: python auto_wp_gpt.py
+
+      # ✅ (선택) 발행 후 키워드 회전
+      - name: Rotate keywords (move used keyword to bottom)
+        run: python rotate_keywords.py
