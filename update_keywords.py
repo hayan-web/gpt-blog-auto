@@ -1,6 +1,7 @@
 # update_keywords.py
 # 소스: Naver Search API(뉴스), NewsAPI(top-headlines, KR), Google News RSS(KR)
 # 목표: 최소 5~20개 키워드 수집 → 랜덤 섞기 → 첫 줄은 오늘의 랜덤 키워드로 배치 → keywords.csv 생성
+
 import os, re, csv, io, json, random, time
 import requests
 from urllib.parse import quote
@@ -15,6 +16,21 @@ NEWSAPI_KEY = os.getenv("NEWSAPI_KEY") or ""
 
 MIN_COUNT = 5       # 최소 키워드 개수
 MAX_COUNT = 20      # 최대 키워드 개수
+
+# ─ 금칙어 / 안전보충 키워드
+BLOCK_WORDS = {
+    # 민감/정책 리스크/저품질 키워드 (필요시 자유롭게 추가/수정)
+    "성관계","포르노","야동","불법촬영","음란","노골","강간","몰카",
+    "혐오","증오","폭력","자해","테러","마약","총기","선동","가짜뉴스"
+}
+SAFE_FALLBACKS = [
+    "오늘의 이슈", "실생활 가이드", "트렌드 한눈에",
+    "초보자용 핵심정리", "알쓸정보 톡톡", "생활 팁 모음"
+]
+
+def _is_allowed(kw: str) -> bool:
+    t = (kw or "").lower()
+    return not any(b in t for b in BLOCK_WORDS)
 
 # ─ 유틸
 STOPWORDS = set("""
@@ -35,9 +51,9 @@ def extract_candidates(titles: list[str]) -> list[str]:
     cands = []
     for t in titles:
         t = clean_title(t)
-        if not t: 
+        if not t:
             continue
-        # 1) 긴 구절 우선: "한글 단어 2~12자" 가 2~4개 이어진 구절을 시도
+        # 1) 긴 구절 우선: "한글/영문/숫자 2~12자"가 2~4개 이어진 구절
         phrases = re.findall(r"(?:[가-힣A-Za-z0-9]{2,12}(?:\s|$)){2,4}", t)
         for p in phrases:
             p = p.strip()
@@ -55,8 +71,7 @@ def extract_candidates(titles: list[str]) -> list[str]:
             if 6 <= len(tri) <= 32:
                 cands.append(tri)
     # 정리
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for s in cands:
         s = re.sub(r"\s+", " ", s).strip()
         if s and s not in seen:
@@ -94,7 +109,7 @@ def fetch_newsapi_titles() -> list[str]:
         print(f"[경고] NewsAPI 실패: {e}")
     return titles
 
-# ─ 소스 3: Naver Search API (뉴스) - 넓은 쿼리로 분산 수집
+# ─ 소스 3: Naver Search API (뉴스)
 def fetch_naver_news_titles() -> list[str]:
     titles = []
     if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET):
@@ -118,7 +133,7 @@ def fetch_naver_news_titles() -> list[str]:
     return titles
 
 def main():
-    all_titles = []
+    all_titles: list[str] = []
     all_titles += fetch_google_news_titles()
     all_titles += fetch_newsapi_titles()
     all_titles += fetch_naver_news_titles()
@@ -129,13 +144,16 @@ def main():
 
     cands = extract_candidates(all_titles)
     random.shuffle(cands)
+
     # 한국어 위주 + 길이/중복 필터
-    filtered = []
+    filtered: list[str] = []
     seen = set()
     for s in cands:
         if len(s) < 4 or len(s) > 32:
             continue
         if not re.search(r"[가-힣]", s):
+            continue
+        if not _is_allowed(s):
             continue
         key = s.lower()
         if key in seen:
@@ -145,16 +163,12 @@ def main():
         if len(filtered) >= MAX_COUNT:
             break
 
-    # 최저 개수 보장
-    if len(filtered) < MIN_COUNT:
-        # 타이틀 원문에서라도 더 뽑아 보충
-        more = [clean_title(t) for t in all_titles if t]
-        for m in more:
-            if m and m not in seen and 4 <= len(m) <= 40:
-                filtered.append(m)
-                seen.add(m)
-            if len(filtered) >= MIN_COUNT:
-                break
+    # 최저 개수 보장 (모자라면 안전 키워드로 보충)
+    while len(filtered) < MIN_COUNT:
+        pick = random.choice(SAFE_FALLBACKS)
+        if pick.lower() not in seen:
+            filtered.append(pick)
+            seen.add(pick.lower())
 
     if not filtered:
         print("[오류] 키워드 후보를 구성하지 못했습니다.")
@@ -166,7 +180,7 @@ def main():
     filtered.remove(today)
     keywords = [today] + filtered
 
-    # 파일 저장 (UTF-8, 개행 고정)
+    # 파일 저장 (UTF-8, 개행 고정, BOM 없음)
     with io.open(KEYWORDS_CSV, "w", encoding="utf-8", newline="\n") as f:
         w = csv.writer(f)
         for kw in keywords:
