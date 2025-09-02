@@ -1,7 +1,7 @@
-# auto_wp_gpt.py : 글 1개 자동 발행 (다음날 자동 이월 스케줄링)
+# auto_wp_gpt.py : 글 1개 자동 발행 (다음날 자동 이월 스케줄링 + UI 패치)
 # - [예약:HOUR] 마커 유지(워크플로 Guard와 호환)
-# - 당일 해당 회차 예약이 이미 있으면 자동으로 **내일** 같은 회차로 예약
-# - 오늘/내일 둘 다 이미 있으면 스킵
+# - 오늘 해당 회차 예약이 있으면 **내일 같은 회차**로 자동 이월, 오늘/내일 모두 있으면 스킵
+# - 소제목 스타일 단일화(H2/H3), 본문 CSS 유틸 강화, 이미지 캡션 제거
 # - 이미지: WebP 우선, 실패 시 PNG 폴백 + MIME 자동
 # - 디버그 로그 강화
 
@@ -56,41 +56,74 @@ IMAGE_PROMPT_STYLE  = "중립적 다큐 사진, 자연스러운 색감, 텍스�
 # ── 글로벌 스타일(CSS) ──────────────────────────────────
 STYLE_GLOBAL = """
 <style>
-.post-body{line-height:1.85;font-size:17px;color:#222}
+/* ===== Typography & Layout ===== */
+.post-body{line-height:1.85;font-size:17px;color:#1f2937;word-break:keep-all}
 .post-body h1{font-size:28px;margin:0 0 16px}
-.post-body h2{font-size:22px;margin:24px 0 12px}
-.post-body h3{font-size:20px;margin:18px 0 8px}
+.post-body h2,.post-body h3{margin:22px 0 12px}
 .post-body p{margin:0 0 14px}
-.post-body hr.soft{border:0;border-top:1px solid #eee;margin:22px 0}
-.post-body .summary{background:#f8fafc;border-left:4px solid #3b82f6;padding:14px 16px;border-radius:10px;margin:16px 0}
-.post-body .ad{margin:18px 0}
+.post-body hr.soft{border:0;border-top:1px solid #e5e7eb;margin:22px 0}
+
+/* ===== Unified Headings (단일 스타일) ===== */
+.h2-unified{display:inline-block;padding-bottom:8px;border-bottom:3px solid #6366f1}
+.h3-unified{padding-left:12px;border-left:4px solid #22c55e}
+
+/* ===== Figures & Tables ===== */
 .post-body figure{margin:16px 0;text-align:center}
 .post-body figure img{max-width:100%;height:auto;border-radius:12px;border:1px solid #e5e7eb}
-.post-body figure figcaption{color:#6b7280;font-size:14px;margin-top:6px}
-.post-body table{width:100%;border-collapse:collapse;margin:14px 0;border:1px solid #e5e7eb}
+.post-body figure figcaption{display:none !important} /* 과거 글 캡션도 숨김 */
+.post-body table{width:100%;border-collapse:collapse;margin:16px 0;border:1px solid #e5e7eb}
 .post-body thead th{background:#f8fafc;font-weight:700}
-.post-body td, .post-body th{padding:10px;border:1px solid #e5e7eb;text-align:left}
+.post-body td,.post-body th{padding:10px;border:1px solid #e5e7eb;text-align:left}
+.post-body table.zebra tbody tr:nth-child(odd){background:#fafafa}
+
+/* ===== Lists & Blockquotes ===== */
+.post-body ul{margin:12px 0 12px 20px}
+.post-body ol{margin:12px 0 12px 22px}
+.post-body li{margin:6px 0}
+.post-body blockquote{
+  margin:16px 0;padding:14px 16px;border-left:4px solid #9ca3af;
+  background:#f8fafc;border-radius:10px;color:#374151
+}
+
+/* ===== Emphasis & Code ===== */
+.post-body .lead{font-size:18px;color:#111827}
+.post-body .muted{color:#6b7280}
+.post-body .kbd{font-family:ui-monospace,monospace;border:1px solid #e5e7eb;border-bottom-width:2px;border-radius:6px;padding:2px 6px;background:#f8fafc}
+.post-body code{font-family:ui-monospace,monospace;background:#f3f4f6;padding:2px 6px;border-radius:6px}
+.post-body pre{overflow:auto;background:#0b1020;color:#e5e7eb;padding:12px 14px;border-radius:12px}
+.post-body mark{background:#fef08a;padding:0 4px;border-radius:4px}
+
+/* ===== Cards & Grid ===== */
+.post-body .card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;padding:16px;box-shadow:0 4px 10px rgba(2,6,23,.04);margin:14px 0}
+.post-body .grid{display:grid;gap:12px}
+.post-body .grid.cols-2{grid-template-columns:repeat(2,1fr)}
+.post-body .grid.cols-3{grid-template-columns:repeat(3,1fr)}
+@media(max-width:720px){.post-body .grid.cols-2,.post-body .grid.cols-3{grid-template-columns:1fr}}
+
+/* ===== Buttons & Links ===== */
+.post-body .btn{display:inline-block;padding:10px 14px;border-radius:10px;border:1px solid #e5e7eb;background:#f8fafc}
+.post-body .btn.primary{background:#4f46e5;color:#fff;border-color:#4338ca}
+.post-body a{color:#2563eb;text-decoration:none}
+.post-body a:hover{text-decoration:underline}
+
+/* ===== Summary & Ads ===== */
+.post-body .summary{background:#f8fafc;border-left:4px solid #3b82f6;padding:14px 16px;border-radius:10px;margin:16px 0}
+.post-body .ad{margin:18px 0}
+
+/* ===== Placeholder ===== */
 .placeholder{height:180px;border-radius:12px;background:linear-gradient(135deg,#f1f5f9,#e2e8f0);border:1px dashed #cbd5e1;display:flex;align-items:center;justify-content:center;color:#475569}
 
-/* H2/H3 장식 */
-.h2-pill{display:inline-block;padding:8px 14px;border-radius:999px;background:#eef2ff;color:#3730a3}
-.h2-underline{display:inline-block;padding-bottom:6px;border-bottom:4px solid #a78bfa}
-.h2-box{display:inline-block;background:#fff7ed;color:#9a3412;border:1px solid #fed7aa;padding:8px 12px;border-radius:10px}
-.h3-badge{display:inline-block;background:#ede7f6;color:#4527a0;padding:8px 12px;border-radius:999px}
-.h3-leftbar{padding-left:12px;border-left:4px solid #14b8a6}
-.h3-underline{display:inline-block;border-bottom:3px solid #60a5fa;padding-bottom:4px}
-.h3-chip{display:inline-block;padding:6px 10px;border-radius:999px;background:#e2e8f0;color:#111827}
-.h3-shadow{display:inline-block;padding:6px 12px;border-radius:10px;background:#ffffff;box-shadow:0 6px 16px rgba(0,0,0,0.06)}
+/* ===== Mobile ===== */
 @media (max-width:640px){ .post-body{font-size:16px} .post-body h1{font-size:24px} }
 </style>
 """.strip()
 
-# ── 본문 내 스타일 스니펫 ───────────────────────────────
+# ── 본문 내 스타일 스니펫(톤 정리) ─────────────────────
 STYLE_VARIANT_A = """
 <style>
 .callout-a{background:#eef2ff;border-left:5px solid #6366f1;padding:14px 16px;border-radius:12px;margin:18px 0}
-.stat-card{display:flex;gap:12px;align-items:center;background:#f8fafc;border:1px solid #e5e7eb;padding:14px;border-radius:12px}
-.stat-card .dot{width:10px;height:10px;border-radius:50%;background:#22c55e}
+.stat-card{display:flex;gap:12px;align-items:center;background:#ffffff;border:1px solid #e5e7eb;padding:14px;border-radius:12px;box-shadow:0 4px 10px rgba(2,6,23,.04)}
+.stat-card .dot{width:10px;height:10px;border-radius:50%;background:#22c55e;margin-top:2px}
 .timeline{position:relative;margin:18px 0 6px 0;padding-left:14px}
 .timeline::before{content:"";position:absolute;left:6px;top:0;bottom:0;width:2px;background:#e2e8f0}
 .timeline .t-item{position:relative;margin:10px 0 10px 10px}
@@ -102,7 +135,7 @@ STYLE_VARIANT_B = """
 <style>
 .tip-box{background:#ecfeff;border:1px solid #bae6fd;color:#0c4a6e;padding:14px;border-radius:12px;margin:18px 0}
 .quote-box{background:#fff7ed;border-left:5px solid #f59e0b;padding:14px;border-radius:12px;margin:18px 0}
-.key-card{background:#f1f5f9;border:1px solid #e2e8f0;border-radius:12px;padding:16px}
+.key-card{background:#ffffff;border:1px solid #e2e7f0;border-radius:12px;padding:16px;box-shadow:0 4px 10px rgba(2,6,23,.04)}
 </style>
 """.strip()
 
@@ -161,7 +194,7 @@ def choose_categories(keyword: str, plain_text: str) -> list[str]:
     if not cats: cats = ["정보"]
     return [c for c in cats if c in EXISTING_CATEGORIES] or (["전체글"] if "전체글" in EXISTING_CATEGORIES else ["정보"])
 
-# ── OpenAI: 제목/본문/이미지 ───────────────────────────
+# ── OpenAI: 제목/본문 ─────────────────────────────────
 TITLE_GUIDE = """
 한국어 블로그 H1 제목 한 줄만 출력하세요.
 [조건] 22~28자, 키워드와 강한 연관(가능하면 포함), 과장/낚시 금지, 자연스러운 말투, 따옴표·괄호·이모지 금지
@@ -223,7 +256,7 @@ def gen_body2(keyword: str, title: str) -> str:
     return tidy_text(r.choices[0].message.content or "")
 
 def gen_image_captions(keyword:str, title:str, n:int) -> list[str]:
-    print("[4/10] 이미지 캡션 생성…")
+    print("[4/10] 이미지 캡션(설명 텍스트) 생성…")
     r = client.chat.completions.create(model=MODEL, messages=[{"role":"user","content": IMG_PROMPT_GUIDE + f"\n제목:{title}\n키워드:{keyword}\n개수:{n}"}])
     txt = (r.choices[0].message.content or "").strip()
     try:
@@ -242,6 +275,7 @@ def openai_generate_image_bytes(prompt:str, safe_retry=False) -> bytes:
     return base64.b64decode(b64)
 
 def encode_image_bytes(image_bytes: bytes, quality:int=82) -> tuple[bytes, str]:
+    """WebP 저장 시도 → 실패하면 PNG 폴백. (bytes, ext) 반환"""
     im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     try:
         buf = io.BytesIO()
@@ -276,12 +310,81 @@ def wp_upload_media(filename:str, image_bytes:bytes, alt_text:str) -> dict:
         print(f"[DBG] Media alt update skip: {e}")
     return media
 
-def build_img_figure(src:str, alt:str, cap:str=""):
-    cap_html = f"<figcaption>{cap}</figcaption>" if cap else ""
-    return f'<figure><img loading="lazy" decoding="async" src="{src}" alt="{alt}">{cap_html}</figure>'
+# ⬇︎ 캡션 없는 그림만 출력
+def build_img_figure(src:str, alt:str):
+    return f'<figure><img loading="lazy" decoding="async" src="{src}" alt="{alt}"></figure>'
 
 def placeholder_figure(text:str):
     return f'<div class="placeholder">{text}</div>'
+
+# ── 광고 블록 로더 ─────────────────────────────────────
+def load_ad_block() -> str:
+    if AD_METHOD == "shortcode" and AD_SHORTCODE:
+        return f'<div class="ad">{AD_SHORTCODE}</div>'
+    if AD_METHOD == "raw":
+        if AD_HTML_FILE and os.path.exists(AD_HTML_FILE):
+            try:
+                with open(AD_HTML_FILE, "r", encoding="utf-8") as f:
+                    return f'<div class="ad">{f.read()}</div>'
+            except Exception as e:
+                print("[DBG] AD_HTML_FILE read fail:", e)
+        if AD_HTML:
+            raw = AD_HTML.replace("\\n", "\n")
+            return f'<div class="ad">{raw}</div>'
+    return '<div class="ad"><!-- 광고 영역 --></div>'
+
+# ── 소제목 스타일 “단일화” 주입 ─────────────────────────
+def _inject_class(tag_open:str, cls:str) -> str:
+    if re.search(r'class\s*=\s*"', tag_open, flags=re.IGNORECASE):
+        return re.sub(r'(class\s*=\s*")', r'\1'+cls+' ', tag_open, count=1, flags=re.IGNORECASE)
+    return re.sub(r"(<h[23])", r'\1 class="'+cls+'"', tag_open, count=1, flags=re.IGNORECASE)
+
+def stylize_headings(html:str)->str:
+    # H2 → .h2-unified, H3 → .h3-unified
+    html = re.sub(r"<h2[^>]*>", lambda m: _inject_class(m.group(0), "h2-unified"), html, flags=re.IGNORECASE)
+    html = re.sub(r"<h3[^>]*>", lambda m: _inject_class(m.group(0), "h3-unified"), html, flags=re.IGNORECASE)
+    return html
+
+# ── 본문용 리치 모듈 ───────────────────────────────────
+def rich_modules(title:str, keyword:str) -> tuple[str,str]:
+    mod_a = f'''
+{STYLE_VARIANT_A}
+<div class="callout-a"><p>핵심: "{keyword}" 주제를 일상에 적용하려면 오늘 하나만 바꿔도 충분합니다. 작게 시작해도 꾸준하면 커집니다.</p></div>
+<div class="stat-card"><span class="dot"></span><div><p>집중 포인트: 환경 정리 → 루틴 고정 → 방해요인 차단</p></div></div>
+<div class="timeline">
+  <div class="t-item"><span class="dot"></span><div class="t-body"><p>Step 1: 오늘 책상 위 3가지만 남겨두기</p></div></div>
+  <div class="t-item"><span class="dot"></span><div class="t-body"><p>Step 2: 자주 쓰는 도구는 한 팔 내로 배치</p></div></div>
+  <div class="t-item"><span class="dot"></span><div class="t-body"><p>Step 3: 끝나면 2분 정리, 사진으로 상태 기록</p></div></div>
+</div>
+'''.strip()
+
+    mod_b = f'''
+{STYLE_VARIANT_B}
+<div class="tip-box"><p>작은 팁: 타이머 25분에 알림을 맞추고, 끝나면 자리에서 꼭 일어나 스트레칭하세요. 리셋이 집중을 지켜줍니다.</p></div>
+<div class="quote-box"><p>"꾸준함은 의지보다 시스템에서 나온다."</p></div>
+<div class="key-card"><p>정리: 제목 "{title}" 에서 말하는 핵심은 '꾸준히 유지 가능한 구조'입니다. 과하지 않게, 그러나 매일.</p></div>
+'''.strip()
+    return mod_a, mod_b
+
+# ── 레이아웃 조립 ─────────────────────────────────────
+def assemble_post(title:str, body1_html:str, body2_html:str, figures_top:list[str], figures_mid:list[str], keyword:str) -> str:
+    ad_top = load_ad_block()
+    mod_a, mod_b = rich_modules(title, keyword)
+    parts = []
+    parts.append(f"<h1>{title}</h1>")
+    parts.append(ad_top)
+    parts.append(body1_html)
+    parts.append(mod_a)
+    if figures_top: parts.append("\n".join(figures_top))  # 상단 이미지 2장
+    parts.append("<hr class='soft'>")
+    if AD_INSERT_MIDDLE:
+        parts.append(load_ad_block())
+    parts.append(mod_b)
+    parts.append(body2_html)
+    html = "\n".join(parts)
+    html = re.sub(r"<hr\s*/?>", '<hr class="soft">', html, flags=re.IGNORECASE)
+    html = stylize_headings(html)
+    return STYLE_GLOBAL + f'\n<div class="post-body">\n{html}\n</div>'
 
 # ── WP 용어(term) 유틸 ─────────────────────────────────
 def wp_search_terms(kind:str, search:str):
@@ -417,7 +520,8 @@ def main():
             fn = safe_ascii_filename(title, idx, ext=ext)
             media = wp_upload_media(fn, enc, alt_text=f"{title} - {cap}")
             media_ids.append(media.get("id"))
-            figures.append(build_img_figure(media.get("source_url",""), f"{title} - {cap}", cap))
+            # ⬇︎ 캡션 없이 그림만
+            figures.append(build_img_figure(media.get("source_url",""), f"{title} - {cap}"))
         except Exception as e:
             print(f"[경고] 이미지 {idx} 실패: {e}")
             figures.append(placeholder_figure("이미지 준비 중"))
