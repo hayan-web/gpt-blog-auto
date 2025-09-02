@@ -1,13 +1,12 @@
-# auto_wp_gpt.py : 글 1개 자동 발행 (디버그 강화판 + 중복 예약 가드)
-# - [예약:HOUR] 마커 자동 삽입(워크플로 Guard와 호환)
-# - 스크립트 선행 가드: 오늘 해당 시간대 예약글 존재 시 즉시 종료
+# auto_wp_gpt.py : 글 1개 자동 발행 (다음날 자동 이월 스케줄링)
+# - [예약:HOUR] 마커 유지(워크플로 Guard와 호환)
+# - 당일 해당 회차 예약이 이미 있으면 자동으로 **내일** 같은 회차로 예약
+# - 오늘/내일 둘 다 이미 있으면 스킵
 # - 이미지: WebP 우선, 실패 시 PNG 폴백 + MIME 자동
-# - 디버그: 카테고리/태그/미디어/포스트 API 응답 코드·본문 일부 출력
-# - 레이아웃: [광고] → [요약/본문1] → [상단 이미지 2] → <hr> → [중간광고] → [본문2]
-# - 스타일: 글로벌 1회 + 본문 스타일 스니펫 2회
+# - 디버그 로그 강화
 
 import os, csv, re, io, base64, time, json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 from PIL import Image
 import requests
@@ -32,6 +31,8 @@ auth   = HTTPBasicAuth(WP_USER, WP_APP_PASSWORD)
 # ── 게시/분류/키워드 ─────────────────────────────────────
 POST_STATUS       = os.getenv("POST_STATUS", "future")   # publish | draft | future
 SCHEDULE_KST_HOUR = int(os.getenv("SCHEDULE_KST_HOUR", "10"))
+# (선택) Guard 단계에서 계산해 넣어줄 수 있음. 없으면 스크립트가 자동 판단.
+SCHEDULE_SHIFT_DAYS_ENV = os.getenv("SCHEDULE_SHIFT_DAYS")
 KEYWORDS_CSV      = os.getenv("KEYWORDS_CSV","keywords.csv")
 EXISTING_CATEGORIES = [s.strip() for s in os.getenv(
     "EXISTING_CATEGORIES", "뉴스,비공개,쇼핑,전체글,게시글,정보,취미"
@@ -160,7 +161,7 @@ def choose_categories(keyword: str, plain_text: str) -> list[str]:
     if not cats: cats = ["정보"]
     return [c for c in cats if c in EXISTING_CATEGORIES] or (["전체글"] if "전체글" in EXISTING_CATEGORIES else ["정보"])
 
-# ── OpenAI: 제목/본문 ─────────────────────────────────
+# ── OpenAI: 제목/본문/이미지 ───────────────────────────
 TITLE_GUIDE = """
 한국어 블로그 H1 제목 한 줄만 출력하세요.
 [조건] 22~28자, 키워드와 강한 연관(가능하면 포함), 과장/낚시 금지, 자연스러운 말투, 따옴표·괄호·이모지 금지
@@ -207,7 +208,6 @@ def gen_title(keyword: str, hour: str) -> str:
     title = re.sub(r"\s+", " ", title).strip()
     if len(title) < 20:
         title = f"{keyword} 핵심정리와 실전 가이드"
-    # ✅ 워크플로 Guard와 일치하는 마커를 제목 앞에 부착
     return f"[예약:{hour}] {title[:30]}"
 
 def gen_body1(keyword: str, title: str) -> str:
@@ -242,7 +242,6 @@ def openai_generate_image_bytes(prompt:str, safe_retry=False) -> bytes:
     return base64.b64decode(b64)
 
 def encode_image_bytes(image_bytes: bytes, quality:int=82) -> tuple[bytes, str]:
-    """WebP 저장 시도 → 실패하면 PNG 폴백. (bytes, ext) 반환"""
     im = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     try:
         buf = io.BytesIO()
@@ -284,88 +283,6 @@ def build_img_figure(src:str, alt:str, cap:str=""):
 def placeholder_figure(text:str):
     return f'<div class="placeholder">{text}</div>'
 
-# ── 광고 블록 로더 ─────────────────────────────────────
-def load_ad_block() -> str:
-    if AD_METHOD == "shortcode" and AD_SHORTCODE:
-        return f'<div class="ad">{AD_SHORTCODE}</div>'
-    if AD_METHOD == "raw":
-        if AD_HTML_FILE and os.path.exists(AD_HTML_FILE):
-            try:
-                with open(AD_HTML_FILE, "r", encoding="utf-8") as f:
-                    return f'<div class="ad">{f.read()}</div>'
-            except Exception as e:
-                print("[DBG] AD_HTML_FILE read fail:", e)
-        if AD_HTML:
-            raw = AD_HTML.replace("\\n", "\n")
-            return f'<div class="ad">{raw}</div>'
-    return '<div class="ad"><!-- 광고 영역 --></div>'
-
-# ── 소제목 스타일 주입 ─────────────────────────────────
-def _inject_class(tag_open:str, cls:str) -> str:
-    if re.search(r'class\s*=\s*"', tag_open, flags=re.IGNORECASE):
-        return re.sub(r'(class\s*=\s*")', r'\1'+cls+' ', tag_open, count=1, flags=re.IGNORECASE)
-    return re.sub(r"(<h[23])", r'\1 class="'+cls+'"', tag_open, count=1, flags=re.IGNORECASE)
-
-def stylize_headings(html:str)->str:
-    h2_classes = ["h2-pill","h2-underline","h2-box"]
-    h3_classes = ["h3-badge","h3-leftbar","h3-underline","h3-chip","h3-shadow"]
-    i2=0
-    def r2(m):
-        nonlocal i2
-        cls = h2_classes[i2] if i2 < len(h2_classes) else h2_classes[-1]; i2+=1
-        return _inject_class(m.group(0), cls)
-    html = re.sub(r"<h2[^>]*>", r2, html, count=3, flags=re.IGNORECASE)
-
-    i3=0
-    def r3(m):
-        nonlocal i3
-        cls = h3_classes[i3 % len(h3_classes)]; i3+=1
-        return _inject_class(m.group(0), cls)
-    html = re.sub(r"<h3[^>]*>", r3, html, flags=re.IGNORECASE)
-    return html
-
-# ── 본문용 리치 모듈 ───────────────────────────────────
-def rich_modules(title:str, keyword:str) -> tuple[str,str]:
-    mod_a = f'''
-{STYLE_VARIANT_A}
-<div class="callout-a"><p>핵심: "{keyword}" 주제를 일상에 적용하려면 오늘 하나만 바꿔도 충분합니다. 작게 시작해도 꾸준하면 커집니다.</p></div>
-<div class="stat-card"><span class="dot"></span><div><p>집중 포인트: 환경 정리 → 루틴 고정 → 방해요인 차단</p></div></div>
-<div class="timeline">
-  <div class="t-item"><span class="dot"></span><div class="t-body"><p>Step 1: 오늘 책상 위 3가지만 남겨두기</p></div></div>
-  <div class="t-item"><span class="dot"></span><div class="t-body"><p>Step 2: 자주 쓰는 도구는 한 팔 내로 배치</p></div></div>
-  <div class="t-item"><span class="dot"></span><div class="t-body"><p>Step 3: 끝나면 2분 정리, 사진으로 상태 기록</p></div></div>
-</div>
-'''.strip()
-
-    mod_b = f'''
-{STYLE_VARIANT_B}
-<div class="tip-box"><p>작은 팁: 타이머 25분에 알림을 맞추고, 끝나면 자리에서 꼭 일어나 스트레칭하세요. 리셋이 집중을 지켜줍니다.</p></div>
-<div class="quote-box"><p>"꾸준함은 의지보다 시스템에서 나온다."</p></div>
-<div class="key-card"><p>정리: 제목 "{title}" 에서 말하는 핵심은 '꾸준히 유지 가능한 구조'입니다. 과하지 않게, 그러나 매일.</p></div>
-'''.strip()
-    return mod_a, mod_b
-
-# ── 레이아웃 조립 ─────────────────────────────────────
-def assemble_post(title:str, body1_html:str, body2_html:str, figures_top:list[str], figures_mid:list[str], keyword:str) -> str:
-    ad_top = load_ad_block()
-    mod_a, mod_b = rich_modules(title, keyword)
-    parts = []
-    parts.append(f"<h1>{title}</h1>")
-    parts.append(ad_top)
-    parts.append(body1_html)
-    parts.append(mod_a)
-    if figures_top: parts.append("\n".join(figures_top))  # 상단 이미지 2장
-    parts.append("<hr class='soft'>")
-    if AD_INSERT_MIDDLE:
-        parts.append(load_ad_block())
-    # 2장 고정: figures_mid는 사용하지 않음
-    parts.append(mod_b)
-    parts.append(body2_html)
-    html = "\n".join(parts)
-    html = re.sub(r"<hr\s*/?>", '<hr class="soft">', html, flags=re.IGNORECASE)
-    html = stylize_headings(html)
-    return STYLE_GLOBAL + f'\n<div class="post-body">\n{html}\n</div>'
-
 # ── WP 용어(term) 유틸 ─────────────────────────────────
 def wp_search_terms(kind:str, search:str):
     url = f"{WP_URL}/wp-json/wp/v2/{kind}"
@@ -391,30 +308,55 @@ def ensure_term(kind:str, name:str)->int|None:
     r.raise_for_status()
     return r.json()["id"]
 
-# ── 중복 예약 이중 가드(스크립트 차원) ───────────────────
-def already_scheduled_for_hour(hour: str) -> bool:
-    """오늘 KST 00:00~23:59 사이 'future' 글 중 제목에 [예약:hour]가 있으면 True"""
+# ── 회차별 예약 존재 여부 조회 ──────────────────────────
+def _exists_for_date(hour: str, base_date: date) -> bool:
     try:
         kst = ZoneInfo("Asia/Seoul")
-        today = datetime.now(kst).date()
-        after  = datetime(today.year, today.month, today.day, 0,0,0, tzinfo=kst).isoformat()
-        before = datetime(today.year, today.month, today.day, 23,59,59, tzinfo=kst).isoformat()
-
+        after  = datetime(base_date.year, base_date.month, base_date.day, 0,0,0, tzinfo=kst).isoformat()
+        before = datetime(base_date.year, base_date.month, base_date.day, 23,59,59, tzinfo=kst).isoformat()
         url = f"{WP_URL}/wp-json/wp/v2/posts"
         params = {"status":"future", "after":after, "before":before, "per_page":100}
         r = requests.get(url, auth=auth, params=params, timeout=30)
-        print(f"[DBG] Guard-check code={r.status_code}")
-        print(f"[DBG] Guard body: {r.text[:200]}")
+        print(f"[DBG] Exists-check {base_date} code={r.status_code}")
+        print(f"[DBG] Exists body: {r.text[:200]}")
         r.raise_for_status()
         posts = r.json()
         return any(f"[예약:{hour}]" in (p.get("title",{}).get("rendered","")) for p in posts)
     except Exception as e:
-        print(f"[DBG] Guard-check error: {e}")
-        # 가드 오류시 안전을 위해 False 반환(진행)
+        print(f"[DBG] Exists-check error: {e} (treat as not existing)")
         return False
 
+def _compute_shift_days(hour: str) -> int | None:
+    """
+    반환:
+      0 => 오늘 예약
+      1 => 내일로 이월
+      None => 오늘/내일 모두 존재 → 스킵
+    우선순위: 환경변수 SCHEDULE_SHIFT_DAYS > 자동판단
+    """
+    if SCHEDULE_SHIFT_DAYS_ENV is not None:
+        try:
+            v = int(SCHEDULE_SHIFT_DAYS_ENV)
+            return max(0, min(1, v))
+        except Exception:
+            pass
+
+    kst = ZoneInfo("Asia/Seoul")
+    today = datetime.now(kst).date()
+    tomorrow = today + timedelta(days=1)
+
+    today_has = _exists_for_date(hour, today)
+    if not today_has:
+        return 0
+    # 오늘 이미 있음 → 내일 확인
+    tomorrow_has = _exists_for_date(hour, tomorrow)
+    if not tomorrow_has:
+        return 1
+    # 오늘/내일 모두 존재 → 스킵
+    return None
+
 # ── 포스팅 ─────────────────────────────────────────────
-def create_post(title, content_html, cat_ids, tag_ids, featured_media_id=None):
+def create_post(title, content_html, cat_ids, tag_ids, featured_media_id=None, shift_days: int = 0):
     payload = {
         "title": title,
         "content": content_html,
@@ -428,14 +370,13 @@ def create_post(title, content_html, cat_ids, tag_ids, featured_media_id=None):
         payload["featured_media"] = featured_media_id
     if POST_STATUS == "future":
         kst = ZoneInfo("Asia/Seoul")
-        now_kst = datetime.now(kst)
-        schedule_kst = now_kst.replace(hour=SCHEDULE_KST_HOUR, minute=0, second=0, microsecond=0)
-        if schedule_kst < now_kst:
-            schedule_kst += timedelta(days=1)
+        base = datetime.now(kst).date() + timedelta(days=shift_days)
+        schedule_kst = datetime(base.year, base.month, base.day, SCHEDULE_KST_HOUR, 0, 0, tzinfo=kst)
         payload["date_gmt"] = schedule_kst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     print("[DBG] Posting payload summary:",
-          {"status": payload["status"], "len_content": len(payload["content"]), "cats": cat_ids, "tags": tag_ids, "has_feat": bool(featured_media_id)})
+          {"status": payload["status"], "len_content": len(payload["content"]), "cats": cat_ids, "tags": tag_ids,
+           "has_feat": bool(featured_media_id), "shift_days": shift_days, "hour": SCHEDULE_KST_HOUR})
 
     r = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", auth=auth, json=payload, timeout=120)
     print("[DBG] WP response code:", r.status_code)
@@ -446,15 +387,17 @@ def create_post(title, content_html, cat_ids, tag_ids, featured_media_id=None):
 # ── 메인(글 1개) ───────────────────────────────────────
 def main():
     hour = str(SCHEDULE_KST_HOUR)
-    # 선행 가드: 오늘 동일 회차 이미 예약되어 있으면 종료(워크플로 Guard와 이중 방지)
-    if POST_STATUS == "future" and already_scheduled_for_hour(hour):
-        print(f"[가드] 오늘 {hour}KST 예약글이 이미 존재합니다. 종료합니다.")
+
+    # 목표 날짜(오늘/내일) 계산
+    shift = _compute_shift_days(hour)
+    if shift is None:
+        print(f"[가드] 오늘과 내일 모두 {hour}KST 예약글이 존재합니다. 스킵합니다.")
         raise SystemExit(0)
 
     keyword = load_keyword(KEYWORDS_CSV)
-    print(f"[0/10] 대상 키워드: {keyword} / 회차: {hour}KST")
+    print(f"[0/10] 대상 키워드: {keyword} / 회차: {hour}KST / shift_days={shift}")
 
-    title  = gen_title(keyword, hour)   # ✅ 마커 포함
+    title  = gen_title(keyword, hour)   # 마커 포함
     body1  = gen_body1(keyword, title)
     body2  = gen_body2(keyword, title)
 
@@ -480,9 +423,9 @@ def main():
             figures.append(placeholder_figure("이미지 준비 중"))
 
     featured_id = next((m for m in media_ids if m), None)
-    figures_top, figures_mid = figures[:2], []  # 2장 고정: 상단 2장, 중간 0장
+    figures_top, _ = figures[:2], []  # 2장 고정
 
-    html   = assemble_post(title, body1, body2, figures_top, figures_mid, keyword)
+    html   = assemble_post(title, body1, body2, figures_top, [], keyword)
 
     plain  = re.sub(r"<[^>]+>", " ", html)
     cat_names = choose_categories(keyword, plain)
@@ -511,7 +454,7 @@ def main():
     print("[DBG] tag ids:", tag_ids)
 
     print(f"[8/10] 워드프레스 업로드… | 카테고리={cat_names} | 이미지={sum(1 for x in media_ids if x)}장")
-    post = create_post(title, html, cat_ids, tag_ids, featured_media_id=featured_id)
+    post = create_post(title, html, cat_ids, tag_ids, featured_media_id=featured_id, shift_days=shift)
     print(f"[10/10] 완료 :", post.get('link'))
 
 if __name__ == "__main__":
