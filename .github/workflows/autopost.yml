@@ -2,7 +2,8 @@ name: Auto Post 2/day (scheduled future)
 
 on:
   schedule:
-    - cron: "5 0 * * *"
+    - cron: "5 0 * * *"   # UTC 00:05 → KST 09:05
+    - cron: "0 8 * * *"   # UTC 08:00 → KST 17:00 (보강)
   workflow_dispatch: {}
 
 concurrency:
