@@ -1,9 +1,9 @@
-name: Auto Post 2/day (scheduled future)
+name: Auto Post 2/day
 
 on:
   schedule:
     - cron: "5 0 * * *"   # UTC 00:05 → KST 09:05
-    - cron: "0 8 * * *"   # UTC 08:00 → KST 17:00 (보강)
+    - cron: "0 8 * * *"   # UTC 08:00 → KST 17:00
   workflow_dispatch: {}
 
 concurrency:
@@ -13,21 +13,26 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - name: Check required secrets
-        run: |
-          test -n "${{ secrets.WP_URL }}" || (echo "WP_URL missing" && exit 1)
-          test -n "${{ secrets.WP_USER }}" || (echo "WP_USER missing" && exit 1)
-          test -n "${{ secrets.WP_APP_PASSWORD }}" || (echo "WP_APP_PASSWORD missing" && exit 1)
-          test -n "${{ secrets.OPENAI_API_KEY }}" || (echo "OPENAI_API_KEY missing" && exit 1)
-          test -n "${{ secrets.OPENAI_MODEL }}" || (echo "OPENAI_MODEL missing" && exit 1)
+
       - name: Create .env
         run: |
           cat > .env << 'EOF'
@@ -41,9 +46,9 @@ jobs:
           TAGS=${{ secrets.TAGS }}
           EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
           ALLOW_CREATE_TERMS=false
-          AD_METHOD=${{ secrets.AD_METHOD }}
-          AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
-          AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
+          AD_METHOD=shortcode
+          AD_SHORTCODE=[ads_top]
+          AD_INSERT_MIDDLE=true
           NUM_IMAGES=2
           IMAGE_SIZE=1024x1024
           IMAGE_QUALITY_WEBP=82
@@ -51,17 +56,69 @@ jobs:
           NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
           NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
           EOF
+
       - name: Update keywords
         run: python update_keywords.py
-      - name: Schedule post for 10 KST
+
+      # 오전 10시 예약
+      - name: Guard 10KST
+        env:
+          SCHEDULE_KST_HOUR: "10"
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
         run: |
-          export SCHEDULE_KST_HOUR=10
-          python auto_wp_gpt.py
-      - name: Rotate used keyword
+          TODAY_KST=$(TZ=Asia/Seoul date +%Y-%m-%d)
+          AFTER="${TODAY_KST}T00:00:00"
+          BEFORE="${TODAY_KST}T23:59:59"
+          COUNT=$(curl -s -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            "${WP_URL%/}/wp-json/wp/v2/posts?status=future&after=${AFTER}&before=${BEFORE}&per_page=100" \
+            | grep -c "\[예약:10\]")
+          echo "scheduled_count:${COUNT}"
+          if [ "${COUNT}" != "0" ]; then
+            echo "Today’s 10KST post already scheduled. Skipping."
+            exit 78
+          fi
+
+      - name: Post 10KST
+        if: success()
+        env:
+          SCHEDULE_KST_HOUR: "10"
+        run: python auto_wp_gpt.py
+
+      - name: Rotate keywords
         run: python rotate_keywords.py
-      - name: Schedule post for 17 KST
+
+      # 오후 5시 예약
+      - name: Guard 17KST
+        env:
+          SCHEDULE_KST_HOUR: "17"
+          WP_URL: ${{ secrets.WP_URL }}
+          WP_USER: ${{ secrets.WP_USER }}
+          WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
         run: |
-          export SCHEDULE_KST_HOUR=17
-          python auto_wp_gpt.py
-      - name: Rotate used keyword
+          TODAY_KST=$(TZ=Asia/Seoul date +%Y-%m-%d)
+          AFTER="${TODAY_KST}T00:00:00"
+          BEFORE="${TODAY_KST}T23:59:59"
+          COUNT=$(curl -s -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            "${WP_URL%/}/wp-json/wp/v2/posts?status=future&after=${AFTER}&before=${BEFORE}&per_page=100" \
+            | grep -c "\[예약:17\]")
+          echo "scheduled_count:${COUNT}"
+          if [ "${COUNT}" != "0" ]; then
+            echo "Today’s 17KST post already scheduled. Skipping."
+            exit 78
+          fi
+
+      - name: Post 17KST
+        if: success()
+        env:
+          SCHEDULE_KST_HOUR: "17"
+        run: python auto_wp_gpt.py
+
+      - name: Rotate keywords
         run: python rotate_keywords.py
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "✅ AutoPost finished at $(TZ=Asia/Seoul date)" >> $GITHUB_STEP_SUMMARY
