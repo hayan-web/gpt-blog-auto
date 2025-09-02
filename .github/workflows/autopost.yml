@@ -13,7 +13,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -60,62 +60,96 @@ jobs:
       - name: Update keywords
         run: python update_keywords.py
 
-      # 오전 10시 예약
-      - name: Guard 10KST
+      # ───────────────────────────── 10 KST ─────────────────────────────
+      - name: Guard 10KST (today→tomorrow shift)
         env:
-          SCHEDULE_KST_HOUR: "10"
           WP_URL: ${{ secrets.WP_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
         run: |
           TODAY_KST=$(TZ=Asia/Seoul date +%Y-%m-%d)
-          AFTER="${TODAY_KST}T00:00:00"
-          BEFORE="${TODAY_KST}T23:59:59"
-          COUNT=$(curl -s -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            "${WP_URL%/}/wp-json/wp/v2/posts?status=future&after=${AFTER}&before=${BEFORE}&per_page=100" \
-            | grep -c "\[예약:10\]")
-          echo "scheduled_count:${COUNT}"
-          if [ "${COUNT}" != "0" ]; then
-            echo "Today’s 10KST post already scheduled. Skipping."
-            exit 78
+          TOMORROW_KST=$(TZ=Asia/Seoul date -d "$TODAY_KST +1 day" +%Y-%m-%d)
+
+          AFTER_T="${TODAY_KST}T00:00:00"
+          BEFORE_T="${TODAY_KST}T23:59:59"
+          AFTER_N="${TOMORROW_KST}T00:00:00"
+          BEFORE_N="${TOMORROW_KST}T23:59:59"
+
+          HAS_TODAY=$(curl -s -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            "${WP_URL%/}/wp-json/wp/v2/posts?status=future&after=${AFTER_T}&before=${BEFORE_T}&per_page=100" | grep -c "\[예약:10\]" || true)
+
+          HAS_NEXT=$(curl -s -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            "${WP_URL%/}/wp-json/wp/v2/posts?status=future&after=${AFTER_N}&before=${BEFORE_N}&per_page=100" | grep -c "\[예약:10\]" || true)
+
+          echo "today_has_10=${HAS_TODAY}, next_has_10=${HAS_NEXT}"
+
+          if [ "${HAS_TODAY}" != "0" ] && [ "${HAS_NEXT}" != "0" ]; then
+            echo "POST10_SKIP=true" >> $GITHUB_ENV
+            echo "POST10_SHIFT_DAYS=0" >> $GITHUB_ENV
+            exit 0
           fi
+
+          if [ "${HAS_TODAY}" != "0" ] && [ "${HAS_NEXT}" = "0" ]; then
+            echo "POST10_SHIFT_DAYS=1" >> $GITHUB_ENV
+          else
+            echo "POST10_SHIFT_DAYS=0" >> $GITHUB_ENV
+          fi
+          echo "POST10_SKIP=false" >> $GITHUB_ENV
 
       - name: Post 10KST
-        if: success()
+        if: env.POST10_SKIP != 'true'
         env:
           SCHEDULE_KST_HOUR: "10"
+          SCHEDULE_SHIFT_DAYS: ${{ env.POST10_SHIFT_DAYS }}
         run: python auto_wp_gpt.py
 
-      - name: Rotate keywords
+      - name: Rotate keywords (after 10KST)
         run: python rotate_keywords.py
 
-      # 오후 5시 예약
-      - name: Guard 17KST
+      # ───────────────────────────── 17 KST ─────────────────────────────
+      - name: Guard 17KST (today→tomorrow shift)
         env:
-          SCHEDULE_KST_HOUR: "17"
           WP_URL: ${{ secrets.WP_URL }}
           WP_USER: ${{ secrets.WP_USER }}
           WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
         run: |
           TODAY_KST=$(TZ=Asia/Seoul date +%Y-%m-%d)
-          AFTER="${TODAY_KST}T00:00:00"
-          BEFORE="${TODAY_KST}T23:59:59"
-          COUNT=$(curl -s -u "${WP_USER}:${WP_APP_PASSWORD}" \
-            "${WP_URL%/}/wp-json/wp/v2/posts?status=future&after=${AFTER}&before=${BEFORE}&per_page=100" \
-            | grep -c "\[예약:17\]")
-          echo "scheduled_count:${COUNT}"
-          if [ "${COUNT}" != "0" ]; then
-            echo "Today’s 17KST post already scheduled. Skipping."
-            exit 78
+          TOMORROW_KST=$(TZ=Asia/Seoul date -d "$TODAY_KST +1 day" +%Y-%m-%d)
+
+          AFTER_T="${TODAY_KST}T00:00:00"
+          BEFORE_T="${TODAY_KST}T23:59:59"
+          AFTER_N="${TOMORROW_KST}T00:00:00"
+          BEFORE_N="${TOMORROW_KST}T23:59:59"
+
+          HAS_TODAY=$(curl -s -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            "${WP_URL%/}/wp-json/wp/v2/posts?status=future&after=${AFTER_T}&before=${BEFORE_T}&per_page=100" | grep -c "\[예약:17\]" || true)
+
+          HAS_NEXT=$(curl -s -u "${WP_USER}:${WP_APP_PASSWORD}" \
+            "${WP_URL%/}/wp-json/wp/v2/posts?status=future&after=${AFTER_N}&before=${BEFORE_N}&per_page=100" | grep -c "\[예약:17\]" || true)
+
+          echo "today_has_17=${HAS_TODAY}, next_has_17=${HAS_NEXT}"
+
+          if [ "${HAS_TODAY}" != "0" ] && [ "${HAS_NEXT}" != "0" ]; then
+            echo "POST17_SKIP=true" >> $GITHUB_ENV
+            echo "POST17_SHIFT_DAYS=0" >> $GITHUB_ENV
+            exit 0
           fi
 
+          if [ "${HAS_TODAY}" != "0" ] && [ "${HAS_NEXT}" = "0" ]; then
+            echo "POST17_SHIFT_DAYS=1" >> $GITHUB_ENV
+          else
+            echo "POST17_SHIFT_DAYS=0" >> $GITHUB_ENV
+          fi
+          echo "POST17_SKIP=false" >> $GITHUB_ENV
+
       - name: Post 17KST
-        if: success()
+        if: env.POST17_SKIP != 'true'
         env:
           SCHEDULE_KST_HOUR: "17"
+          SCHEDULE_SHIFT_DAYS: ${{ env.POST17_SHIFT_DAYS }}
         run: python auto_wp_gpt.py
 
-      - name: Rotate keywords
+      - name: Rotate keywords (after 17KST)
         run: python rotate_keywords.py
 
       - name: Summary
