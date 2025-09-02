@@ -1,117 +1,139 @@
-# update_keywords.py
-# 소스: Naver Search API(뉴스), NewsAPI(top-headlines, KR), Google News RSS(KR)
-# 목표: 최소 5~20개 키워드 수집 → 랜덤 섞기 → 첫 줄은 오늘의 랜덤 키워드로 배치 → keywords.csv 생성
+# -*- coding: utf-8 -*-
+"""
+update_keywords.py
+- 뉴스/검색 타이틀을 모아 2~4단어 키워드 5~20개 추출
+- 중복 제거 + 랜덤 셔플
+- 0개일 경우: 백업 키워드(ENV 또는 파일)로 대체
+- 결과를 keywords.csv 에 저장(첫 줄 = 오늘 쓸 키워드)
 
-import os, re, csv, io, json, random, time
-import requests
+외부 의존성: requests, python-dotenv (requirements.txt에 포함)
+환경변수:
+  NAVER_CLIENT_ID, NAVER_CLIENT_SECRET (선택)
+  NEWSAPI_KEY (선택)
+  BACKUP_KEYWORDS (선택, 콤마 구분)  예: "아이폰 16 배터리, 카카오톡 보안 설정, ..."
+  KEYWORDS_CSV (선택, 기본값 "keywords.csv")
+"""
+
+import os
+import re
+import csv
+import json
+import time
+import random
+import logging
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
 
-# ─ env
-KEYWORDS_CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
+import requests
+from dotenv import load_dotenv
 
+load_dotenv()
+
+# ===== 설정 =====
+KEYWORDS_CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID") or ""
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET") or ""
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY") or ""
 
-MIN_COUNT = 5       # 최소 키워드 개수
-MAX_COUNT = 20      # 최대 키워드 개수
+MIN_KEYS, MAX_KEYS = 5, 20
+NGRAM_MIN, NGRAM_MAX = 2, 4
+TIMEOUT = 15
+RETRY = 3
+BACKOFF = 2
 
-# ─ 금칙어 / 안전보충 키워드
+# 기본 질의(한국어 일반/IT/생활 섞어 다양성 확보)
+SEED_QUERIES = [
+    "오늘의 뉴스", "실시간 이슈", "테크 뉴스", "모바일 소식",
+    "생활 꿀팁", "정부 발표", "경제 동향", "문화 트렌드"
+]
+
+# 정책/브랜드 리스크 키워드(필요 시 추가)
 BLOCK_WORDS = {
-    # 민감/정책 리스크/저품질 키워드 (필요시 자유롭게 추가/수정)
     "성관계","포르노","야동","불법촬영","음란","노골","강간","몰카",
     "혐오","증오","폭력","자해","테러","마약","총기","선동","가짜뉴스"
 }
+
 SAFE_FALLBACKS = [
-    "오늘의 이슈", "실생활 가이드", "트렌드 한눈에",
-    "초보자용 핵심정리", "알쓸정보 톡톡", "생활 팁 모음"
+    "생활 정보 모음", "알뜰 소비 팁", "모바일 설정 가이드",
+    "블로그 최적화 방법", "워드프레스 이미지 최적화"
 ]
+
+STOPWORDS = {
+    "단독","속보","이슈","현장","종합","인터뷰","업데이트","기자","사진","영상","포토",
+    "단체","공식","발표","논란","결과","이유","변화","분석","전망","관련","오늘","어제",
+    "내일","방금","지금","해당","주요","특집","칼럼","사설","오피니언","전문"
+}
+
+# ===== 로깅 =====
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+log = logging.getLogger("update_keywords")
+
 
 def _is_allowed(kw: str) -> bool:
     t = (kw or "").lower()
     return not any(b in t for b in BLOCK_WORDS)
 
-# ─ 유틸
-STOPWORDS = set("""
-단독 속보 이슈 현장 종합 인터뷰 업데이트 기자 사진 영상 포토 단체 공식 발표
-논란 결과 이유 변화 분석 전망 관련 오늘 어제 내일 방금 지금 해당 주요
-""".split())
 
-def clean_title(t: str) -> str:
-    if not t:
-        return ""
-    t = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|〈.*?〉|「.*?」|『.*?』|<.*?>", " ", t)
-    t = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", t)
-    t = re.sub(r"[\"'“”‘’•·…~_=+^#@%&*|/:;]", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+# ===== HTTP GET(재시도) =====
+def http_get(url: str, params: dict | None = None, headers: dict | None = None) -> requests.Response | None:
+    last_err = None
+    for i in range(RETRY):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=TIMEOUT)
+            if resp.status_code == 200:
+                return resp
+            last_err = f"HTTP {resp.status_code} {resp.text[:180]}"
+            log.warning(f"GET failed {i+1}/{RETRY}: {last_err}")
+        except requests.RequestException as e:
+            last_err = repr(e)
+            log.warning(f"GET error {i+1}/{RETRY}: {last_err}")
+        time.sleep(BACKOFF ** i)
+    log.error(f"GET failed: {url} ({last_err})")
+    return None
 
-def extract_candidates(titles: list[str]) -> list[str]:
-    cands = []
-    for t in titles:
-        t = clean_title(t)
-        if not t:
-            continue
-        # 1) 긴 구절 우선: "한글/영문/숫자 2~12자"가 2~4개 이어진 구절
-        phrases = re.findall(r"(?:[가-힣A-Za-z0-9]{2,12}(?:\s|$)){2,4}", t)
-        for p in phrases:
-            p = p.strip()
-            if 4 <= len(p) <= 28:
-                cands.append(p)
 
-        # 2) 백업: 개별 단어 기반 2~3어 조합
-        words = [w for w in re.findall(r"[가-힣A-Za-z0-9]{2,}", t) if w not in STOPWORDS]
-        for i in range(len(words)-1):
-            pair = f"{words[i]} {words[i+1]}"
-            if 4 <= len(pair) <= 28:
-                cands.append(pair)
-        for i in range(len(words)-2):
-            tri = f"{words[i]} {words[i+1]} {words[i+2]}"
-            if 6 <= len(tri) <= 32:
-                cands.append(tri)
-    # 정리
-    uniq, seen = [], set()
-    for s in cands:
-        s = re.sub(r"\s+", " ", s).strip()
-        if s and s not in seen:
-            seen.add(s)
-            uniq.append(s)
-    return uniq
-
-# ─ 소스 1: Google News RSS (무료, 키 필요 없음)
+# ===== 소스 1: Google News RSS (전체 피드) =====
 def fetch_google_news_titles() -> list[str]:
-    titles = []
+    titles: list[str] = []
     try:
         url = "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko"
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
+        resp = http_get(url)
+        if not resp:
+            return titles
+        root = ET.fromstring(resp.content)
         for item in root.findall(".//item/title"):
-            titles.append(item.text or "")
+            t = item.text or ""
+            if t:
+                titles.append(t)
     except Exception as e:
-        print(f"[경고] Google News RSS 실패: {e}")
+        log.warning(f"Google News RSS parse error: {e}")
     return titles
 
-# ─ 소스 2: NewsAPI (무료 키 필요)
+
+# ===== 소스 2: NewsAPI (top-headlines, KR) =====
 def fetch_newsapi_titles() -> list[str]:
-    titles = []
+    titles: list[str] = []
     if not NEWSAPI_KEY:
         return titles
+    url = "https://newsapi.org/v2/top-headlines"
+    params = {"country": "kr", "pageSize": 50, "apiKey": NEWSAPI_KEY}
+    resp = http_get(url, params=params)
+    if not resp:
+        return titles
     try:
-        url = f"https://newsapi.org/v2/top-headlines?country=kr&pageSize=50&apiKey={NEWSAPI_KEY}"
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        data = resp.json()
         for art in data.get("articles", []):
-            titles.append(art.get("title") or "")
+            t = art.get("title") or ""
+            if t:
+                titles.append(t)
     except Exception as e:
-        print(f"[경고] NewsAPI 실패: {e}")
+        log.warning(f"NewsAPI parse error: {e}")
     return titles
 
-# ─ 소스 3: Naver Search API (뉴스)
+
+# ===== 소스 3: Naver Search API (뉴스, 다중 질의) =====
 def fetch_naver_news_titles() -> list[str]:
-    titles = []
+    titles: list[str] = []
     if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET):
         return titles
     headers = {
@@ -122,34 +144,100 @@ def fetch_naver_news_titles() -> list[str]:
     for q in queries:
         try:
             url = f"https://openapi.naver.com/v1/search/news.json?query={quote(q)}&display=30&sort=sim"
-            r = requests.get(url, headers=headers, timeout=15)
-            r.raise_for_status()
-            data = r.json()
+            resp = http_get(url, headers=headers)
+            if not resp:
+                continue
+            data = resp.json()
             for it in data.get("items", []):
-                titles.append(it.get("title") or "")
-            time.sleep(0.2)  # 속도 제한 완화
+                t = it.get("title") or ""
+                if t:
+                    titles.append(t)
+            time.sleep(0.2)  # 속도 제한 여유
         except Exception as e:
-            print(f"[경고] Naver API 실패({q}): {e}")
+            log.warning(f"Naver API parse fail ({q}): {e}")
     return titles
 
+
+# ===== 전처리 & n-gram =====
+def clean_title(t: str) -> str:
+    if not t:
+        return ""
+    t = re.sub(r"<\/?b>", "", t)                      # 네이버 태그 제거
+    t = re.sub(r"\[.*?\]|\(.*?\)|【.*?】|〈.*?〉|「.*?」|『.*?』|<.*?>", " ", t)
+    t = re.sub(r"[\"'“”‘’•·…~_=+^#@%&*|/:;]", " ", t)
+    t = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def tokenize_ko(s: str) -> list[str]:
+    toks = [w for w in re.split(r"\s+", s) if w]
+    toks = [w for w in toks if w not in STOPWORDS and not w.isdigit()]
+    toks = [w for w in toks if len(w) > 1]
+    return toks
+
+
+def ngrams(words: list[str], n: int) -> list[str]:
+    return [" ".join(words[i:i+n]) for i in range(0, max(0, len(words)-n+1))]
+
+
+def extract_candidates(titles: list[str]) -> list[str]:
+    pool: set[str] = set()
+    for t in titles:
+        t = clean_title(t)
+        if not t:
+            continue
+        toks = tokenize_ko(t)
+        # 2~4 gram 조합
+        for n in range(NGRAM_MIN, NGRAM_MAX + 1):
+            for g in ngrams(toks, n):
+                if any(sw in g for sw in STOPWORDS):
+                    continue
+                if re.search(r"\b\d{1,4}\b", g):
+                    # 연도/숫자만 있는 조합은 패스
+                    continue
+                if 6 <= len(g) <= 32:
+                    pool.add(g)
+    return list(pool)
+
+
+# ===== 백업 키워드 로딩 =====
+def load_backup_keywords() -> list[str]:
+    env_k = os.getenv("BACKUP_KEYWORDS", "").strip()
+    if env_k:
+        items = [x.strip() for x in env_k.split(",") if x.strip()]
+        if items:
+            return items
+
+    if os.path.exists("backup_keywords.txt"):
+        with open("backup_keywords.txt", "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+            if lines:
+                return lines
+    return []
+
+
 def main():
-    all_titles: list[str] = []
-    all_titles += fetch_google_news_titles()
-    all_titles += fetch_newsapi_titles()
-    all_titles += fetch_naver_news_titles()
+    log.info("🔎 Collecting titles...")
+    titles: list[str] = []
 
-    if not all_titles:
-        print("[오류] 어떤 소스에서도 제목을 가져오지 못했습니다.")
-        return
+    # 여러 소스에서 수집
+    titles += fetch_google_news_titles()
+    titles += fetch_newsapi_titles()
+    titles += fetch_naver_news_titles()
 
-    cands = extract_candidates(all_titles)
-    random.shuffle(cands)
+    # 중복 제거
+    titles = list(dict.fromkeys([t for t in titles if t]))
+    log.info(f"Collected titles: {len(titles)}")
 
-    # 한국어 위주 + 길이/중복 필터
+    candidates = extract_candidates(titles)
+    random.shuffle(candidates)
+
+    # 한국어 포함 + 길이/블럭 필터 + 최대치 컷
     filtered: list[str] = []
     seen = set()
-    for s in cands:
-        if len(s) < 4 or len(s) > 32:
+    for s in candidates:
+        if not (6 <= len(s) <= 32):
             continue
         if not re.search(r"[가-힣]", s):
             continue
@@ -160,19 +248,24 @@ def main():
             continue
         seen.add(key)
         filtered.append(s)
-        if len(filtered) >= MAX_COUNT:
+        if len(filtered) >= MAX_KEYS:
             break
 
     # 최저 개수 보장 (모자라면 안전 키워드로 보충)
-    while len(filtered) < MIN_COUNT:
-        pick = random.choice(SAFE_FALLBACKS)
-        if pick.lower() not in seen:
-            filtered.append(pick)
-            seen.add(pick.lower())
+    if len(filtered) < MIN_KEYS:
+        backup = load_backup_keywords() or SAFE_FALLBACKS
+        random.shuffle(backup)
+        for pick in backup:
+            k = pick.lower()
+            if k not in seen:
+                filtered.append(pick)
+                seen.add(k)
+            if len(filtered) >= MIN_KEYS:
+                break
 
     if not filtered:
-        print("[오류] 키워드 후보를 구성하지 못했습니다.")
-        return
+        log.error("❌ 키워드 후보를 구성하지 못했습니다. 내장 안전 키워드 사용.")
+        filtered = SAFE_FALLBACKS[:MIN_KEYS]
 
     # 오늘의 랜덤 1개를 맨 위로 (auto_wp_gpt.py는 첫 줄을 사용)
     random.shuffle(filtered)
@@ -181,12 +274,14 @@ def main():
     keywords = [today] + filtered
 
     # 파일 저장 (UTF-8, 개행 고정, BOM 없음)
-    with io.open(KEYWORDS_CSV, "w", encoding="utf-8", newline="\n") as f:
+    os.makedirs(os.path.dirname(KEYWORDS_CSV) or ".", exist_ok=True)
+    with open(KEYWORDS_CSV, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         for kw in keywords:
             w.writerow([kw])
 
-    print(f"[완료] 키워드 {len(keywords)}개 저장 (첫 줄: '{today}')")
+    log.info(f"📝 keywords.csv updated. Count={len(keywords)} | First(today): {today}")
+
 
 if __name__ == "__main__":
     main()
