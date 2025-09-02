@@ -1,6 +1,7 @@
 # auto_wp_gpt.py : 글 1개 자동 발행 (다음날 자동 이월 스케줄링 + UI 패치)
-# - [예약:HOUR] 마커 유지(워크플로 Guard와 호환)
-# - 오늘 해당 회차 예약이 있으면 **내일 같은 회차**로 자동 이월, 오늘/내일 모두 있으면 스킵
+# - 제목의 [예약:xx] 표시 제거
+# - 본문 맨 위에 숨은 마커 <!--SLOT:10|17--> 삽입 (가드/이월 판단용)
+# - 오늘 해당 회차 이미 있으면 내일로 이월, 오늘/내일 모두 있으면 스킵
 # - 소제목 스타일 단일화(H2/H3), 본문 CSS 유틸 강화, 이미지 캡션 제거
 # - 이미지: WebP 우선, 실패 시 PNG 폴백 + MIME 자동
 # - 디버그 로그 강화
@@ -31,7 +32,7 @@ auth   = HTTPBasicAuth(WP_USER, WP_APP_PASSWORD)
 # ── 게시/분류/키워드 ─────────────────────────────────────
 POST_STATUS       = os.getenv("POST_STATUS", "future")   # publish | draft | future
 SCHEDULE_KST_HOUR = int(os.getenv("SCHEDULE_KST_HOUR", "10"))
-# (선택) Guard 단계에서 계산해 넣어줄 수 있음. 없으면 스크립트가 자동 판단.
+# (선택) 워크플로 Guard에서 넣어줄 수 있음. 없으면 본 스크립트가 자동 판단.
 SCHEDULE_SHIFT_DAYS_ENV = os.getenv("SCHEDULE_SHIFT_DAYS")
 KEYWORDS_CSV      = os.getenv("KEYWORDS_CSV","keywords.csv")
 EXISTING_CATEGORIES = [s.strip() for s in os.getenv(
@@ -140,8 +141,7 @@ STYLE_VARIANT_B = """
 """.strip()
 
 # ── 유틸 ───────────────────────────────────────────────
-def strip_bom(s: str) -> str:
-    return s.lstrip("\ufeff").strip()
+def strip_bom(s: str) -> str: return s.lstrip("\ufeff").strip()
 
 def slugify_ascii(text:str, fallback:str="image") -> str:
     base = re.sub(r"[^\w-]+", "-", strip_bom(text)).strip("-").lower()
@@ -214,7 +214,7 @@ HTML 조각만 출력하세요(워드프레스 본문용). <h1>은 출력하지 
 필수 포함:
 - <hr> 로 시작
 - <section id="body2"> 최소 1200~1600자 분량, 다양한 <h3> + <p>
-- 섹션 내부에 실제 <table><thead><tr><th>…</th></tr></thead><tbody>…</tbody></table> 1개 포함(2x2, 3x3, 4x5 중 임의)
+- 섹션 내부에 실제 <table><thead><tr><th>…</th></tr></thead><tbody>…</tbody></table> 1개 포함
 - 맺음말 포함
 마크다운/지침 금지.
 """
@@ -225,7 +225,7 @@ IMG_PROMPT_GUIDE = """
 반환 예: ["설명1","설명2",...]
 """
 
-def gen_title(keyword: str, hour: str) -> str:
+def gen_title(keyword: str) -> str:
     print(f"[1/10] 제목 생성… ({keyword})")
     try:
         r = client.chat.completions.create(
@@ -241,7 +241,8 @@ def gen_title(keyword: str, hour: str) -> str:
     title = re.sub(r"\s+", " ", title).strip()
     if len(title) < 20:
         title = f"{keyword} 핵심정리와 실전 가이드"
-    return f"[예약:{hour}] {title[:30]}"
+    # ⬇︎ 더 이상 [예약:xx] 붙이지 않음
+    return title[:60]
 
 def gen_body1(keyword: str, title: str) -> str:
     print("[2/10] 요약/본문1 생성…")
@@ -256,8 +257,11 @@ def gen_body2(keyword: str, title: str) -> str:
     return tidy_text(r.choices[0].message.content or "")
 
 def gen_image_captions(keyword:str, title:str, n:int) -> list[str]:
-    print("[4/10] 이미지 캡션(설명 텍스트) 생성…")
-    r = client.chat.completions.create(model=MODEL, messages=[{"role":"user","content": IMG_PROMPT_GUIDE + f"\n제목:{title}\n키워드:{keyword}\n개수:{n}"}])
+    print("[4/10] 이미지 캡션 생성…")
+    r = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role":"user","content": IMG_PROMPT_GUIDE + f"\n제목:{title}\n키워드:{keyword}\n개수:{n}"}]
+    )
     txt = (r.choices[0].message.content or "").strip()
     try:
         arr = json.loads(txt)
@@ -310,7 +314,7 @@ def wp_upload_media(filename:str, image_bytes:bytes, alt_text:str) -> dict:
         print(f"[DBG] Media alt update skip: {e}")
     return media
 
-# ⬇︎ 캡션 없는 그림만 출력
+# ⬇︎ 캡션 없이 그림만 출력
 def build_img_figure(src:str, alt:str):
     return f'<figure><img loading="lazy" decoding="async" src="{src}" alt="{alt}"></figure>'
 
@@ -360,9 +364,9 @@ def rich_modules(title:str, keyword:str) -> tuple[str,str]:
 
     mod_b = f'''
 {STYLE_VARIANT_B}
-<div class="tip-box"><p>작은 팁: 타이머 25분에 알림을 맞추고, 끝나면 자리에서 꼭 일어나 스트레칭하세요. 리셋이 집중을 지켜줍니다.</p></div>
+<div class="tip-box"><p>작은 팁: 25분 집중/5분 휴식 루틴을 권장합니다. 리셋이 집중을 지켜줍니다.</p></div>
 <div class="quote-box"><p>"꾸준함은 의지보다 시스템에서 나온다."</p></div>
-<div class="key-card"><p>정리: 제목 "{title}" 에서 말하는 핵심은 '꾸준히 유지 가능한 구조'입니다. 과하지 않게, 그러나 매일.</p></div>
+<div class="key-card"><p>정리: 제목 "{title}"의 핵심은 '꾸준히 유지 가능한 구조'입니다.</p></div>
 '''.strip()
     return mod_a, mod_b
 
@@ -370,11 +374,8 @@ def rich_modules(title:str, keyword:str) -> tuple[str,str]:
 def assemble_post(title:str, body1_html:str, body2_html:str, figures_top:list[str], figures_mid:list[str], keyword:str) -> str:
     ad_top = load_ad_block()
     mod_a, mod_b = rich_modules(title, keyword)
-    parts = []
-    parts.append(f"<h1>{title}</h1>")
-    parts.append(ad_top)
-    parts.append(body1_html)
-    parts.append(mod_a)
+    hidden_marker = f"<!--SLOT:{SCHEDULE_KST_HOUR}-->"  # 제목 대신 본문 상단에 숨은 마커
+    parts = [hidden_marker, f"<h1>{title}</h1>", ad_top, body1_html, mod_a]
     if figures_top: parts.append("\n".join(figures_top))  # 상단 이미지 2장
     parts.append("<hr class='soft'>")
     if AD_INSERT_MIDDLE:
@@ -411,20 +412,26 @@ def ensure_term(kind:str, name:str)->int|None:
     r.raise_for_status()
     return r.json()["id"]
 
-# ── 회차별 예약 존재 여부 조회 ──────────────────────────
+# ── 회차별 예약 존재 여부 조회 (숨은 마커/과거 마커 모두 인식) ──────────
 def _exists_for_date(hour: str, base_date: date) -> bool:
     try:
         kst = ZoneInfo("Asia/Seoul")
         after  = datetime(base_date.year, base_date.month, base_date.day, 0,0,0, tzinfo=kst).isoformat()
         before = datetime(base_date.year, base_date.month, base_date.day, 23,59,59, tzinfo=kst).isoformat()
         url = f"{WP_URL}/wp-json/wp/v2/posts"
-        params = {"status":"future", "after":after, "before":before, "per_page":100}
+        params = {"status":"future", "after":after, "before":before, "per_page":100, "_fields":"id,title,content"}
         r = requests.get(url, auth=auth, params=params, timeout=30)
         print(f"[DBG] Exists-check {base_date} code={r.status_code}")
-        print(f"[DBG] Exists body: {r.text[:200]}")
         r.raise_for_status()
         posts = r.json()
-        return any(f"[예약:{hour}]" in (p.get("title",{}).get("rendered","")) for p in posts)
+        marker_hidden = f"<!--SLOT:{hour}-->"
+        marker_legacy  = f"[예약:{hour}]"
+        for p in posts:
+            title = p.get("title",{}).get("rendered","")
+            body  = p.get("content",{}).get("rendered","")
+            if marker_hidden in body or marker_legacy in title:
+                return True
+        return False
     except Exception as e:
         print(f"[DBG] Exists-check error: {e} (treat as not existing)")
         return False
@@ -448,14 +455,12 @@ def _compute_shift_days(hour: str) -> int | None:
     today = datetime.now(kst).date()
     tomorrow = today + timedelta(days=1)
 
-    today_has = _exists_for_date(hour, today)
+    today_has = _exists_for_date(str(SCHEDULE_KST_HOUR), today)
     if not today_has:
         return 0
-    # 오늘 이미 있음 → 내일 확인
-    tomorrow_has = _exists_for_date(hour, tomorrow)
+    tomorrow_has = _exists_for_date(str(SCHEDULE_KST_HOUR), tomorrow)
     if not tomorrow_has:
         return 1
-    # 오늘/내일 모두 존재 → 스킵
     return None
 
 # ── 포스팅 ─────────────────────────────────────────────
@@ -500,7 +505,7 @@ def main():
     keyword = load_keyword(KEYWORDS_CSV)
     print(f"[0/10] 대상 키워드: {keyword} / 회차: {hour}KST / shift_days={shift}")
 
-    title  = gen_title(keyword, hour)   # 마커 포함
+    title  = gen_title(keyword)
     body1  = gen_body1(keyword, title)
     body2  = gen_body2(keyword, title)
 
