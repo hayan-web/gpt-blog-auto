@@ -1,4 +1,6 @@
-# auto_wp_gpt.py : 글 1개 자동 발행 (디버그 강화판)
+# auto_wp_gpt.py : 글 1개 자동 발행 (디버그 강화판 + 중복 예약 가드)
+# - [예약:HOUR] 마커 자동 삽입(워크플로 Guard와 호환)
+# - 스크립트 선행 가드: 오늘 해당 시간대 예약글 존재 시 즉시 종료
 # - 이미지: WebP 우선, 실패 시 PNG 폴백 + MIME 자동
 # - 디버그: 카테고리/태그/미디어/포스트 API 응답 코드·본문 일부 출력
 # - 레이아웃: [광고] → [요약/본문1] → [상단 이미지 2] → <hr> → [중간광고] → [본문2]
@@ -24,9 +26,12 @@ MODEL             = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 if not (WP_URL and WP_USER and WP_APP_PASSWORD and OPENAI_API_KEY):
     raise RuntimeError("'.env'의 WP_URL, WP_USER, WP_APP_PASSWORD, OPENAI_API_KEY 를 확인하세요.")
 
+client = OpenAI(api_key=OPENAI_API_KEY)
+auth   = HTTPBasicAuth(WP_USER, WP_APP_PASSWORD)
+
 # ── 게시/분류/키워드 ─────────────────────────────────────
-POST_STATUS       = os.getenv("POST_STATUS", "publish")   # publish | draft | future
-SCHEDULE_KST_HOUR = int(os.getenv("SCHEDULE_KST_HOUR", "9"))
+POST_STATUS       = os.getenv("POST_STATUS", "future")   # publish | draft | future
+SCHEDULE_KST_HOUR = int(os.getenv("SCHEDULE_KST_HOUR", "10"))
 KEYWORDS_CSV      = os.getenv("KEYWORDS_CSV","keywords.csv")
 EXISTING_CATEGORIES = [s.strip() for s in os.getenv(
     "EXISTING_CATEGORIES", "뉴스,비공개,쇼핑,전체글,게시글,정보,취미"
@@ -46,9 +51,6 @@ NUM_IMAGES      = 2
 IMAGE_SIZE      = os.getenv("IMAGE_SIZE", "1024x1024")
 IMAGE_QUALITY_WEBP  = int(os.getenv("IMAGE_QUALITY_WEBP","82"))
 IMAGE_PROMPT_STYLE  = "중립적 다큐 사진, 자연스러운 색감, 텍스트/워터마크 없음, 과도한 인물 클로즈업 피함, 폭력/성적/범죄/정치 선동 배제"
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-auth   = HTTPBasicAuth(WP_USER, WP_APP_PASSWORD)
 
 # ── 글로벌 스타일(CSS) ──────────────────────────────────
 STYLE_GLOBAL = """
@@ -189,14 +191,24 @@ IMG_PROMPT_GUIDE = """
 반환 예: ["설명1","설명2",...]
 """
 
-def gen_title(keyword: str) -> str:
+def gen_title(keyword: str, hour: str) -> str:
     print(f"[1/10] 제목 생성… ({keyword})")
-    r = client.chat.completions.create(model=MODEL, messages=[{"role":"user","content": TITLE_GUIDE + f"\n키워드: {keyword}"}])
-    title = (r.choices[0].message.content or "").strip()
+    try:
+        r = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role":"user","content": TITLE_GUIDE + f"\n키워드: {keyword}"}]
+        )
+        title = (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[경고] 제목 생성 실패: {e} → 기본 제목 사용")
+        title = f"{keyword} 핵심정리와 실전 가이드"
+
     title = re.sub(r"[\"“”‘’'<>]", "", title)
     title = re.sub(r"\s+", " ", title).strip()
-    if len(title) < 20: title = f"{keyword} 핵심정리와 실전 가이드"
-    return title[:30]
+    if len(title) < 20:
+        title = f"{keyword} 핵심정리와 실전 가이드"
+    # ✅ 워크플로 Guard와 일치하는 마커를 제목 앞에 부착
+    return f"[예약:{hour}] {title[:30]}"
 
 def gen_body1(keyword: str, title: str) -> str:
     print("[2/10] 요약/본문1 생성…")
@@ -379,6 +391,28 @@ def ensure_term(kind:str, name:str)->int|None:
     r.raise_for_status()
     return r.json()["id"]
 
+# ── 중복 예약 이중 가드(스크립트 차원) ───────────────────
+def already_scheduled_for_hour(hour: str) -> bool:
+    """오늘 KST 00:00~23:59 사이 'future' 글 중 제목에 [예약:hour]가 있으면 True"""
+    try:
+        kst = ZoneInfo("Asia/Seoul")
+        today = datetime.now(kst).date()
+        after  = datetime(today.year, today.month, today.day, 0,0,0, tzinfo=kst).isoformat()
+        before = datetime(today.year, today.month, today.day, 23,59,59, tzinfo=kst).isoformat()
+
+        url = f"{WP_URL}/wp-json/wp/v2/posts"
+        params = {"status":"future", "after":after, "before":before, "per_page":100}
+        r = requests.get(url, auth=auth, params=params, timeout=30)
+        print(f"[DBG] Guard-check code={r.status_code}")
+        print(f"[DBG] Guard body: {r.text[:200]}")
+        r.raise_for_status()
+        posts = r.json()
+        return any(f"[예약:{hour}]" in (p.get("title",{}).get("rendered","")) for p in posts)
+    except Exception as e:
+        print(f"[DBG] Guard-check error: {e}")
+        # 가드 오류시 안전을 위해 False 반환(진행)
+        return False
+
 # ── 포스팅 ─────────────────────────────────────────────
 def create_post(title, content_html, cat_ids, tag_ids, featured_media_id=None):
     payload = {
@@ -411,10 +445,16 @@ def create_post(title, content_html, cat_ids, tag_ids, featured_media_id=None):
 
 # ── 메인(글 1개) ───────────────────────────────────────
 def main():
-    keyword = load_keyword(KEYWORDS_CSV)
-    print(f"[0/10] 대상 키워드: {keyword}")
+    hour = str(SCHEDULE_KST_HOUR)
+    # 선행 가드: 오늘 동일 회차 이미 예약되어 있으면 종료(워크플로 Guard와 이중 방지)
+    if POST_STATUS == "future" and already_scheduled_for_hour(hour):
+        print(f"[가드] 오늘 {hour}KST 예약글이 이미 존재합니다. 종료합니다.")
+        raise SystemExit(0)
 
-    title  = gen_title(keyword)
+    keyword = load_keyword(KEYWORDS_CSV)
+    print(f"[0/10] 대상 키워드: {keyword} / 회차: {hour}KST")
+
+    title  = gen_title(keyword, hour)   # ✅ 마커 포함
     body1  = gen_body1(keyword, title)
     body2  = gen_body2(keyword, title)
 
