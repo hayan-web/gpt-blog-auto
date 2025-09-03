@@ -1,4 +1,4 @@
-﻿requests
+requests
 python-dotenv
 pillow
 openai

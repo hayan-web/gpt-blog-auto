@@ -1,8 +1,8 @@
-name: Auto Post to WordPress
+name: Auto Post 2/day (under10)
 
 on:
   schedule:
-    - cron: "0 1,8 * * *"   # 매일 KST 10:00, 17:00 실행 (UTC 01:00, 08:00)
+    - cron: "5 0 * * *"   # 매일 09:05 (KST) 실행
   workflow_dispatch: {}
 
 concurrency:
@@ -13,11 +13,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -26,16 +23,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ Secrets 필수값 존재 확인
-      - name: Check required secrets
-        run: |
-          test -n "${{ secrets.WP_URL }}" || (echo "WP_URL missing" && exit 1)
-          test -n "${{ secrets.WP_USER }}" || (echo "WP_USER missing" && exit 1)
-          test -n "${{ secrets.WP_APP_PASSWORD }}" || (echo "WP_APP_PASSWORD missing" && exit 1)
-          test -n "${{ secrets.OPENAI_API_KEY }}" || (echo "OPENAI_API_KEY missing" && exit 1)
-          test -n "${{ secrets.OPENAI_MODEL }}" || (echo "OPENAI_MODEL missing" && exit 1)
-
-      - name: Create .env from Secrets
+      - name: Inject .env
         run: |
           cat > .env << 'EOF'
           WP_URL=${{ secrets.WP_URL }}
@@ -43,52 +31,39 @@ jobs:
           WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
-          POST_STATUS=${{ secrets.POST_STATUS }}
+          OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
+          POST_STATUS=future
           KEYWORDS_CSV=keywords.csv
           SCHEDULE_KST_HOUR=9
           TAGS=${{ secrets.TAGS }}
           EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
           ALLOW_CREATE_TERMS=false
-          AD_METHOD=${{ secrets.AD_METHOD }}
-          AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
-          AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
-          NUM_IMAGES=3
-          IMAGE_SIZE=1024x1024
-          IMAGE_QUALITY_WEBP=82
-          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
-          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+          AD_METHOD=shortcode
+          AD_SHORTCODE=[ads_top]
+          AD_INSERT_MIDDLE=true
+          NUM_IMAGES=1
+          IMAGE_SIZE=768x768
+          IMAGE_QUALITY_WEBP=75
+          LOW_COST_MODE=true
+          MAX_TOKENS_BODY=900
+          MONTHLY_BUDGET_USD=10
+          BUDGET_MARGIN=0.85
+          COST_PER_MTOKEN_NANO=0.02
+          COST_PER_MTOKEN_MINI=0.15
+          COST_PER_IMAGE_1024=0.04
+          COST_PER_IMAGE_768=0.03
+          USAGE_DIR=.usage
+          CACHE_DIR=.cache
           EOF
 
-      - name: Update keywords (fetch 5~20 and shuffle)
+      - name: Prepare dirs
+        run: mkdir -p .usage .cache
+
+      - name: Update keywords
         run: python update_keywords.py
 
-      # 🐞 디버그: auto_wp_gpt.py 파일/환경/실행 확인
-      - name: Show auto_wp_gpt.py head/tail
-        run: |
-          echo "===== head(auto_wp_gpt.py) ====="
-          sed -n '1,80p' auto_wp_gpt.py || true
-          echo "===== tail(auto_wp_gpt.py) ====="
-          tail -n 60 auto_wp_gpt.py || true
+      - name: Generate & schedule 2 posts (under10)
+        run: python auto_wp_gpt.py --mode=two-posts
 
-      - name: Verbose run auto_wp_gpt.py
-        run: |
-          python - <<'PY'
-          import os, runpy, sys
-          print("[DBG] Python", sys.version)
-          print("[DBG] CWD", os.getcwd())
-          print("[DBG] Env sanity:", {k:bool(os.getenv(k)) for k in ["WP_URL","WP_USER","WP_APP_PASSWORD","OPENAI_API_KEY","OPENAI_MODEL"]})
-          try:
-              runpy.run_path("auto_wp_gpt.py", run_name="__main__")
-              print("[DBG] auto_wp_gpt.py finished with exit 0")
-          except SystemExit as e:
-              print("[DBG] SystemExit:", e.code)
-              raise
-          except Exception as e:
-              print("[DBG] Exception:", repr(e))
-              raise
-          PY
-
-      # ✅ (선택) 발행 후 키워드 회전
-      - name: Rotate keywords (move used keyword to bottom)
+      - name: Rotate keywords
         run: python rotate_keywords.py
