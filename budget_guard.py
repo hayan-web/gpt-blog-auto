@@ -68,16 +68,13 @@ def should_emergency_save():
     return current_cost_usd() >= MONTHLY_BUDGET_USD * BUDGET_MARGIN
 
 def recommend_models():
-    """ 예산 상황에 따른 모델 추천(자동 다운그레이드).
-        환경변수 값이 비어있으면 안전한 기본값으로 대체한다.
-    """
+    """환경변수 값이 비어있으면 안전 기본값으로 대체."""
     def _coalesce_env(name: str, default: str) -> str:
         v = os.getenv(name, "")
         v = (v or "").strip()
         return v if v else default
 
     if should_emergency_save():
-        # 강제 저비용: 본문도 nano
         return dict(short="gpt-5-nano", long="gpt-5-nano", max_tokens_body=700)
 
     short = _coalesce_env("OPENAI_MODEL", "gpt-5-nano")

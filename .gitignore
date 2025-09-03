@@ -1,4 +1,21 @@
-__pycache__/
+# env
 .env
-.cache/
+*.env
+
+# python
+__pycache__/
+*.pyc
+
+# caches
 .usage/
+.cache/
+
+# os/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# misc
+*.zip
+.py

@@ -1,7 +1,7 @@
 # rotate_keywords.py
 # 사용한 키워드를 CSV 맨 아래로 이동 (1줄 단위)
 
-import os, sys
+import os
 
 CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
 
