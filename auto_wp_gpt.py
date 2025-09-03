@@ -1,13 +1,12 @@
 # auto_wp_gpt.py
-# under10 모드 + 카테고리별 이미지 프롬프트 + OpenAI 사진형 썸네일 + 가독 CSS 본문
+# under10 모드 + 카테고리별 이미지 프롬프트 + OpenAI 사진형 썸네일(항상 OpenAI) + 가독 CSS 본문
 # - 텍스트: max_completion_tokens 사용(temperature 미전달)
 # - 제목: SERP 후킹형 자동 생성(22~32자)
 # - 본문: 순수 HTML(h2/h3/p/table) + 스타일 주입(콜아웃/표 반응형)
 # - 키워드: keywords.csv 전체에서 무작위 2개 선택
 # - 태그: 키워드 기반만 사용
-# - 이미지: IMAGE_SOURCE=openai → OpenAI 이미지 생성(문자 절대 금지), 아니면 thumbgen 로컬
-# - 이미지 size 보정: 768 등 비지원 값은 API 1024로 호출 후 저장 크기로 다운스케일
-# - 예산 85%↑: 본문 모델 nano 전환 + 이미지 0장
+# - 이미지: 항상 OpenAI 이미지(문자 절대 금지), 768 등 비지원 값은 API 1024로 호출 후 저장 크기로 다운스케일
+# - 예약: 10/17시 기준 → 현재 시각 지났으면 +1일 → 해당 시간대에 이미 예약이 있으면 날짜를 계속 +1일 (충돌 회피)
 
 import os, re, argparse, random, datetime as dt, io, base64
 from zoneinfo import ZoneInfo
@@ -17,8 +16,8 @@ from openai import OpenAI
 from PIL import Image
 
 from utils_cache import cached_call
-from budget_guard import log_llm, log_image, recommend_models, allowed_images
-from thumbgen import make_thumb
+from budget_guard import log_llm, log_image, recommend_models  # allowed_images 제거
+# thumbgen 사용 안 함 (항상 OpenAI)
 
 load_dotenv()
 client = OpenAI()
@@ -36,10 +35,10 @@ EXISTING_CATEGORIES = [x.strip() for x in os.getenv(
     "EXISTING_CATEGORIES", "뉴스,비공개,쇼핑,전체글,게시글,정보,취미"
 ).split(",") if x.strip()]
 
-NUM_IMAGES_DEFAULT = int(os.getenv("NUM_IMAGES", "1"))
-IMAGE_SOURCE = os.getenv("IMAGE_SOURCE", "openai").lower()  # openai | local
+NUM_IMAGES_DEFAULT = int(os.getenv("NUM_IMAGES", "1"))  # 현재 로직은 1장만 생성
+IMAGE_SOURCE = "openai"  # 항상 OpenAI 고정
 IMAGE_STYLE  = os.getenv("IMAGE_STYLE", "photo").lower()    # photo | illustration | flat | 3d
-IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")           # 기본 1024 (768도 입력 가능: API 1024로 보정)
+IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")           # 기본 1024 (768 입력 가능: API 1024로 보정)
 IMAGE_QUALITY_WEBP = int(os.getenv("IMAGE_QUALITY_WEBP", "75"))
 LOW_COST_MODE = os.getenv("LOW_COST_MODE", "true").lower() == "true"
 
@@ -234,8 +233,7 @@ def read_keywords_random(need=2):
                 parts = [x.strip() for x in row.split(",") if x.strip()]
                 words.extend(parts)
     # 중복 제거
-    uniq = []
-    seen = set()
+    uniq, seen = [], set()
     for w in words:
         base = w.strip()
         if base and base not in seen:
@@ -281,6 +279,11 @@ def wp_auth(): return (WP_USER, WP_APP_PASSWORD)
 
 def wp_post(url, **kw):
     r = requests.post(url, auth=wp_auth(), timeout=60, **kw)
+    r.raise_for_status()
+    return r.json()
+
+def wp_get(url, **kw):
+    r = requests.get(url, auth=wp_auth(), timeout=60, **kw)
     r.raise_for_status()
     return r.json()
 
@@ -369,7 +372,7 @@ def assemble_content(body: str, media_ids):
            (f"\n\n{ad_sc}\n\n" if ad_middle else "")
 
 # =========================
-# 이미지 생성 (OpenAI / Local)  —— 카테고리별 주제 힌트 + 스타일 + 사이즈 보정 + '문자 절대 금지'
+# 이미지 생성 (항상 OpenAI) —— 카테고리별 주제 힌트 + 스타일 + 사이즈 보정 + '문자 절대 금지'
 # =========================
 def _category_subject_hint(category: str, title: str) -> str:
     c = (category or "").strip()
@@ -431,25 +434,12 @@ def _gen_openai_image(title: str, category: str, size="1024x1024", out="thumb.we
     return out
 
 def make_images_or_template(title: str, category: str):
-    num_allowed = allowed_images(NUM_IMAGES_DEFAULT)
-
-    if IMAGE_SOURCE == "openai" and num_allowed > 0:
-        print(f"[image] OpenAI ({IMAGE_STYLE}, size={IMAGE_SIZE})")
-        path = _gen_openai_image(
-            title=cleanup_title(title),
-            category=category,
-            size=IMAGE_SIZE,
-            out="thumb.webp",
-            quality=IMAGE_QUALITY_WEBP
-        )
-        media_id = upload_media_to_wp(path)
-        return [media_id]
-
-    print(f"[image] LOCAL thumbgen (fallback) size={IMAGE_SIZE}")
-    path = make_thumb(
+    # 항상 OpenAI 이미지 1장 생성 (예산 가드 무시 요청 반영)
+    print(f"[image] OpenAI ({IMAGE_STYLE}, size={IMAGE_SIZE})")
+    path = _gen_openai_image(
         title=cleanup_title(title),
-        cat=category,
-        size=_size_tuple(IMAGE_SIZE),
+        category=category,
+        size=IMAGE_SIZE,
         out="thumb.webp",
         quality=IMAGE_QUALITY_WEBP
     )
@@ -457,16 +447,57 @@ def make_images_or_template(title: str, category: str):
     return [media_id]
 
 # =========================
-# 스케줄 (10:00 / 17:00 KST)
+# 스케줄 (10:00 / 17:00 KST) + 충돌 회피
 # =========================
+def _has_future_post_around(target_kst: dt.datetime, tolerance_min: int = 5) -> bool:
+    """
+    target_kst 주변(±tolerance_min)에 이미 예약된 포스트가 있으면 True.
+    WordPress REST: future 글 100개까지 조회해서 date_gmt 비교.
+    """
+    try:
+        arr = wp_get(f"{WP_URL}/wp-json/wp/v2/posts?status=future&per_page=100&orderby=date&order=asc")
+    except Exception:
+        return False  # 조회 실패시 보수적으로 False 처리(이월 안 함)
+
+    tgt_utc = target_kst.astimezone(dt.timezone.utc)
+    for p in arr:
+        dgmt = p.get("date_gmt")
+        if not dgmt:
+            continue
+        try:
+            # WP는 'YYYY-MM-DDTHH:MM:SS' 또는 '...Z'
+            if dgmt.endswith("Z"):
+                post_utc = dt.datetime.fromisoformat(dgmt.replace("Z", "+00:00"))
+            else:
+                post_utc = dt.datetime.fromisoformat(dgmt + "+00:00")
+        except Exception:
+            continue
+        delta_min = abs((post_utc - tgt_utc).total_seconds()) / 60.0
+        if delta_min <= tolerance_min:
+            return True
+    return False
+
 def pick_slot(idx: int):
+    """
+    idx=0 → 10:00 KST, idx=1 → 17:00 KST
+    - 현재 시각 이미 지났으면 +1일
+    - 해당 시간대에 이미 예약이 있으면 날짜를 계속 +1일 (충돌 회피)
+    """
     now = kst_now()
     base = now.date()
     hour = 10 if idx == 0 else 17
-    target = dt.datetime(base.year, base.month, base.day, hour, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-    if now >= target:
-        target = target + dt.timedelta(days=1)
-    return target
+    candidate = dt.datetime(base.year, base.month, base.day, hour, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    if now >= candidate:
+        candidate = candidate + dt.timedelta(days=1)
+
+    # 충돌 있으면 다음날로 계속 이월
+    safety = 0
+    while _has_future_post_around(candidate, tolerance_min=5):
+        candidate = candidate + dt.timedelta(days=1)
+        safety += 1
+        if safety > 60:  # 비정상 루프 방지
+            break
+    return candidate
 
 # =========================
 # 포스트 생성
