@@ -2,7 +2,7 @@ name: Auto Post 2/day (under10)
 
 on:
   schedule:
-    - cron: "5 0 * * *"   # 매일 09:05 (KST) 실행 (UTC 0:05)
+    - cron: "5 0 * * *"   # 매일 09:05 (KST)
   workflow_dispatch: {}
 
 concurrency:
@@ -42,6 +42,8 @@ jobs:
           AD_METHOD=shortcode
           AD_SHORTCODE=[ads_top]
           AD_INSERT_MIDDLE=true
+          IMAGE_SOURCE=openai
+          IMAGE_STYLE=photo
           NUM_IMAGES=1
           IMAGE_SIZE=768x768
           IMAGE_QUALITY_WEBP=75
@@ -55,6 +57,9 @@ jobs:
           COST_PER_IMAGE_768=0.03
           USAGE_DIR=.usage
           CACHE_DIR=.cache
+          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
           EOF
 
       - name: Prepare dirs
@@ -63,8 +68,5 @@ jobs:
       - name: Update keywords
         run: python update_keywords.py
 
-      - name: Generate & schedule 2 posts (under10)
+      - name: Generate & schedule 2 posts
         run: python auto_wp_gpt.py --mode=two-posts
-
-      - name: Rotate keywords
-        run: python rotate_keywords.py
