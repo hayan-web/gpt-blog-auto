@@ -1,11 +1,12 @@
 # auto_wp_gpt.py
-# 월 10달러 이하 모드 통합본 (최신 수정본)
+# 월 10달러 이하 모드 통합본 (coalesce + 최신 수정본)
 # - 한 번 실행에 2개 포스트(10시/17시) 예약
 # - 예산 가드: 토큰/이미지 자동 절약
 # - OpenAI 호출 캐시
 # - 템플릿 썸네일(WebP) 로컬 생성 후 업로드
 # - "전체글" 카테고리 항상 포함
 # - ask_openai: max_completion_tokens 사용 / temperature 미전달
+# - 모델 값 비었을 때 안전 기본값으로 보강
 
 import os, re, json, argparse, random, datetime as dt
 from zoneinfo import ZoneInfo
@@ -61,7 +62,7 @@ def approx_excerpt(body: str, n=140) -> str:
     return (txt[:n] + "…") if len(txt) > n else txt
 
 # ---------------------------
-# OpenAI 래퍼 (캐시 + 로깅)  ★ 최신 수정 포인트 ★
+# OpenAI 래퍼 (캐시 + 로깅)
 # ---------------------------
 def ask_openai(model: str, prompt: str, max_tokens=500, temperature=None):
     """
@@ -302,9 +303,10 @@ def pick_slot(idx: int):
 # ---------------------------
 def generate_two_posts(keywords_today):
     models = recommend_models()
-    M_SHORT = models["short"]
-    M_LONG = models["long"]
-    MAX_BODY = models["max_tokens_body"]
+    # ✅ 모델 값이 비어 있으면 안전 기본값으로 보강
+    M_SHORT = (models.get("short") or "").strip() or "gpt-5-nano"
+    M_LONG  = (models.get("long")  or "").strip() or "gpt-4o-mini"
+    MAX_BODY = models.get("max_tokens_body", 900)
 
     # 1) 공통 개요 1회
     context_prompt = f"""아래 2개 키워드 각각에 대해 SEO용 소제목 5개와 한줄요약을 간단히 제시하라.
