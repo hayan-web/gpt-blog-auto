@@ -1,64 +1,25 @@
-﻿# -*- coding: utf-8 -*-
-"""
-rotate_keywords.py
-- keywords.csv 의 첫 줄(방금 사용한 키워드)을 파일 맨 아래로 이동
-- 안전 처리: 파일 부재, 빈 파일, 1개만 있는 경우, 공백 라인 정리
-- 로깅 추가
-"""
+# rotate_keywords.py
+# 사용한 키워드를 CSV 맨 아래로 이동 (1줄 단위)
 
-import os
-import csv
-import logging
-from dotenv import load_dotenv
+import os, sys
 
-load_dotenv()
+CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
 
-KEYWORDS_CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
-
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-log = logging.getLogger("rotate_keywords")
-
-
-def read_keywords(path: str) -> list[str]:
-    if not os.path.exists(path):
-        return []
-    rows: list[str] = []
-    with open(path, "r", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        for row in reader:
-            if not row:
-                continue
-            kw = (row[0] or "").strip()
-            if kw:
-                rows.append(kw)
-    return rows
-
-
-def write_keywords(path: str, items: list[str]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        for it in items:
-            w.writerow([it])
-
-
-def main():
-    kws = read_keywords(KEYWORDS_CSV)
-    if not kws:
-        log.warning("keywords.csv is empty or missing. Nothing to rotate.")
+def rotate_once():
+    if not os.path.exists(CSV):
+        print(f"[warn] {CSV} not found; skip rotate.")
         return
-
-    if len(kws) == 1:
-        # 하나뿐이면 그대로 유지
-        write_keywords(KEYWORDS_CSV, kws)
-        log.info("Single keyword only. Rotation skipped.")
+    with open(CSV, "r", encoding="utf-8") as f:
+        rows = [line.rstrip("\n") for line in f if line.strip()]
+    if len(rows) <= 1:
+        print("[info] nothing to rotate")
         return
-
-    first = kws.pop(0)
-    kws.append(first)
-    write_keywords(KEYWORDS_CSV, kws)
-    log.info(f"✅ Rotated. New first: {kws[0]} (moved '{first}' to bottom)")
-
+    first = rows.pop(0)
+    rows.append(first)
+    with open(CSV, "w", encoding="utf-8") as f:
+        for r in rows:
+            f.write(r + "\n")
+    print("[OK] rotated keywords: moved first line to bottom.")
 
 if __name__ == "__main__":
-    main()
+    rotate_once()
