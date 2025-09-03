@@ -45,7 +45,7 @@ jobs:
           IMAGE_SOURCE=openai
           IMAGE_STYLE=photo
           NUM_IMAGES=1
-          IMAGE_SIZE=768x768
+          IMAGE_SIZE=1024x1024     # ← API 허용값으로 주입
           IMAGE_QUALITY_WEBP=75
           LOW_COST_MODE=true
           MAX_TOKENS_BODY=900

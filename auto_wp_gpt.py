@@ -5,6 +5,7 @@
 # - 본문: 순수 HTML(h2/h3/p/table) + 스타일 주입(콜아웃/표 반응형)
 # - 이미지: IMAGE_SOURCE=openai 이면 OpenAI 이미지 생성, 아니면 thumbgen 로컬
 # - 카테고리별 이미지 지시: 뉴스=현장 스냅, 쇼핑=제품 클로즈업, 정보=맥락 사물
+# - 이미지 size 보정: 768 등 비지원 값은 API 1024로 호출 후 저장 크기로 다운스케일
 # - 예산 85%↑: 본문 모델 nano 전환 + 이미지 0장
 
 import os, re, argparse, random, datetime as dt, io, base64
@@ -37,7 +38,7 @@ EXISTING_CATEGORIES = [x.strip() for x in os.getenv(
 NUM_IMAGES_DEFAULT = int(os.getenv("NUM_IMAGES", "1"))
 IMAGE_SOURCE = os.getenv("IMAGE_SOURCE", "openai").lower()  # openai | local
 IMAGE_STYLE  = os.getenv("IMAGE_STYLE", "photo").lower()    # photo | illustration | flat | 3d
-IMAGE_SIZE = os.getenv("IMAGE_SIZE", "768x768")             # 비용 가드: 768 권장
+IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")           # 기본 1024 (768도 입력 가능: API 1024로 보정)
 IMAGE_QUALITY_WEBP = int(os.getenv("IMAGE_QUALITY_WEBP", "75"))
 LOW_COST_MODE = os.getenv("LOW_COST_MODE", "true").lower() == "true"
 
@@ -49,7 +50,7 @@ def _size_tuple(s: str):
         w, h = s.lower().split("x")
         return (int(w), int(h))
     except Exception:
-        return (768, 768)
+        return (1024, 1024)
 
 def kst_now():
     return dt.datetime.now(ZoneInfo("Asia/Seoul"))
@@ -61,6 +62,31 @@ def approx_excerpt(body: str, n=140) -> str:
     txt = re.sub(r"<[^>]+>", " ", body or "")
     txt = re.sub(r"\s+", " ", txt).strip()
     return (txt[:n] + "…") if len(txt) > n else txt
+
+# --- OpenAI Image size helpers ---
+ALLOWED_API_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
+
+def _normalize_api_size(size_str: str) -> str:
+    """
+    OpenAI 이미지 API가 지원하는 size로 보정.
+    - 768x768 등 비지원 값을 넣으면 1024x1024로 자동 대체
+    """
+    s = (size_str or "").lower().strip()
+    if s in ALLOWED_API_SIZES:
+        return s
+    # 흔한 소형/정사각 요청은 1024 정사각으로
+    if any(x in s for x in ["768", "800", "512", "square"]):
+        return "1024x1024"
+    # 1536 힌트가 있으면 가로/세로 추정
+    if "1536" in s:
+        return "1536x1024" if s.startswith("1536x") else "1024x1536"
+    return "1024x1024"
+
+def _api_width(api_size: str) -> int:
+    if api_size == "1536x1024":
+        return 1536
+    # auto나 그 외는 1024로 가정
+    return 1024
 
 # =========================
 # 제목(후킹형)
@@ -325,7 +351,7 @@ def assemble_content(body: str, media_ids):
            (f"\n\n{ad_sc}\n\n" if ad_middle else "")
 
 # =========================
-# 이미지 생성 (OpenAI / Local)  —— 카테고리별 주제 힌트 + 스타일
+# 이미지 생성 (OpenAI / Local)  —— 카테고리별 주제 힌트 + 스타일 + 사이즈 보정
 # =========================
 def _category_subject_hint(category: str, title: str) -> str:
     """
@@ -371,14 +397,26 @@ def _image_prompt(title: str, category: str) -> str:
     # 공통 금지어 + 정사각형 컴포지션
     return f"{style} {hint} No text, captions, watermarks, or logos. Square composition. {base}"
 
-def _gen_openai_image(title: str, category: str, size="768x768", out="thumb.webp", quality=75):
+def _gen_openai_image(title: str, category: str, size="1024x1024", out="thumb.webp", quality=75):
+    # 1) API 호출용 size 보정
+    api_size = _normalize_api_size(size)
+    # 2) 프롬프트
     prompt = _image_prompt(title, category)
-    resp = client.images.generate(model="gpt-image-1", prompt=prompt, size=size, n=1)
+    # 3) 생성
+    resp = client.images.generate(model="gpt-image-1", prompt=prompt, size=api_size, n=1)
     b64 = resp.data[0].b64_json
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+    # 4) 저장 크기(환경 요청)로 리사이즈
+    save_w, save_h = _size_tuple(size)
+    if (img.width, img.height) != (save_w, save_h):
+        try:
+            img = img.resize((save_w, save_h), Image.LANCZOS)
+        except Exception:
+            img = img.resize((save_w, save_h))
+    # 5) 저장 + 비용 로깅(과금은 API size 기준)
     img.save(out, "WEBP", quality=quality)
-    px = int(size.split("x")[0]) if "x" in size else 768
-    log_image(size_px=px)  # 비용 로깅(근사)
+    log_image(size_px=_api_width(api_size))
+    print(f"[image] OpenAI api_size={api_size} save_size={save_w}x{save_h}")
     return out
 
 def make_images_or_template(title: str, category: str):
