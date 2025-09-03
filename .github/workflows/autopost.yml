@@ -2,7 +2,7 @@ name: Auto Post 2/day
 
 on:
   schedule:
-    - cron: "5 0 * * *"        # 매일 09:05 (KST) 실행
+    - cron: "5 0 * * *"      # 매일 09:05 KST
   workflow_dispatch: {}
 
 concurrency:
@@ -13,15 +13,13 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ✅ 한글 폰트 설치 (PIL 텍스트 오버레이용)
+      # 한글 폰트(썸네일 오버레이용)
       - name: Install Korean fonts
         run: |
           sudo apt-get update
@@ -35,49 +33,36 @@ jobs:
       - name: Write .env from Secrets
         run: |
           cat > .env << 'EOF'
-          # WordPress
           WP_URL=${{ secrets.WP_URL }}
           WP_USER=${{ secrets.WP_USER }}
           WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
 
-          # OpenAI
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
           OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
 
-          # Posting
           POST_STATUS=future
           KEYWORDS_CSV=keywords.csv
-          SCHEDULE_KST_HOUR=9
           TAGS=${{ secrets.TAGS }}
           EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
           ALLOW_CREATE_TERMS=false
 
-          # Ads
           AD_METHOD=shortcode
           AD_SHORTCODE=[ads_top]
           AD_INSERT_MIDDLE=true
 
-          # Images (항상 OpenAI 사용, 한글 오버레이 선명)
-          IMAGE_STYLE=illustration
+          IMAGE_STYLE=photo
           IMAGE_SIZE=1024x1024
-          IMAGE_QUALITY_WEBP=78
+          IMAGE_QUALITY_WEBP=80
           NUM_IMAGES=1
           LOW_COST_MODE=true
 
-          # (선택) 외부 소스 키
-          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
-          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
-
-          # Paths
           USAGE_DIR=.usage
           CACHE_DIR=.cache
           EOF
 
-      - name: Update keywords (10개 생성/덮어쓰기)
+      - name: Update keywords (overwrite 10)
         run: python update_keywords.py
 
-      # ✅ 두 개 포스트를 한 번에 예약(10시/17시, 충돌 시 다음날 이월)
       - name: Generate & schedule two posts
         run: python auto_wp_gpt.py --mode=two-posts
