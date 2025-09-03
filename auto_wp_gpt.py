@@ -76,20 +76,22 @@ def ask_openai(model: str, prompt: str, max_tokens=500, temperature=None):
              "content": "너는 간결한 한국어 SEO 라이터다. 군더더기 최소화, 사실 우선. 표절 금지."},
             {"role": "user", "content": prompt}
         ]
+
+        # ✔ 지원되는 인자만 전달
         create_kwargs = {
             "model": model,
             "messages": messages,
             "n": 1,
         }
         if max_tokens is not None:
-            create_kwargs["max_completion_tokens"] = max_tokens
+            create_kwargs["max_completion_tokens"] = max_tokens  # ★ 핵심: 여기가 꼭 있어야 함
 
         resp = client.chat.completions.create(**create_kwargs)
         text = resp.choices[0].message.content
-        log_llm(model, prompt, text)  # 비용 로깅(근사)
+        log_llm(model, prompt, text)
         return {"text": text}
 
-    # cached_call 키에는 그대로 max_tokens/temperature가 포함되어도 무방
+    # temperature는 캐시 키에만 남겨두고, API 호출엔 전달 안 함
     return cached_call(
         _call,
         model=model,
