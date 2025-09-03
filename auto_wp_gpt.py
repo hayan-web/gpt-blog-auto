@@ -1,5 +1,5 @@
 # auto_wp_gpt.py (no-image edition)
-# - 이미지 전부 제거: 썸네일/미디어 업로드/폰트/ Pillow 의존성 없음
+# - 이미지 전부 제거: 썸네일/미디어 업로드/폰트/Pillow 없음
 # - 본문: 코드펜스/엔티티 정리 → 순수 HTML, h2/h3 변환 + CSS
 # - 제목: 후킹형 자동 생성
 # - 키워드: keywords.csv 전체에서 무작위 2개
