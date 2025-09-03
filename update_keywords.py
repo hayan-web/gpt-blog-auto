@@ -1,47 +1,101 @@
 # update_keywords.py
-# 키워드 5~20개 수집 + 랜덤 셔플 (경량 버전: 로컬 CSV 유지 보수 위주)
-
-import os, random
+# Google RSS + NewsAPI + Naver Search API (뉴스) 기반 키워드 추출
+import os, re, random, requests
+from dotenv import load_dotenv
+load_dotenv()
 
 CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
+NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
+NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
-SEED_KEYWORDS = [
-    "AI 최신 동향", "스마트폰 신제품", "전기차 배터리 이슈", "건강 관리 팁",
-    "여행 준비 체크리스트", "워드프레스 최적화", "쿠팡 인기 상품", "나만의 재테크",
-    "간단 레시피 모음", "업무 자동화", "노트북 추천", "가성비 모니터",
-]
+def fetch_google_news(limit=80):
+    url = "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko"
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        titles = re.findall(r"<title>(.*?)</title>", r.text, flags=re.S)
+        return [re.sub(r"<.*?>", "", t).strip() for t in titles[1:limit+1] if t]
+    except Exception:
+        return []
 
-def ensure_csv():
-    if not os.path.exists(CSV):
-        # 기본 키워드 파일 생성
-        lines = []
-        random.shuffle(SEED_KEYWORDS)
-        for i in range(0, len(SEED_KEYWORDS), 2):
-            lines.append(", ".join(SEED_KEYWORDS[i:i+2]))
-        with open(CSV, "w", encoding="utf-8") as f:
-            for line in lines:
-                f.write(line + "\n")
-        print(f"[OK] created {CSV} with seed keywords.")
-        return
+def fetch_newsapi(limit=80):
+    if not NEWSAPI_KEY: return []
+    url = f"https://newsapi.org/v2/top-headlines?country=kr&pageSize={limit}"
+    try:
+        r = requests.get(url, headers={"X-Api-Key": NEWSAPI_KEY}, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        return [a.get("title","").strip() for a in data.get("articles",[]) if a.get("title")]
+    except Exception:
+        return []
 
-    # 파일 존재: 맨 윗줄이 비어있으면 보충
-    with open(CSV, "r", encoding="utf-8") as f:
-        rows = [r.strip() for r in f if r.strip()]
-    if not rows:
-        random.shuffle(SEED_KEYWORDS)
-        with open(CSV, "w", encoding="utf-8") as f:
-            for i in range(0, len(SEED_KEYWORDS), 2):
-                f.write(", ".join(SEED_KEYWORDS[i:i+2]) + "\n")
-        print(f"[OK] refilled {CSV} with seed keywords.")
-        return
+def fetch_naver_news(query="트렌드", display=50):
+    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET): return []
+    url = f"https://openapi.naver.com/v1/search/news.json?query={query}&display={display}"
+    headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID,
+               "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        items = r.json().get("items", [])
+        out = []
+        for it in items:
+            t = re.sub(r"<.*?>", "", it.get("title",""))
+            d = re.sub(r"<.*?>", "", it.get("description",""))
+            if t: out.append(t)
+            if d: out.append(d)
+        return out
+    except Exception:
+        return []
 
-    # 상단 키워드가 너무 유사하면 간단 셔플(가벼운 중복 완화)
-    rows = list(dict.fromkeys(rows))  # 중복 라인 제거
-    random.shuffle(rows)
+def normalize(txt):
+    txt = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", txt)
+    txt = re.sub(r"\s+", " ", txt)
+    return txt.strip()
+
+def build_candidates(texts, max_candidates=120):
+    tokens = []
+    for t in texts:
+        n = normalize(t)
+        parts = [p for p in n.split() if 1 < len(p) <= 15]
+        for k in range(2,5):
+            for i in range(len(parts)-k+1):
+                phrase = " ".join(parts[i:i+k])
+                if 4 <= len(phrase) <= 28:
+                    tokens.append(phrase)
+    uniq, seen = [], set()
+    for p in tokens:
+        key = p.lower()
+        if key in seen: continue
+        seen.add(key); uniq.append(p)
+        if len(uniq) >= max_candidates: break
+    return uniq
+
+def save_keywords(top_list, per_line=2, total_lines=10):
+    lines = []
+    idx = 0
+    for _ in range(total_lines):
+        chunk = top_list[idx:idx+per_line]
+        if not chunk: break
+        lines.append(", ".join(chunk))
+        idx += per_line
+    if not lines: lines = ["예시 키워드 1, 예시 키워드 2"]
     with open(CSV, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(r + "\n")
-    print(f"[OK] refreshed {CSV} (shuffled).")
+        for line in lines: f.write(line + "\n")
+    print(f"[OK] wrote {CSV}")
+
+def main():
+    titles = []
+    titles += fetch_google_news(limit=80)
+    titles += fetch_newsapi(limit=80)
+    titles += fetch_naver_news(query="트렌드", display=50)
+    if not titles:
+        base = ["AI 최신 동향", "전기차 배터리", "워드프레스 최적화", "스마트폰 신제품", "여행 체크리스트"]
+        random.shuffle(base); save_keywords(base); return
+    cands = build_candidates(titles, max_candidates=120)
+    random.shuffle(cands)
+    save_keywords(cands, per_line=2, total_lines=10)
 
 if __name__ == "__main__":
-    ensure_csv()
+    main()
