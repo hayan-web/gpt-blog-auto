@@ -1,8 +1,8 @@
-name: Auto Post 2/day (under10)
+name: Auto Post 2/day
 
 on:
   schedule:
-    - cron: "5 0 * * *"   # 매일 09:05 (KST)
+    - cron: "5 0 * * *"        # 매일 09:05 (KST) 실행
   workflow_dispatch: {}
 
 concurrency:
@@ -13,60 +13,71 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      # ✅ 한글 폰트 설치 (PIL 텍스트 오버레이용)
+      - name: Install Korean fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-cjk
+
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Inject .env
+      - name: Write .env from Secrets
         run: |
           cat > .env << 'EOF'
+          # WordPress
           WP_URL=${{ secrets.WP_URL }}
           WP_USER=${{ secrets.WP_USER }}
           WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
+
+          # OpenAI
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
           OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
+
+          # Posting
           POST_STATUS=future
           KEYWORDS_CSV=keywords.csv
           SCHEDULE_KST_HOUR=9
           TAGS=${{ secrets.TAGS }}
           EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
           ALLOW_CREATE_TERMS=false
+
+          # Ads
           AD_METHOD=shortcode
           AD_SHORTCODE=[ads_top]
           AD_INSERT_MIDDLE=true
-          IMAGE_SOURCE=openai
-          IMAGE_STYLE=photo
+
+          # Images (항상 OpenAI 사용, 한글 오버레이 선명)
+          IMAGE_STYLE=illustration
+          IMAGE_SIZE=1024x1024
+          IMAGE_QUALITY_WEBP=78
           NUM_IMAGES=1
-          IMAGE_SIZE=1024x1024     # ← API 허용값으로 주입
-          IMAGE_QUALITY_WEBP=75
           LOW_COST_MODE=true
-          MAX_TOKENS_BODY=900
-          MONTHLY_BUDGET_USD=10
-          BUDGET_MARGIN=0.85
-          COST_PER_MTOKEN_NANO=0.02
-          COST_PER_MTOKEN_MINI=0.15
-          COST_PER_IMAGE_1024=0.04
-          COST_PER_IMAGE_768=0.03
-          USAGE_DIR=.usage
-          CACHE_DIR=.cache
-          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+
+          # (선택) 외부 소스 키
           NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
+          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+
+          # Paths
+          USAGE_DIR=.usage
+          CACHE_DIR=.cache
           EOF
 
-      - name: Prepare dirs
-        run: mkdir -p .usage .cache
-
-      - name: Update keywords
+      - name: Update keywords (10개 생성/덮어쓰기)
         run: python update_keywords.py
 
-      - name: Generate & schedule 2 posts
+      # ✅ 두 개 포스트를 한 번에 예약(10시/17시, 충돌 시 다음날 이월)
+      - name: Generate & schedule two posts
         run: python auto_wp_gpt.py --mode=two-posts

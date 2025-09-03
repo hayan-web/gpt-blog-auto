@@ -1,29 +1,26 @@
 # auto_wp_gpt.py
-# under10 모드 + 카테고리별 이미지 프롬프트 + OpenAI 사진형 썸네일(항상 OpenAI) + 가독 CSS 본문
-# - 텍스트: max_completion_tokens 사용(temperature 미전달)
-# - 제목: SERP 후킹형 자동 생성(22~32자)
-# - 본문: 순수 HTML(h2/h3/p/table) + 스타일 주입(콜아웃/표 반응형)
-# - 키워드: keywords.csv 전체에서 무작위 2개 선택
-# - 태그: 키워드 기반만 사용
-# - 이미지: 항상 OpenAI 이미지(문자 절대 금지), 768 등 비지원 값은 API 1024로 호출 후 저장 크기로 다운스케일
-# - 예약: 10/17시 기준 → 현재 시각 지났으면 +1일 → 해당 시간대에 이미 예약이 있으면 날짜를 계속 +1일 (충돌 회피)
+# 단순 제약 썸네일: 항상 OpenAI 이미지 1장 생성 + 한글 제목 오버레이(선명)
+# - 최소 네거티브: no text/logo/watermark 만 금지(글자는 우리가 나중에 오버레이)
+# - 키워드: keywords.csv 전체에서 무작위 2개
+# - 태그: 키워드 기반
+# - 예약: 10/17시, 이미 예약 있으면 다음날로 이월
+# - 이미지 크기: 768 등은 API 1024로 보정 후 저장 크기로 다운스케일
 
-import os, re, argparse, random, datetime as dt, io, base64
+import os, re, argparse, random, datetime as dt, io, base64, textwrap
 from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from utils_cache import cached_call
-from budget_guard import log_llm, log_image, recommend_models  # allowed_images 제거
-# thumbgen 사용 안 함 (항상 OpenAI)
+from budget_guard import log_llm, log_image, recommend_models
 
 load_dotenv()
 client = OpenAI()
 
 # =========================
-# 환경변수
+# 환경
 # =========================
 WP_URL = os.getenv("WP_URL", "").rstrip("/")
 WP_USER = os.getenv("WP_USER", "")
@@ -35,25 +32,23 @@ EXISTING_CATEGORIES = [x.strip() for x in os.getenv(
     "EXISTING_CATEGORIES", "뉴스,비공개,쇼핑,전체글,게시글,정보,취미"
 ).split(",") if x.strip()]
 
-NUM_IMAGES_DEFAULT = int(os.getenv("NUM_IMAGES", "1"))  # 현재 로직은 1장만 생성
-IMAGE_SOURCE = "openai"  # 항상 OpenAI 고정
-IMAGE_STYLE  = os.getenv("IMAGE_STYLE", "photo").lower()    # photo | illustration | flat | 3d
-IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")           # 기본 1024 (768 입력 가능: API 1024로 보정)
-IMAGE_QUALITY_WEBP = int(os.getenv("IMAGE_QUALITY_WEBP", "75"))
+IMAGE_STYLE  = os.getenv("IMAGE_STYLE", "illustration").lower()  # 기본 일러스트 감성
+IMAGE_SIZE = os.getenv("IMAGE_SIZE", "1024x1024")
+IMAGE_QUALITY_WEBP = int(os.getenv("IMAGE_QUALITY_WEBP", "78"))
+NUM_IMAGES_DEFAULT = 1  # 고정 1장
 LOW_COST_MODE = os.getenv("LOW_COST_MODE", "true").lower() == "true"
 
 # =========================
 # 유틸
 # =========================
+def kst_now(): return dt.datetime.now(ZoneInfo("Asia/Seoul"))
+
 def _size_tuple(s: str):
     try:
         w, h = s.lower().split("x")
         return (int(w), int(h))
     except Exception:
         return (1024, 1024)
-
-def kst_now():
-    return dt.datetime.now(ZoneInfo("Asia/Seoul"))
 
 def cleanup_title(s: str) -> str:
     return re.sub(r"^\s*예약\s*", "", s or "").strip()
@@ -63,469 +58,387 @@ def approx_excerpt(body: str, n=140) -> str:
     txt = re.sub(r"\s+", " ", txt).strip()
     return (txt[:n] + "…") if len(txt) > n else txt
 
-# --- OpenAI Image size helpers ---
+# --- OpenAI 이미지 size 보정 ---
 ALLOWED_API_SIZES = {"1024x1024", "1024x1536", "1536x1024", "auto"}
-
 def _normalize_api_size(size_str: str) -> str:
-    """
-    OpenAI 이미지 API가 지원하는 size로 보정.
-    - 768x768 등 비지원 값을 넣으면 1024x1024로 자동 대체
-    """
     s = (size_str or "").lower().strip()
-    if s in ALLOWED_API_SIZES:
-        return s
-    # 흔한 소형/정사각 요청은 1024 정사각으로
-    if any(x in s for x in ["768", "800", "512", "square"]):
-        return "1024x1024"
-    # 1536 힌트가 있으면 가로/세로 추정
-    if "1536" in s:
-        return "1536x1024" if s.startswith("1536x") else "1024x1536"
+    if s in ALLOWED_API_SIZES: return s
+    if any(x in s for x in ["768","800","512","square"]): return "1024x1024"
+    if "1536" in s: return "1536x1024" if s.startswith("1536x") else "1024x1536"
     return "1024x1024"
-
 def _api_width(api_size: str) -> int:
-    if api_size == "1536x1024":
-        return 1536
-    # auto나 그 외는 1024로 가정
-    return 1024
+    return 1536 if api_size == "1536x1024" else 1024
 
 # =========================
-# 제목(후킹형)
-# =========================
-def normalize_title(s: str) -> str:
-    s = (s or "").strip()
-    s = re.sub(r'^[\'"“”‘’《「(]+', '', s)
-    s = re.sub(r'[\'"“”‘’》」)]+$', '', s)
-    s = re.sub(r'\s+', ' ', s)
-    return s
-
-def build_title(keyword: str, candidate: str) -> str:
-    t = cleanup_title(normalize_title(candidate))
-    if len(t) < 5:
-        t = f"{keyword} 한눈에 정리"
-    if len(t) > 60:
-        t = t[:60].rstrip()
-    return t
-
-HOOK_BENEFIT_TERMS = [
-    "총정리","가이드","방법","비법","체크리스트","꿀팁","가격","비교","추천","리뷰",
-    "정리","필수","초보","전문가","실전","한눈에","업데이트","최신","무료","혜택",
-    "주의","함정","핵심","요약","A부터 Z","비교표","차이"
-]
-HOOK_STOP_TERMS = ["제목 없음","예약","테스트","Test","sample"]
-
-def _score_title(t: str, keyword: str) -> float:
-    s = (t or "").strip()
-    L = len(s)
-    len_score = max(0, 10 - abs(26 - L))
-    num_score = 6 if any(ch.isdigit() for ch in s) else 0
-    hook_score = min(sum(1 for w in HOOK_BENEFIT_TERMS if w in s), 6)
-    kw_score = 6 if keyword.replace(" ", "") in s.replace(" ", "") else -10
-    dup_penalty = -4 if s.count(keyword) >= 2 else 0
-    bad_penalty = -8 if any(b in s for b in HOOK_STOP_TERMS) else 0
-    if any(c in s for c in ["★","☆","❤","🔥","?", "!", "…"]):
-        bad_penalty -= 4
-    return len_score + num_score + hook_score + kw_score + dup_penalty + bad_penalty
-
-def generate_hook_title(keyword: str, model_short: str) -> str:
-    prompt = (
-        f"키워드 '{keyword}'로 한국어 SEO 제목 8개를 생성하라.\n"
-        "- 각 제목은 22~32자\n"
-        "- 키워드를 자연스럽게 1회 포함\n"
-        "- 숫자(예: 7가지, 2025)나 후킹 단어(가이드, 총정리, 체크리스트, 추천 등) 활용\n"
-        "- 따옴표/이모지/특수문자 금지, 마침표 금지, 콜론/대괄호 금지\n"
-        "- 번호 매기지 말고, 각 제목을 한 줄에 하나씩 출력"
-    )
-    raw = ask_openai(model_short, prompt, max_tokens=200)["text"]
-    cands = [normalize_title(x) for x in raw.splitlines() if x.strip()]
-    if len(cands) < 3:
-        fb = ask_openai(model_short, f"'{keyword}' 핵심을 담은 24~28자 제목 3개만 한 줄씩.", max_tokens=120)["text"]
-        cands += [normalize_title(x) for x in fb.splitlines() if x.strip()]
-    ranked = sorted(cands, key=lambda t: _score_title(t, keyword), reverse=True)
-    best = ranked[0] if ranked else f"{keyword} 한눈에 정리"
-    return build_title(keyword, best)
-
-# =========================
-# 본문 정리 & CSS
+# 본문 CSS & 처리
 # =========================
 STYLES_CSS = """
 <style>
-.gpt-article{--accent:#2563eb;--muted:#475569;--line:#e5e7eb;--soft:#f8fafc;
-  font-size:16px; line-height:1.8; color:#0f172a;}
-.gpt-article h2{font-size:1.375rem;margin:28px 0 12px;padding:10px 14px;
-  border-left:4px solid var(--accent);background:#f8fafc;border-radius:10px;}
-.gpt-article h3{font-size:1.125rem;margin:20px 0 8px;color:#0b1440;}
-.gpt-article p{margin:10px 0;}
-.gpt-article ul,.gpt-article ol{margin:10px 0 10px 1.25rem;}
-.gpt-article .callout{margin:16px 0;padding:12px 14px;background:#eff6ff;
-  border-left:4px solid var(--accent);border-radius:10px;}
-.gpt-article .table-wrap{overflow-x:auto;margin:12px 0;}
-.gpt-article table{width:100%;border-collapse:separate;border-spacing:0;
-  border:1px solid var(--line);border-radius:12px;overflow:hidden;}
-.gpt-article thead th{background:#f3f4f6;font-weight:600;padding:10px;text-align:left;
-  border-bottom:1px solid var(--line);}
-.gpt-article tbody td{padding:10px;border-top:1px solid #f1f5f9;}
-.gpt-article tbody tr:nth-child(even){background:#fbfdff;}
-.gpt-article .mark{background:linear-gradient(transparent 65%, #ffe9a8 65%);}
-@media (max-width:640px){
-  .gpt-article{font-size:15px;}
-  .gpt-article h2{font-size:1.25rem;}
-  .gpt-article h3{font-size:1.05rem;}
-}
+.gpt-article{--accent:#2563eb;--line:#e5e7eb;font-size:16px;line-height:1.8;color:#0f172a}
+.gpt-article h2{font-size:1.375rem;margin:28px 0 12px;padding:10px 14px;border-left:4px solid var(--accent);background:#f8fafc;border-radius:10px}
+.gpt-article h3{font-size:1.125rem;margin:20px 0 8px;color:#0b1440}
+.gpt-article p{margin:10px 0}
+.gpt-article .table-wrap{overflow-x:auto;margin:12px 0}
+.gpt-article table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.gpt-article thead th{background:#f3f4f6;font-weight:600;padding:10px;text-align:left;border-bottom:1px solid var(--line)}
+.gpt-article tbody td{padding:10px;border-top:1px solid #f1f5f9}
+@media (max-width:640px){.gpt-article{font-size:15px}.gpt-article h2{font-size:1.25rem}.gpt-article h3{font-size:1.05rem}}
 </style>
 """
-
 def _md_headings_to_html(txt: str) -> str:
     txt = re.sub(r'^\s*####\s+(.+)$', r'<h4>\1</h4>', txt, flags=re.M)
     txt = re.sub(r'^\s*###\s+(.+)$', r'<h3>\1</h3>', txt, flags=re.M)
     txt = re.sub(r'^\s*##\s+(.+)$',  r'<h2>\1</h2>', txt, flags=re.M)
     txt = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', txt)
     return txt
-
-def _auto_callouts(txt: str) -> str:
-    pat = r'^\s*(핵심|주의|TIP|참고)\s*[:：]\s*(.+)$'
-    return re.sub(pat, r'<div class="callout"><strong>\1</strong> \2</div>', txt, flags=re.M)
-
-def _wrap_tables(txt: str) -> str:
-    return txt.replace('<table', '<div class="table-wrap"><table') \
-              .replace('</table>', '</table></div>')
-
 def process_body_html_or_md(body: str) -> str:
-    body2 = _md_headings_to_html(body or "")
-    body2 = _auto_callouts(body2)
-    body2 = _wrap_tables(body2)
-    return body2
+    return _md_headings_to_html(body or "")
 
 # =========================
-# OpenAI 텍스트 (캐시+로깅)
+# LLM
 # =========================
+from budget_guard import log_llm
+from utils_cache import cached_call
 def ask_openai(model: str, prompt: str, max_tokens=500, temperature=None):
     def _call(model, prompt, max_tokens=500, temperature=None):
         messages = [
-            {"role": "system",
-             "content": "너는 간결한 한국어 SEO 라이터다. 군더더기 최소화, 사실 우선. 표절 금지."},
-            {"role": "user", "content": prompt}
+            {"role": "system","content":"너는 간결한 한국어 SEO 라이터다. 군더더기 최소화, 사실 우선."},
+            {"role":"user","content":prompt},
         ]
-        create_kwargs = {"model": model, "messages": messages, "n": 1}
+        kwargs = {"model":model, "messages":messages, "n":1}
         if max_tokens is not None:
-            create_kwargs["max_completion_tokens"] = max_tokens
-        resp = client.chat.completions.create(**create_kwargs)
+            kwargs["max_completion_tokens"] = max_tokens
+        resp = client.chat.completions.create(**kwargs)
         text = resp.choices[0].message.content
         log_llm(model, prompt, text)
         return {"text": text}
-    return cached_call(_call, model=model, prompt=prompt,
-                       max_tokens=max_tokens, temperature=temperature)
+    return cached_call(_call, model=model, prompt=prompt, max_tokens=max_tokens, temperature=temperature)
 
 # =========================
-# 키워드 (무작위 선택)
+# 제목(후킹형)
+# =========================
+def normalize_title(s:str)->str:
+    s = (s or "").strip()
+    s = re.sub(r'^[\'"“”‘’《「(]+','',s); s=re.sub(r'[\'"“”‘’》」)]+$','',s)
+    return re.sub(r'\s+',' ',s)
+def build_title(keyword:str,candidate:str)->str:
+    t = cleanup_title(normalize_title(candidate))
+    if len(t)<5: t=f"{keyword} 한눈에 정리"
+    if len(t)>60: t=t[:60].rstrip()
+    return t
+HOOK_BENEFIT_TERMS=["총정리","가이드","방법","체크리스트","추천","리뷰","한눈에","최신","가격","비교","요약","핵심"]
+def _score_title(t,kw): 
+    L=len(t); return max(0,10-abs(26-L))+ (6 if any(ch.isdigit() for ch in t) else 0)+ min(sum(1 for w in HOOK_BENEFIT_TERMS if w in t),6)+ (6 if kw.replace(" ","") in t.replace(" ","") else -6)
+def generate_hook_title(keyword, model_short):
+    p=(f"키워드 '{keyword}'로 22~32자 한국어 SEO 제목 8개. "
+       "숫자/후킹단어 활용. 따옴표·이모지·대괄호·마침표 금지. 한 줄에 하나씩.")
+    raw=ask_openai(model_short,p,max_tokens=200)["text"]
+    cands=[normalize_title(x) for x in raw.splitlines() if x.strip()]
+    if len(cands)<3:
+        fb=ask_openai(model_short,f"'{keyword}' 핵심 24~28자 제목 3개만",max_tokens=120)["text"]
+        cands+=[normalize_title(x) for x in fb.splitlines() if x.strip()]
+    best=sorted(cands,key=lambda t:_score_title(t,keyword),reverse=True)[0] if cands else f"{keyword} 한눈에 정리"
+    return build_title(keyword,best)
+
+# =========================
+# 키워드/카테고리/태그
 # =========================
 def read_keywords_random(need=2):
-    """
-    keywords.csv의 모든 줄을 읽어 쉼표로 분해한 뒤,
-    중복 제거 후 무작위로 need개 반환.
-    (파일이 1줄만 있어도 '첫 두 개'가 아니라 '무작위 2개'를 고름)
-    """
-    words = []
+    words=[]
     if os.path.exists(KEYWORDS_CSV):
-        with open(KEYWORDS_CSV, "r", encoding="utf-8") as f:
+        with open(KEYWORDS_CSV,"r",encoding="utf-8") as f:
             for row in f:
-                row = row.strip()
-                if not row: continue
-                parts = [x.strip() for x in row.split(",") if x.strip()]
+                parts=[x.strip() for x in row.strip().split(",") if x.strip()]
                 words.extend(parts)
-    # 중복 제거
-    uniq, seen = [], set()
+    uniq=[]; seen=set()
     for w in words:
-        base = w.strip()
-        if base and base not in seen:
-            seen.add(base)
-            uniq.append(base)
-    if len(uniq) >= need:
-        return random.sample(uniq, k=need)
-    # 부족하면 시드 보충
-    while len(uniq) < need:
-        uniq.append(f"일반 키워드 {len(uniq)+1}")
+        b=w.strip()
+        if b and b not in seen:
+            seen.add(b); uniq.append(b)
+    if len(uniq)>=need: return random.sample(uniq,k=need)
+    while len(uniq)<need: uniq.append(f"일반 키워드 {len(uniq)+1}")
     return uniq[:need]
 
-# =========================
-# 카테고리/태그
-# =========================
-def auto_category(keyword: str) -> str:
-    k = keyword.lower()
-    if any(x in k for x in ["뉴스", "속보", "브리핑"]): return "뉴스"
-    if any(x in k for x in ["쇼핑", "추천", "리뷰", "제품"]): return "쇼핑"
+def auto_category(keyword:str)->str:
+    k=keyword.lower()
+    if any(x in k for x in ["뉴스","속보","브리핑"]): return "뉴스"
+    if any(x in k for x in ["쇼핑","추천","리뷰","제품"]): return "쇼핑"
     return "정보"
 
-def derive_tags_from_keyword(keyword: str, max_n=8):
-    """
-    키워드 문구에서만 태그를 생성.
-    - 전체 문구 1개 + 토큰화된 단어들(2~12자) 위주
-    - 본문에서 무작위 추출하지 않음
-    """
-    tags = []
-    kw = (keyword or "").strip()
-    if kw:
-        tags.append(kw)  # 전체 구문도 태그로
+def derive_tags_from_keyword(keyword:str,max_n=8):
+    tags=[]; kw=(keyword or "").strip()
+    if kw: tags.append(kw)
     for tok in re.findall(r"[A-Za-z가-힣0-9]{2,12}", kw):
-        if tok not in tags:
-            tags.append(tok)
-        if len(tags) >= max_n:
-            break
+        if tok not in tags: tags.append(tok)
+        if len(tags)>=max_n: break
     return tags[:max_n]
 
 # =========================
 # WP API
 # =========================
 def wp_auth(): return (WP_USER, WP_APP_PASSWORD)
-
-def wp_post(url, **kw):
-    r = requests.post(url, auth=wp_auth(), timeout=60, **kw)
-    r.raise_for_status()
-    return r.json()
-
-def wp_get(url, **kw):
-    r = requests.get(url, auth=wp_auth(), timeout=60, **kw)
-    r.raise_for_status()
-    return r.json()
+def wp_post(url,**kw): r=requests.post(url,auth=wp_auth(),timeout=60,**kw); r.raise_for_status(); return r.json()
+def wp_get(url,**kw): r=requests.get(url,auth=wp_auth(),timeout=60,**kw); r.raise_for_status(); return r.json()
 
 def ensure_categories(cat_names):
-    want = set(["전체글"] + [c for c in cat_names if c])
-    cats, page = [], 1
+    want=set(["전체글"]+[c for c in cat_names if c]); cats=[]; page=1
     while True:
-        url = f"{WP_URL}/wp-json/wp/v2/categories?per_page=100&page={page}"
-        r = requests.get(url, auth=wp_auth(), timeout=30)
-        if r.status_code == 400: break
-        r.raise_for_status()
-        arr = r.json()
+        url=f"{WP_URL}/wp-json/wp/v2/categories?per_page=100&page={page}"
+        r=requests.get(url,auth=wp_auth(),timeout=30); 
+        if r.status_code==400: break
+        r.raise_for_status(); arr=r.json()
         if not arr: break
         cats.extend(arr)
-        if len(arr) < 100: break
-        page += 1
-    name_to_id = {c.get("name"): c.get("id") for c in cats}
-    ids = [name_to_id[n] for n in want if n in name_to_id]
-    return ids
+        if len(arr)<100: break
+        page+=1
+    name_to_id={c.get("name"):c.get("id") for c in cats}
+    return [name_to_id[n] for n in want if n in name_to_id]
 
 def ensure_tags(tag_names):
-    want = set([t for t in tag_names if t]); ids = []
+    want=set([t for t in tag_names if t]); ids=[]
     for name in list(want)[:10]:
         try:
-            url = f"{WP_URL}/wp-json/wp/v2/tags?search={requests.utils.quote(name)}&per_page=1"
-            r = requests.get(url, auth=wp_auth(), timeout=20)
-            r.raise_for_status()
-            arr = r.json()
+            url=f"{WP_URL}/wp-json/wp/v2/tags?search={requests.utils.quote(name)}&per_page=1"
+            r=requests.get(url,auth=wp_auth(),timeout=20); r.raise_for_status()
+            arr=r.json()
             if arr: ids.append(arr[0]["id"])
-        except Exception:
-            continue
+        except Exception: continue
     return ids
 
-def _mime_from_ext(path: str):
-    ext = os.path.splitext(path.lower())[1]
-    return {
-        ".webp": "image/webp",
-        ".png":  "image/png",
-        ".jpg":  "image/jpeg",
-        ".jpeg": "image/jpeg"
-    }.get(ext, "application/octet-stream")
+def _mime_from_ext(path:str):
+    ext=os.path.splitext(path.lower())[1]
+    return {".webp":"image/webp",".png":"image/png",".jpg": "image/jpeg",".jpeg":"image/jpeg"}.get(ext,"application/octet-stream")
 
-def upload_media_to_wp(path: str):
-    filename = os.path.basename(path)
-    url = f"{WP_URL}/wp-json/wp/v2/media"
-    headers = {
-        "Content-Disposition": f'attachment; filename="{filename}"',
-        "Content-Type": _mime_from_ext(filename),
-    }
-    with open(path, "rb") as f:
-        r = requests.post(url, headers=headers, data=f, auth=wp_auth(), timeout=120)
-    r.raise_for_status()
-    j = r.json()
-    return j.get("id")
+def upload_media_to_wp(path:str):
+    url=f"{WP_URL}/wp-json/wp/v2/media"; fn=os.path.basename(path)
+    headers={"Content-Disposition":f'attachment; filename="{fn}"',"Content-Type":_mime_from_ext(fn)}
+    with open(path,"rb") as f:
+        r=requests.post(url,headers=headers,data=f,auth=wp_auth(),timeout=120)
+    r.raise_for_status(); return r.json().get("id")
 
-def publish_to_wordpress(title: str, content: str, categories, tags,
-                         featured_media=None, schedule_dt=None, status="future"):
-    url = f"{WP_URL}/wp-json/wp/v2/posts"
-    payload = {
-        "title": cleanup_title(title),
-        "content": content,
-        "status": status,
-        "excerpt": approx_excerpt(content),
-        "categories": categories or [],
-        "tags": tags or [],
-    }
-    if featured_media:
-        payload["featured_media"] = featured_media
-    if status == "future" and schedule_dt:
-        utc_dt = schedule_dt.astimezone(dt.timezone.utc)
-        payload["date_gmt"] = utc_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    return wp_post(url, json=payload)
+def publish_to_wordpress(title, content, categories, tags, featured_media=None, schedule_dt=None, status="future"):
+    url=f"{WP_URL}/wp-json/wp/v2/posts"
+    payload={"title":cleanup_title(title),"content":content,"status":status,
+             "excerpt":approx_excerpt(content),"categories":categories or [],"tags":tags or []}
+    if featured_media: payload["featured_media"]=featured_media
+    if status=="future" and schedule_dt:
+        utc=schedule_dt.astimezone(dt.timezone.utc)
+        payload["date_gmt"]=utc.strftime("%Y-%m-%dT%H:%M:%S")
+    return wp_post(url,json=payload)
 
 # =========================
-# 컨텐츠 조립
+# 썸네일: 프롬프트(제약 최소) + 제목 오버레이
 # =========================
-def assemble_content(body: str, media_ids):
-    cleaned = process_body_html_or_md(body)
-    article_html = f"{STYLES_CSS}\n<div class='gpt-article'>\n{cleaned}\n</div>"
-    ad_method = os.getenv("AD_METHOD", "shortcode")
-    ad_sc = os.getenv("AD_SHORTCODE", "[ads_top]")
-    ad_middle = os.getenv("AD_INSERT_MIDDLE", "true").lower() == "true"
-    if ad_method != "shortcode" or not ad_sc:
-        return article_html
-    return article_html.replace("</style>", f"</style>\n{ad_sc}\n", 1) + \
-           (f"\n\n{ad_sc}\n\n" if ad_middle else "")
-
-# =========================
-# 이미지 생성 (항상 OpenAI) —— 카테고리별 주제 힌트 + 스타일 + 사이즈 보정 + '문자 절대 금지'
-# =========================
-def _category_subject_hint(category: str, title: str) -> str:
-    c = (category or "").strip()
+def _category_subject_hint(category:str,title:str)->str:
+    c=(category or "").strip()
     if "뉴스" in c:
-        return (
-            "Photojournalistic scene representing the issue (location/objects: city street, conference room, "
-            "microphone stand, meeting table, screen with charts). Natural light, candid feel. "
-            "Avoid recognizable faces. No logos."
-        )
+        return ("Sports/press ambience or conference desk; microphones, notepad, stadium/venue hints; "
+                "clear central subject; cinematic light.")
     if "쇼핑" in c:
-        return (
-            "Hero product close-up on a clean neutral background. Soft daylight, subtle reflections, "
-            "emphasize materials and textures, minimal props. Studio look. No logos."
-        )
-    return (
-        "Contextual objects or workspace scene symbolizing the topic (desk with notebook/laptop/tools/graph). "
-        "Shallow depth of field, clean composition. No logos."
-    )
+        return ("Unbranded hero product close-up on neutral background; soft daylight; "
+                "material/texture emphasized; minimal props.")
+    return ("Workspace/desk context: laptop corner, blank notebook, pen, coffee mug; "
+            "clean composition; realistic light; shallow depth of field.")
 
-def _image_prompt(title: str, category: str) -> str:
-    base = f"Topic: {title}. Category: {category}."
-    hint = _category_subject_hint(category, title)
-
+def _image_prompt(title:str, category:str)->str:
+    # 최소 네거티브: 텍스트/로고/워터마크 금지 (글자는 우리가 나중에 오버레이)
+    negative = "no text, no typography, no logos, no watermarks"
     if IMAGE_STYLE == "photo":
-        style = "Photorealistic editorial stock photo, high detail, natural lighting, shallow depth of field."
-    elif IMAGE_STYLE in ("3d", "isometric"):
-        style = "Clean realistic 3D isometric render, soft global illumination, physically based materials."
-    elif IMAGE_STYLE == "illustration":
-        style = "Modern vector illustration with clean shapes and subtle gradients."
-    else:  # flat
-        style = "Flat minimal graphic with soft gradient background."
+        style = "Photorealistic or stylized photo, clear central subject, rich textures, cinematic lighting."
+    elif IMAGE_STYLE in ("3d","isometric"):
+        style = "Clean realistic 3D render, soft global illumination, physically based materials."
+    else:  # illustration / flat
+        style = "Modern vector illustration with soft gradients and rich detail."
+    return f"{style} {_category_subject_hint(category,title)} {negative}. Square composition."
 
-    # ★ 텍스트 절대 금지(한글/영문/숫자/간판/표지판/라벨/워터마크 등)
-    no_text = ("Absolutely no text of any language (no Korean Hangul, no English letters, no numbers), "
-               "no captions, no typography, no signage, no labels, no UI, no watermarks; "
-               "surfaces must be plain without any readable characters.")
-    return f"{style} {hint} {no_text} Square composition. {base}"
+# --- 한글 폰트 찾기 ---
+def _find_kr_font():
+    candidates = [
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansKR-Regular.otf",
+        "/usr/share/fonts/truetype/noto/NotoSansKR-Bold.otf",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "fonts/NotoSansKR-Bold.otf",
+        "NotoSansKR-Bold.otf",
+    ]
+    for p in candidates:
+        if os.path.exists(p): return p
+    return None
 
-def _gen_openai_image(title: str, category: str, size="1024x1024", out="thumb.webp", quality=75):
-    # 1) API 호출용 size 보정
+def _wrap_kr(draw, text, font, max_width, max_lines=2):
+    # 공백 기준 우선 줄바꿈, 없으면 문자 단위
+    words = text.split()
+    lines=[]
+    if len(words)>1:
+        cur=""
+        for w in words:
+            test = f"{cur} {w}".strip()
+            wbox = draw.textbbox((0,0), test, font=font, stroke_width=0)
+            if wbox[2]-wbox[0] <= max_width:
+                cur=test
+            else:
+                if cur: lines.append(cur); cur=w
+            if len(lines)>=max_lines: break
+        if cur and len(lines)<max_lines: lines.append(cur)
+    else:
+        # 공백 거의 없는 한글 문장 처리
+        cur=""
+        for ch in text:
+            test=cur+ch
+            wbox=draw.textbbox((0,0), test, font=font, stroke_width=0)
+            if wbox[2]-wbox[0] <= max_width: cur=test
+            else:
+                lines.append(cur); cur=ch
+                if len(lines)>=max_lines: break
+        if cur and len(lines)<max_lines: lines.append(cur)
+    return lines[:max_lines]
+
+def _overlay_title(img: Image.Image, title: str)->Image.Image:
+    title = cleanup_title(title)
+    W,H = img.size
+    font_path = _find_kr_font()
+    if not font_path:
+        print("[image] WARNING: Korean font not found. Skipping overlay.")
+        return img
+
+    draw = ImageDraw.Draw(img)
+    # 폰트 크기 탐색
+    max_w = int(W*0.85)
+    font_size = int(W*0.12)  # 시작값
+    while font_size>=18:
+        font = ImageFont.truetype(font_path, font_size)
+        lines=_wrap_kr(draw, title, font, max_w, max_lines=2)
+        # 전체 박스 크기 계산
+        line_heights=[]
+        line_width=0
+        for t in lines:
+            box=draw.textbbox((0,0), t, font=font, stroke_width=3)
+            line_heights.append(box[3]-box[1]); line_width=max(line_width, box[2]-box[0])
+        total_h=sum(line_heights) + int(font_size*0.6)
+        if line_width<=max_w and total_h<=int(H*0.6): break
+        font_size-=2
+    # 배경 라운드 박스
+    pad_x=int(font_size*0.7); pad_y=int(font_size*0.5)
+    box_w=line_width+pad_x*2
+    box_h=sum(line_heights)+pad_y*2 + int(font_size*0.2)
+    x=(W-box_w)//2; y=(H-box_h)//2
+    try:
+        draw.rounded_rectangle([x,y,x+box_w,y+box_h], radius=int(font_size*0.6), fill=(0,0,0,200))
+    except Exception:
+        draw.rectangle([x,y,x+box_w,y+box_h], fill=(0,0,0,200))
+    # 텍스트
+    ty=y+pad_y
+    for t in lines:
+        box=draw.textbbox((0,0), t, font=font, stroke_width=3)
+        tw=box[2]-box[0]
+        tx=x+(box_w-tw)//2
+        draw.text((tx,ty), t, font=font, fill="white", stroke_width=3, stroke_fill="black")
+        ty+= (box[3]-box[1])
+    return img
+
+def _gen_openai_image(title: str, category: str, size="1024x1024", out="thumb.webp", quality=78):
     api_size = _normalize_api_size(size)
-    # 2) 프롬프트
     prompt = _image_prompt(title, category)
-    # 3) 생성
     resp = client.images.generate(model="gpt-image-1", prompt=prompt, size=api_size, n=1)
     b64 = resp.data[0].b64_json
     img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
-    # 4) 저장 크기(환경 요청)로 리사이즈
+
+    # 저장 크기 맞추기
     save_w, save_h = _size_tuple(size)
     if (img.width, img.height) != (save_w, save_h):
-        try:
-            img = img.resize((save_w, save_h), Image.LANCZOS)
-        except Exception:
-            img = img.resize((save_w, save_h))
-    # 5) 저장 + 비용 로깅(과금은 API size 기준)
+        try: img = img.resize((save_w, save_h), Image.LANCZOS)
+        except Exception: img = img.resize((save_w, save_h))
+
+    # 제목 오버레이(선명한 한글)
+    img = _overlay_title(img, title)
+
     img.save(out, "WEBP", quality=quality)
     log_image(size_px=_api_width(api_size))
     print(f"[image] OpenAI api_size={api_size} save_size={save_w}x{save_h}")
     return out
 
 def make_images_or_template(title: str, category: str):
-    # 항상 OpenAI 이미지 1장 생성 (예산 가드 무시 요청 반영)
     print(f"[image] OpenAI ({IMAGE_STYLE}, size={IMAGE_SIZE})")
     path = _gen_openai_image(
         title=cleanup_title(title),
         category=category,
         size=IMAGE_SIZE,
         out="thumb.webp",
-        quality=IMAGE_QUALITY_WEBP
+        quality=IMAGE_QUALITY_WEBP,
     )
     media_id = upload_media_to_wp(path)
     return [media_id]
 
 # =========================
-# 스케줄 (10:00 / 17:00 KST) + 충돌 회피
+# 스케줄(10/17) + 충돌 시 다음날 이월
 # =========================
 def _has_future_post_around(target_kst: dt.datetime, tolerance_min: int = 5) -> bool:
-    """
-    target_kst 주변(±tolerance_min)에 이미 예약된 포스트가 있으면 True.
-    WordPress REST: future 글 100개까지 조회해서 date_gmt 비교.
-    """
     try:
         arr = wp_get(f"{WP_URL}/wp-json/wp/v2/posts?status=future&per_page=100&orderby=date&order=asc")
     except Exception:
-        return False  # 조회 실패시 보수적으로 False 처리(이월 안 함)
-
+        return False
     tgt_utc = target_kst.astimezone(dt.timezone.utc)
     for p in arr:
         dgmt = p.get("date_gmt")
-        if not dgmt:
-            continue
+        if not dgmt: continue
         try:
-            # WP는 'YYYY-MM-DDTHH:MM:SS' 또는 '...Z'
-            if dgmt.endswith("Z"):
-                post_utc = dt.datetime.fromisoformat(dgmt.replace("Z", "+00:00"))
-            else:
-                post_utc = dt.datetime.fromisoformat(dgmt + "+00:00")
+            post_utc = dt.datetime.fromisoformat(dgmt.replace("Z","+00:00")) if dgmt.endswith("Z") else dt.datetime.fromisoformat(dgmt + "+00:00")
         except Exception:
             continue
-        delta_min = abs((post_utc - tgt_utc).total_seconds()) / 60.0
+        delta_min = abs((post_utc - tgt_utc).total_seconds())/60.0
         if delta_min <= tolerance_min:
             return True
     return False
 
-def pick_slot(idx: int):
-    """
-    idx=0 → 10:00 KST, idx=1 → 17:00 KST
-    - 현재 시각 이미 지났으면 +1일
-    - 해당 시간대에 이미 예약이 있으면 날짜를 계속 +1일 (충돌 회피)
-    """
+def pick_slot(idx:int):
     now = kst_now()
     base = now.date()
-    hour = 10 if idx == 0 else 17
-    candidate = dt.datetime(base.year, base.month, base.day, hour, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
-    if now >= candidate:
-        candidate = candidate + dt.timedelta(days=1)
-
-    # 충돌 있으면 다음날로 계속 이월
-    safety = 0
-    while _has_future_post_around(candidate, tolerance_min=5):
-        candidate = candidate + dt.timedelta(days=1)
-        safety += 1
-        if safety > 60:  # 비정상 루프 방지
-            break
-    return candidate
+    hour = 10 if idx==0 else 17
+    cand = dt.datetime(base.year, base.month, base.day, hour, 0, 0, tzinfo=ZoneInfo("Asia/Seoul"))
+    if now >= cand: cand += dt.timedelta(days=1)
+    safety=0
+    while _has_future_post_around(cand,5):
+        cand += dt.timedelta(days=1); safety+=1
+        if safety>60: break
+    return cand
 
 # =========================
-# 포스트 생성
+# 컨텐츠 조립/생성/발행
 # =========================
+def assemble_content(body:str, media_ids):
+    cleaned = process_body_html_or_md(body)
+    html = f"{STYLES_CSS}\n<div class='gpt-article'>\n{cleaned}\n</div>"
+    ad_method=os.getenv("AD_METHOD","shortcode"); ad_sc=os.getenv("AD_SHORTCODE","[ads_top]")
+    ad_mid = os.getenv("AD_INSERT_MIDDLE","true").lower()=="true"
+    if ad_method!="shortcode" or not ad_sc: return html
+    return html.replace("</style>", f"</style>\n{ad_sc}\n", 1) + (f"\n\n{ad_sc}\n\n" if ad_mid else "")
+
+def auto_category(keyword:str)->str:
+    k = keyword.lower()
+    if any(x in k for x in ["뉴스","속보","브리핑"]): return "뉴스"
+    if any(x in k for x in ["쇼핑","추천","리뷰","제품"]): return "쇼핑"
+    return "정보"
+
 def generate_two_posts(keywords_today):
     models = recommend_models()
     M_SHORT = (models.get("short") or "").strip() or "gpt-5-nano"
     M_LONG  = (models.get("long")  or "").strip() or "gpt-4o-mini"
     MAX_BODY = models.get("max_tokens_body", 900)
 
-    context_prompt = f"""아래 2개 키워드를 각각 5개의 소제목과 한줄요약(각 120자 이내)으로 정리.
-- {keywords_today[0]}
-- {keywords_today[1]}
-간결하고 중복 없이."""
-    context = ask_openai(M_SHORT, context_prompt, max_tokens=500)["text"]
+    ctx = ask_openai(M_SHORT,
+        f"아래 2개 키워드 각각 5개 소제목과 한줄요약(각 120자 이내)만 목록으로.\n- {keywords_today[0]}\n- {keywords_today[1]}",
+        max_tokens=500)["text"]
 
-    posts = []
+    posts=[]
     for kw in keywords_today[:2]:
         body_prompt = (
-            "다음 개요를 바탕으로 약 1200자 본문을 '순수 HTML'로 작성하라. "
-            "마크다운(##, ###, 코드블럭, 백틱) 사용 금지. "
-            "섹션 제목은 <h2> / 소소제목은 <h3>, 단락은 <p>로만 구성. "
-            "중간에 1개의 비교 표를 <table><thead><tbody> 구조로 포함. "
-            "표는 3~5열, 3~6행으로 간결하게. "
-            "핵심 문구는 <strong>으로 강조. "
-            "특수한 클래스나 인라인 style 속성은 넣지 말 것. "
-            "마지막에 <h2>결론</h2> 섹션 포함.\n\n"
-            f"[키워드] {kw}\n[개요]\n{context}"
+            "다음 개요를 바탕으로 약 1000~1300자 본문을 '순수 HTML'로 작성하라. "
+            "섹션 <h2>, 소소제목 <h3>, 단락 <p>만 사용. "
+            "중간에 비교 표 1개(<table><thead><tbody>) 포함. "
+            "과한 인라인 스타일 금지. 마지막에 <h2>결론</h2> 포함.\n\n"
+            f"[키워드] {kw}\n[개요]\n{ctx}"
         )
         body_html = ask_openai(M_LONG, body_prompt, max_tokens=MAX_BODY)["text"]
         title = generate_hook_title(kw, M_SHORT)
@@ -533,31 +446,22 @@ def generate_two_posts(keywords_today):
     return posts
 
 def create_and_schedule_two_posts():
-    # 무작위 2개 키워드 선택
-    keywords_today = read_keywords_random(need=2)
-    posts = generate_two_posts(keywords_today)
-
+    kws = read_keywords_random(need=2)
+    posts = generate_two_posts(kws)
     for idx, post in enumerate(posts):
-        kw = post["keyword"]
-        final_title = build_title(kw, post["title"])
-
+        kw = post["keyword"]; final_title = build_title(kw, post["title"])
         cat_name = auto_category(kw)
-        cat_ids = ensure_categories([cat_name])  # "전체글"은 존재 시 포함
-
-        # 태그는 '키워드 기반'만
-        tags = derive_tags_from_keyword(kw, max_n=8)
-        t_ids = ensure_tags(tags)
-
+        cat_ids = ensure_categories([cat_name])
+        tag_ids = ensure_tags(derive_tags_from_keyword(kw,8))
         media_ids = make_images_or_template(final_title, category=cat_name)
-        schedule_time = pick_slot(idx)
-
+        sched = pick_slot(idx)
         res = publish_to_wordpress(
             title=final_title,
             content=assemble_content(post["body"], media_ids),
             categories=cat_ids,
-            tags=t_ids,
+            tags=tag_ids,
             featured_media=media_ids[0] if media_ids else None,
-            schedule_dt=schedule_time,
+            schedule_dt=sched,
             status=POST_STATUS
         )
         print(f"[OK] scheduled ({idx}) '{final_title}' -> {res.get('link')}")
@@ -567,12 +471,10 @@ def create_and_schedule_two_posts():
 # =========================
 def main():
     if not (WP_URL and WP_USER and WP_APP_PASSWORD):
-        raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 환경변수를 확인하세요 (.env/GitHub Secrets).")
-
+        raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 환경변수 필요(.env/Secrets).")
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="two-posts", help="two-posts (default)")
-    args = parser.parse_args()
-
+    parser.add_argument("--mode", default="two-posts")
+    _ = parser.parse_args()
     create_and_schedule_two_posts()
 
 if __name__ == "__main__":
