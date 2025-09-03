@@ -2,7 +2,7 @@ name: Auto Post 2/day
 
 on:
   schedule:
-    - cron: "5 0 * * *"      # 매일 09:05 KST
+    - cron: "5 0 * * *"      # 매일 09:05 KST 실행
   workflow_dispatch: {}
 
 concurrency:
@@ -19,12 +19,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # 한글 폰트(썸네일 오버레이용)
-      - name: Install Korean fonts
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y fonts-noto-cjk
-
       - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
@@ -33,30 +27,29 @@ jobs:
       - name: Write .env from Secrets
         run: |
           cat > .env << 'EOF'
+          # WordPress
           WP_URL=${{ secrets.WP_URL }}
           WP_USER=${{ secrets.WP_USER }}
           WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
 
+          # OpenAI
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
           OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
 
+          # Posting
           POST_STATUS=future
           KEYWORDS_CSV=keywords.csv
           TAGS=${{ secrets.TAGS }}
           EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
           ALLOW_CREATE_TERMS=false
 
+          # Ads
           AD_METHOD=shortcode
           AD_SHORTCODE=[ads_top]
           AD_INSERT_MIDDLE=true
 
-          IMAGE_STYLE=photo
-          IMAGE_SIZE=1024x1024
-          IMAGE_QUALITY_WEBP=80
-          NUM_IMAGES=1
-          LOW_COST_MODE=true
-
+          # Paths
           USAGE_DIR=.usage
           CACHE_DIR=.cache
           EOF
