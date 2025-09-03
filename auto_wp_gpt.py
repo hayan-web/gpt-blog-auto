@@ -3,8 +3,9 @@
 # - 텍스트: max_completion_tokens 사용(temperature 미전달)
 # - 제목: SERP 후킹형 자동 생성(22~32자)
 # - 본문: 순수 HTML(h2/h3/p/table) + 스타일 주입(콜아웃/표 반응형)
-# - 이미지: IMAGE_SOURCE=openai 이면 OpenAI 이미지 생성, 아니면 thumbgen 로컬
-# - 카테고리별 이미지 지시: 뉴스=현장 스냅, 쇼핑=제품 클로즈업, 정보=맥락 사물
+# - 키워드: keywords.csv 전체에서 무작위 2개 선택
+# - 태그: 키워드 기반만 사용
+# - 이미지: IMAGE_SOURCE=openai → OpenAI 이미지 생성(문자 절대 금지), 아니면 thumbgen 로컬
 # - 이미지 size 보정: 768 등 비지원 값은 API 1024로 호출 후 저장 크기로 다운스케일
 # - 예산 85%↑: 본문 모델 nano 전환 + 이미지 0장
 
@@ -216,23 +217,36 @@ def ask_openai(model: str, prompt: str, max_tokens=500, temperature=None):
                        max_tokens=max_tokens, temperature=temperature)
 
 # =========================
-# 키워드
+# 키워드 (무작위 선택)
 # =========================
-def read_top_keywords(need=2):
-    if not os.path.exists(KEYWORDS_CSV):
-        raise FileNotFoundError(f"{KEYWORDS_CSV} 가 없습니다.")
-    with open(KEYWORDS_CSV, "r", encoding="utf-8") as f:
-        rows = [r.strip() for r in f if r.strip()]
-    out = []
-    for row in rows:
-        for w in [x.strip() for x in row.split(",") if x.strip()]:
-            if w not in out:
-                out.append(w)
-            if len(out) >= need:
-                return out[:need]
-    while len(out) < need:
-        out.append(f"일반 키워드 {len(out)+1}")
-    return out[:need]
+def read_keywords_random(need=2):
+    """
+    keywords.csv의 모든 줄을 읽어 쉼표로 분해한 뒤,
+    중복 제거 후 무작위로 need개 반환.
+    (파일이 1줄만 있어도 '첫 두 개'가 아니라 '무작위 2개'를 고름)
+    """
+    words = []
+    if os.path.exists(KEYWORDS_CSV):
+        with open(KEYWORDS_CSV, "r", encoding="utf-8") as f:
+            for row in f:
+                row = row.strip()
+                if not row: continue
+                parts = [x.strip() for x in row.split(",") if x.strip()]
+                words.extend(parts)
+    # 중복 제거
+    uniq = []
+    seen = set()
+    for w in words:
+        base = w.strip()
+        if base and base not in seen:
+            seen.add(base)
+            uniq.append(base)
+    if len(uniq) >= need:
+        return random.sample(uniq, k=need)
+    # 부족하면 시드 보충
+    while len(uniq) < need:
+        uniq.append(f"일반 키워드 {len(uniq)+1}")
+    return uniq[:need]
 
 # =========================
 # 카테고리/태그
@@ -243,18 +257,22 @@ def auto_category(keyword: str) -> str:
     if any(x in k for x in ["쇼핑", "추천", "리뷰", "제품"]): return "쇼핑"
     return "정보"
 
-def auto_tags(keyword: str, body: str):
-    tags = set()
-    for t in re.split(r"[,\s/|]+", keyword):
-        t = t.strip()
-        if 2 <= len(t) <= 15: tags.add(t)
-    toks = re.findall(r"[A-Za-z가-힣0-9]{2,12}", re.sub(r"<[^>]+>", " ", body or ""))
-    random.shuffle(toks)
-    for t in toks:
-        if 2 <= len(t) <= 12:
-            tags.add(t)
-        if len(tags) >= 10: break
-    return list(tags)
+def derive_tags_from_keyword(keyword: str, max_n=8):
+    """
+    키워드 문구에서만 태그를 생성.
+    - 전체 문구 1개 + 토큰화된 단어들(2~12자) 위주
+    - 본문에서 무작위 추출하지 않음
+    """
+    tags = []
+    kw = (keyword or "").strip()
+    if kw:
+        tags.append(kw)  # 전체 구문도 태그로
+    for tok in re.findall(r"[A-Za-z가-힣0-9]{2,12}", kw):
+        if tok not in tags:
+            tags.append(tok)
+        if len(tags) >= max_n:
+            break
+    return tags[:max_n]
 
 # =========================
 # WP API
@@ -351,20 +369,14 @@ def assemble_content(body: str, media_ids):
            (f"\n\n{ad_sc}\n\n" if ad_middle else "")
 
 # =========================
-# 이미지 생성 (OpenAI / Local)  —— 카테고리별 주제 힌트 + 스타일 + 사이즈 보정
+# 이미지 생성 (OpenAI / Local)  —— 카테고리별 주제 힌트 + 스타일 + 사이즈 보정 + '문자 절대 금지'
 # =========================
 def _category_subject_hint(category: str, title: str) -> str:
-    """
-    카테고리별로 사진의 '주제/피사체' 힌트를 다르게 준다.
-    - 뉴스: 현장 스냅(장소/사물 위주, 인물 식별 피하기)
-    - 쇼핑: 제품 클로즈업(클린 배경, 재질 강조)
-    - 정보: 맥락 오브젝트(책상/도구/그래프 등 상징적 사물)
-    """
     c = (category or "").strip()
     if "뉴스" in c:
         return (
-            "Photojournalistic scene that represents the issue: location or objects such as city street, "
-            "conference room, microphone stand, meeting table, or screen with charts. Natural light, candid feel. "
+            "Photojournalistic scene representing the issue (location/objects: city street, conference room, "
+            "microphone stand, meeting table, screen with charts). Natural light, candid feel. "
             "Avoid recognizable faces. No logos."
         )
     if "쇼핑" in c:
@@ -372,11 +384,9 @@ def _category_subject_hint(category: str, title: str) -> str:
             "Hero product close-up on a clean neutral background. Soft daylight, subtle reflections, "
             "emphasize materials and textures, minimal props. Studio look. No logos."
         )
-    # 정보(기본)
     return (
-        "Contextual objects and workspace scene symbolizing the topic: desk setup with notebook, laptop, tools or "
-        "accessories, or environment details that imply the concept. Shallow depth of field, clean composition. "
-        "No logos."
+        "Contextual objects or workspace scene symbolizing the topic (desk with notebook/laptop/tools/graph). "
+        "Shallow depth of field, clean composition. No logos."
     )
 
 def _image_prompt(title: str, category: str) -> str:
@@ -384,9 +394,7 @@ def _image_prompt(title: str, category: str) -> str:
     hint = _category_subject_hint(category, title)
 
     if IMAGE_STYLE == "photo":
-        style = (
-            "Photorealistic editorial stock photo, high detail, natural lighting, shallow depth of field."
-        )
+        style = "Photorealistic editorial stock photo, high detail, natural lighting, shallow depth of field."
     elif IMAGE_STYLE in ("3d", "isometric"):
         style = "Clean realistic 3D isometric render, soft global illumination, physically based materials."
     elif IMAGE_STYLE == "illustration":
@@ -394,8 +402,11 @@ def _image_prompt(title: str, category: str) -> str:
     else:  # flat
         style = "Flat minimal graphic with soft gradient background."
 
-    # 공통 금지어 + 정사각형 컴포지션
-    return f"{style} {hint} No text, captions, watermarks, or logos. Square composition. {base}"
+    # ★ 텍스트 절대 금지(한글/영문/숫자/간판/표지판/라벨/워터마크 등)
+    no_text = ("Absolutely no text of any language (no Korean Hangul, no English letters, no numbers), "
+               "no captions, no typography, no signage, no labels, no UI, no watermarks; "
+               "surfaces must be plain without any readable characters.")
+    return f"{style} {hint} {no_text} Square composition. {base}"
 
 def _gen_openai_image(title: str, category: str, size="1024x1024", out="thumb.webp", quality=75):
     # 1) API 호출용 size 보정
@@ -491,7 +502,8 @@ def generate_two_posts(keywords_today):
     return posts
 
 def create_and_schedule_two_posts():
-    keywords_today = read_top_keywords(need=2)
+    # 무작위 2개 키워드 선택
+    keywords_today = read_keywords_random(need=2)
     posts = generate_two_posts(keywords_today)
 
     for idx, post in enumerate(posts):
@@ -500,7 +512,11 @@ def create_and_schedule_two_posts():
 
         cat_name = auto_category(kw)
         cat_ids = ensure_categories([cat_name])  # "전체글"은 존재 시 포함
-        t_ids = ensure_tags(auto_tags(kw, post["body"]))
+
+        # 태그는 '키워드 기반'만
+        tags = derive_tags_from_keyword(kw, max_n=8)
+        t_ids = ensure_tags(tags)
+
         media_ids = make_images_or_template(final_title, category=cat_name)
         schedule_time = pick_slot(idx)
 

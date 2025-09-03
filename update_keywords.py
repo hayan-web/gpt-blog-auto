@@ -1,5 +1,5 @@
 # update_keywords.py
-# 오늘의 키워드 20개 수집 → keywords.csv를 "그 한 줄만" 남기도록 완전 덮어쓰기
+# 오늘의 키워드 10개 수집 → keywords.csv를 "그 한 줄만" 남기도록 완전 덮어쓰기
 # 소스: NewsAPI, Naver News API, Google News RSS (키 없으면 가능한 소스만 사용)
 
 import os, re, random, requests, xml.etree.ElementTree as ET
@@ -87,7 +87,7 @@ def extract_phrases_ko(title: str):
             cands.add(w)
     return list(cands)
 
-def rank_and_pick(phrases, k=20):
+def rank_and_pick(phrases, k=10):
     # 빈도 + 길이 가중치
     freq = {}
     for p in phrases:
@@ -98,7 +98,8 @@ def rank_and_pick(phrases, k=20):
         score = c * 10 + min(L, 12)
         scored.append((score, p))
     scored.sort(reverse=True)
-    pool = [p for _, p in scored[:80]]
+    # 상위 풀에서 무작위 섞어 k개 추출
+    pool = [p for _, p in scored[:60]]
     random.shuffle(pool)
     out, seen = [], set()
     for p in pool:
@@ -118,15 +119,15 @@ def write_today_keywords_only(keywords):
     new_first = ", ".join(keywords)
     with open(CSV, "w", encoding="utf-8", newline="\n") as f:
         f.write(new_first + "\n")
-    print("[OK] wrote ONLY today's 20 keywords (file truncated):")
+    print("[OK] wrote ONLY today's 10 keywords (file truncated):")
     print(new_first)
 
 # -------------------- 메인 --------------------
 SEED_BACKUP = [
-    "경제 동향", "주식 시장", "환율 전망", "부동산 정책", "전기차 배터리",
-    "스마트폰 신제품", "AI 트렌드", "클라우드 보안", "원자재 가격", "반도체 수요",
-    "소비자 물가", "관광 산업", "우주 탐사", "헬스케어 웨어러블", "친환경 에너지",
-    "해외 직구", "업무 자동화", "생산성 도구", "디지털 마케팅", "무료 소프트웨어"
+    "경제 동향","주식 시장","환율 전망","부동산 정책","전기차 배터리",
+    "스마트폰 신제품","AI 트렌드","클라우드 보안","원자재 가격","반도체 수요",
+    "소비자 물가","관광 산업","우주 탐사","헬스케어 웨어러블","친환경 에너지",
+    "해외 직구","업무 자동화","생산성 도구","디지털 마케팅","무료 소프트웨어"
 ]
 
 def main():
@@ -140,15 +141,13 @@ def main():
         phrases += extract_phrases_ko(t)
 
     # 소스가 비거나 부족하면 시드로 보충
-    if len(set(phrases)) < 20:
+    if len(set(phrases)) < 10:
         phrases += SEED_BACKUP
 
-    picked = rank_and_pick(phrases, k=20)
-    # 안전장치: 최소 2개는 확보
+    picked = rank_and_pick(phrases, k=10)
     if len(picked) < 2:
-        picked = (SEED_BACKUP + picked)[:20]
+        picked = (SEED_BACKUP + picked)[:10]
 
-    # 🔥 완전 덮어쓰기
     write_today_keywords_only(picked)
 
 if __name__ == "__main__":
