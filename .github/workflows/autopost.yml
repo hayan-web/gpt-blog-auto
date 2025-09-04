@@ -26,64 +26,64 @@ jobs:
           pip install -r requirements.txt
 
       - name: Write .env from Secrets (do not commit secrets)
-  run: |
-    cat > .env << EOF
-    # ===== WordPress =====
-    WP_URL=${{ secrets.WP_URL }}
-    WP_USER=${{ secrets.WP_USER }}
-    WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
-    WP_TLS_VERIFY=${{ secrets.WP_TLS_VERIFY }}
-    # ===== OpenAI (일상글 2건 생성용) =====
-    OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-    OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
-    OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
-    MAX_TOKENS_BODY=900
-    # ===== Coupang Partners =====
-    COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
-    COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
-    COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
-    COUPANG_SUBID_PREFIX=${{ secrets.COUPANG_SUBID_PREFIX }}
-    REQUIRE_COUPANG_API=${{ secrets.REQUIRE_COUPANG_API }}
-    AFFILIATE_TIME_KST=${{ secrets.AFFILIATE_TIME_KST }}
-    # ===== Posting / Taxonomy =====
-    POST_STATUS=future
-    KEYWORDS_CSV=keywords.csv
-    ALLOW_CREATE_TERMS=${{ secrets.ALLOW_CREATE_TERMS }}
-    EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
-    # ===== Affiliate Content =====
-    PRODUCTS_SEED_CSV=products_seed.csv
-    DEFAULT_CATEGORY=정보
-    DEFAULT_TAGS=쿠팡,추천,리뷰
-    AFFILIATE_CATEGORY=쇼핑
-    AFFILIATE_TAGS=쿠팡,파트너스,추천
-    DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
-    # ===== Ads =====
-    AD_METHOD=${{ secrets.AD_METHOD }}
-    AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
-    AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
-    # ===== Keywords Auto Update =====
-    NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
-    NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
-    NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
-    KEYWORDS_K=10
-    BAN_KEYWORDS=${{ secrets.BAN_KEYWORDS }}
-    BACKUP_OLD_KEYWORDS=true
-    USER_AGENT=gpt-blog-keywords/1.0
-    # ===== Cache / Logs =====
-    USAGE_DIR=.usage
-    CACHE_DIR=.cache
-    LLM_LOG_FILENAME=llm.log
-    CACHE_TTL_DEFAULT=86400
-    CACHE_MAX_FILES=500
-    CACHE_DISABLE=false
-    # ===== Flow switches =====
-    KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}
-    SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}
-    USE_IMAGE=${{ secrets.USE_IMAGE }}
-    BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}
-    # ===== Debug =====
-    DRY_RUN=
-    EOF
+        run: |
+          cat > .env << EOF
+          # ===== WordPress =====
+          WP_URL=${{ secrets.WP_URL }}
+          WP_USER=${{ secrets.WP_USER }}
+          WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
+          WP_TLS_VERIFY=${{ secrets.WP_TLS_VERIFY }}
+          # ===== OpenAI (일상글 2건 생성용) =====
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
+          OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
+          MAX_TOKENS_BODY=900
+          # ===== Coupang Partners =====
+          COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
+          COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
+          COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
+          COUPANG_SUBID_PREFIX=${{ secrets.COUPANG_SUBID_PREFIX }}
+          REQUIRE_COUPANG_API=${{ secrets.REQUIRE_COUPANG_API }}
+          AFFILIATE_TIME_KST=${{ secrets.AFFILIATE_TIME_KST }}
+          # ===== Posting / Taxonomy =====
+          POST_STATUS=future
+          KEYWORDS_CSV=keywords.csv
+          ALLOW_CREATE_TERMS=${{ secrets.ALLOW_CREATE_TERMS }}
+          EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
+          # ===== Affiliate Content =====
+          PRODUCTS_SEED_CSV=products_seed.csv
+          DEFAULT_CATEGORY=정보
+          DEFAULT_TAGS=쿠팡,추천,리뷰
+          AFFILIATE_CATEGORY=쇼핑
+          AFFILIATE_TAGS=쿠팡,파트너스,추천
+          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
+          # ===== Ads =====
+          AD_METHOD=${{ secrets.AD_METHOD }}
+          AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
+          AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
+          # ===== Keywords Auto Update =====
+          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
+          KEYWORDS_K=10
+          BAN_KEYWORDS=${{ secrets.BAN_KEYWORDS }}
+          BACKUP_OLD_KEYWORDS=true
+          USER_AGENT=gpt-blog-keywords/1.0
+          # ===== Cache / Logs =====
+          USAGE_DIR=.usage
+          CACHE_DIR=.cache
+          LLM_LOG_FILENAME=llm.log
+          CACHE_TTL_DEFAULT=86400
+          CACHE_MAX_FILES=500
+          CACHE_DISABLE=false
+          # ===== Flow switches =====
+          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}   # random | rotate | first
+          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}         # rank | shuffle | rotate
+          USE_IMAGE=${{ secrets.USE_IMAGE }}                   # off | hotlink | upload
+          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}               # 비우면 랜덤 CTA
+          # ===== Debug =====
+          DRY_RUN=
+          EOF
 
       - name: "Preflight: show Coupang secrets status"
         run: |
