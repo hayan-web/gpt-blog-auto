@@ -1,52 +1,18 @@
-# env
+﻿# === secrets & local ===
 .env
-*.env
-.env.*
-!.env.example
-
-# python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
 .venv/
-venv/
-pip-wheel-metadata/
-*.egg-info/
-.eggs/
-build/
-dist/
-
-# caches
-.usage/
-.cache/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-coverage.xml
-
-# os/editor
-.DS_Store
-.AppleDouble
-._*
-Thumbs.db
 .vscode/
-.idea/
-
-# logs
-*.log
-
-# misc
-*.zip
-# 주의: 파이썬 소스 추적을 위해 '*.py'는 절대 넣지 마세요.
-# --- local secrets & caches ---
-.env
-.usage/
-.cache/
-.venv/
 __pycache__/
 *.pyc
 *.log
-# generated auxiliary
+
+# === caches & generated ===
+.usage/
+.cache/
+products_seed.csv
 products_seed.cleaned.csv
+keywords.csv
+
+# === misc local helpers ===
+run.bat
+post_test.py
