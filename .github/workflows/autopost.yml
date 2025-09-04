@@ -85,8 +85,7 @@ jobs:
           DRY_RUN=
           EOF
 
-      # 안전한 Preflight: env로 주입한 뒤 bash 변수로만 검사
-      - name: Preflight: show Coupang secrets status
+      - name: "Preflight: show Coupang secrets status"
         env:
           COUPANG_ACCESS_KEY: ${{ secrets.COUPANG_ACCESS_KEY }}
           COUPANG_SECRET_KEY: ${{ secrets.COUPANG_SECRET_KEY }}
@@ -97,7 +96,6 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY are empty. Affiliate seed will be skipped (fallback will be used)."
           fi
 
-      # 0) 오늘의 키워드 10개로 덮어쓰기 (뉴스 기반)
       - name: Update keywords (오늘 키워드 10개)
         run: |
           if [ -f update_keywords.py ]; then
@@ -106,7 +104,6 @@ jobs:
             echo "SKIP: update_keywords.py not found"
           fi
 
-      # 1) 쿠팡 씨앗 빌드 (키가 없으면 SKIP -> 아래 affiliate 폴백 사용)
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
@@ -115,7 +112,6 @@ jobs:
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      # 2) 씨앗 품질 체크 (없으면 통과: 폴백 경로 사용)
       - name: Seed quality check (report + cleaned csv)
         run: |
           if [ -f seed_quality_check.py ]; then
@@ -125,7 +121,6 @@ jobs:
             echo "SKIP: seed_quality_check.py not found"
           fi
 
-      # 3) 일상글 2건 예약 (10:00 / 17:00 KST)
       - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -134,7 +129,6 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전
       - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail
