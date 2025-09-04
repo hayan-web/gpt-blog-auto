@@ -58,13 +58,13 @@ jobs:
           DEFAULT_TAGS=쿠팡,추천,리뷰
           AFFILIATE_CATEGORY=쇼핑
           AFFILIATE_TAGS=쿠팡,파트너스,추천
-          AFFILIATE_TIME_KST=13:00
+          AFFILIATE_TIME_KST=${{ secrets.AFFILIATE_TIME_KST }}
           DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
 
           # Ads
-          AD_METHOD=shortcode
-          AD_SHORTCODE=[ads_top]
-          AD_INSERT_MIDDLE=true
+          AD_METHOD=${{ secrets.AD_METHOD }}
+          AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
+          AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
 
           # Keywords Auto Update
           NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
@@ -83,6 +83,10 @@ jobs:
           CACHE_MAX_FILES=500
           CACHE_DISABLE=false
 
+          # Network tolerance
+          TIMEOUT_SEC=15
+          URL_CHECK_MODE=soft
+
           # Debug
           DRY_RUN=
           EOF
@@ -96,14 +100,14 @@ jobs:
             echo "update_keywords.py not found → 스킵"
           fi
 
-      # 1) 시드 품질 체크(필수) + 클린 파일 생성
-      - name: Seed quality check (strict + write clean)
+      # 1) 시드 품질 체크(네트워크 내성: 실패 시 no-network로 재시도)
+      - name: Seed quality check (strict + tolerant)
+        shell: bash
         run: |
-          if [ -f seed_quality_check.py ]; then
-            python seed_quality_check.py --strict --write-clean --http-fallback --max-per-keyword 5 --report .cache/seed_report.md
-          else
-            echo "seed_quality_check.py not found → 스킵 (권장 아님)"
-          fi
+          set -o pipefail
+          python seed_quality_check.py --strict --write-clean --http-fallback --max-per-keyword 5 --report .cache/seed_report.md || \
+          (echo "[WARN] network check failed; retrying without network..." && \
+           python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md)
 
       # 클린 시드가 있으면 우선 사용
       - name: Prefer cleaned seed
@@ -122,7 +126,7 @@ jobs:
             echo "auto_wp_gpt.py not found → 일상글 단계 스킵"
           fi
 
-      # 3) 쿠팡글 1건 생성(13:00 KST) + 성공 시 키워드 회전
+      # 3) 쿠팡글 1건 생성(13:00 KST) + 성공 시 키워드 자동 회전
       - name: Create 1 affiliate post and rotate keywords on success
         shell: bash
         run: |

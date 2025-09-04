@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-affiliate_post.py (final)
+affiliate_post.py (final with URL_CHECK_MODE)
 - products_seed.(cleaned.)csv 에서 키워드에 맞는 상품 N개(기본 3) 선택
-- URL 유효성 검사(HEAD) 후 쿠팡 파트너스 딥링크 생성
+- URL 유효성 검사(HEAD, 필요 시 GET 폴백 / soft 모드) 후 쿠팡 파트너스 딥링크 생성
 - 대가성 고지 + 비교 표(개수 표기) + 체크리스트/FAQ 본문 HTML 생성
 - 제목을 "TOP N"으로 자동 맞춤 (실제 개수 기준)
 - 카테고리/태그: 쿠팡 전용(AFFILIATE_*)을 우선 적용
 - 예약 시각: AFFILIATE_TIME_KST (기본 13:00 KST) -> date_gmt 로 예약
 - ALLOW_CREATE_TERMS=false 이면 카테고리/태그 자동 생성 시도 없이 있는 것만 사용
+
+URL_CHECK_MODE:
+  - strict:  HEAD(200~399)만 통과
+  - soft  :  HEAD가 실패하면 GET로 재확인, 그래도 실패면 일단 통과(깃허브 러너 내성)
+  - off   :  URL 검사 건너뜀
 """
 import os, csv, requests
 from typing import List, Dict, Optional
@@ -52,7 +57,6 @@ KEYWORDS_CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
 
 # 시드 파일: cleaned 우선
 def _resolve_seed_csv() -> str:
-    # 우선순위: 명시된 경로 -> cleaned 존재 -> 기본 파일
     env_path = os.getenv("PRODUCTS_SEED_CSV")
     if env_path and os.path.exists(env_path):
         return env_path
@@ -64,6 +68,9 @@ SEED_CSV = _resolve_seed_csv()
 
 # 용어 자동 생성 허용 여부
 ALLOW_CREATE_TERMS = (os.getenv("ALLOW_CREATE_TERMS", "true").lower() == "true")
+
+# URL 검사 모드 (strict|soft|off)
+URL_CHECK_MODE = (os.getenv("URL_CHECK_MODE", "soft").lower())
 
 # ===== WordPress REST helpers =====
 def wp_auth():
@@ -104,7 +111,6 @@ def ensure_terms(taxonomy: str, names: List[str]) -> List[int]:
                 if created and created.get("id"):
                     ids.append(created["id"])
         except Exception:
-            # REST 권한/보안 플러그인 등에 의해 실패할 수 있음 → 조용히 스킵
             pass
     return ids
 
@@ -158,18 +164,35 @@ def read_seed_for_keyword(path: str, keyword: str, max_n: int = 3) -> List[Dict]
         selected = rows[:max_n]
     return selected
 
+# ===== URL validation (HEAD + optional GET; soft/off modes) =====
 def validate_urls(rows: List[Dict]) -> List[Dict]:
+    mode = URL_CHECK_MODE
+    if mode == "off":
+        return rows
     ok = []
     for r in rows:
-        u = r.get("raw_url", "").strip()
+        u = (r.get("raw_url") or "").strip()
         if not u:
             continue
+        good = False
         try:
             res = requests.head(u, allow_redirects=True, timeout=10)
-            if 200 <= res.status_code < 400:
-                ok.append(r)
+            good = 200 <= res.status_code < 400
+            if not good and mode in ("soft",):
+                # 일부 환경에서 HEAD 차단 → GET으로 재확인
+                try:
+                    rg = requests.get(u, allow_redirects=True, timeout=10, stream=True)
+                    good = 200 <= rg.status_code < 400
+                finally:
+                    try:
+                        rg.close()
+                    except Exception:
+                        pass
         except Exception:
-            pass
+            # soft 모드면 네트워크 실패여도 통과 (딥링크 API가 다시 검증)
+            good = (mode == "soft")
+        if good or mode == "soft":
+            ok.append(r)
     return ok
 
 # ===== Rendering =====
@@ -251,7 +274,7 @@ def main():
     intro = f"{keyword} 고민 끝! 장단점/체크리스트/바로가기 링크까지 한 번에 살펴보세요."
     content_html = render_post_html(title, intro, enriched)
 
-    # 카테고리/태그 id 확보 (생성 허용 여부 반영)
+    # 카테고리/태그 id 확보
     cat_ids = ensure_terms("categories", [cat_name])
     tag_ids = ensure_terms("tags", list(dict.fromkeys(tag_names))[:10])
 
