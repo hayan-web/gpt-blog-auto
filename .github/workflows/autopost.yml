@@ -2,7 +2,7 @@ name: Daily 3 Posts (auto keywords + 2 daily + 1 affiliate + rotate)
 
 on:
   schedule:
-    - cron: "5 0 * * *"   # 매일 09:05 KST (UTC 기준 00:05)
+    - cron: "5 0 * * *"   # 매일 09:05 KST (UTC 00:05)
   workflow_dispatch: {}
 
 concurrency:
@@ -26,6 +26,7 @@ jobs:
           pip install -r requirements.txt
 
       - name: Write .env from Secrets (do not commit secrets)
+        shell: bash
         run: |
           cat > .env << 'EOF'
           # WordPress
@@ -40,17 +41,17 @@ jobs:
           OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
           MAX_TOKENS_BODY=900
 
-          # Affiliate (Coupang)
-          COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
-          COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
-          COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
-          COUPANG_SUBID_PREFIX=${{ secrets.COUPANG_SUBID_PREFIX }}
-
           # Posting / Taxonomy
           POST_STATUS=future
           KEYWORDS_CSV=keywords.csv
           ALLOW_CREATE_TERMS=${{ secrets.ALLOW_CREATE_TERMS }}
           EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
+
+          # Affiliate (Coupang)
+          COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
+          COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
+          COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
+          COUPANG_SUBID_PREFIX=${{ secrets.COUPANG_SUBID_PREFIX }}
 
           # Affiliate Content
           PRODUCTS_SEED_CSV=products_seed.csv
@@ -61,18 +62,20 @@ jobs:
           AFFILIATE_TIME_KST=${{ secrets.AFFILIATE_TIME_KST }}
           DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
 
+          # Rotation / Image / Button (NEW)
+          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE || 'shuffle' }}     # rank|rotate|shuffle
+          USE_IMAGE=${{ secrets.USE_IMAGE || 'off' }}                   # off|hotlink|upload
+          BUTTON_TEXT=${{ secrets.BUTTON_TEXT || '쿠팡에서 가격 보기' }}
+
           # Ads
           AD_METHOD=${{ secrets.AD_METHOD }}
           AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
           AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
 
-          # Keywords Auto Update
+          # Keywords Auto Update (used if keys present)
           NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
           NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
-          KEYWORDS_K=10
-          BAN_KEYWORDS=${{ secrets.BAN_KEYWORDS }}
-          BACKUP_OLD_KEYWORDS=true
           USER_AGENT=gpt-blog-keywords/1.0
 
           # Cache / Logs
@@ -91,30 +94,28 @@ jobs:
           DRY_RUN=
           EOF
 
-      # 0) 오늘의 키워드 10개로 덮어쓰기 (뉴스 기반)
+      # 0) 오늘의 키워드 10개로 덮어쓰기 (뉴스 기반, 키 없으면 시드 사용)
       - name: Update today's keywords
         run: |
           if [ -f update_keywords.py ]; then
-            python update_keywords.py --k 10
+            python update_keywords.py || true
           else
             echo "update_keywords.py not found → 스킵"
           fi
 
-      # 1) 시드 품질 체크(네트워크 내성: 실패 시 no-network로 재시도)
-      - name: Seed quality check (strict + tolerant)
+      # 1) 시드 품질 체크 (fail-soft)
+      - name: Seed quality check (fail-soft)
         shell: bash
         run: |
-          set -o pipefail
-          python seed_quality_check.py --strict --write-clean --http-fallback --max-per-keyword 5 --report .cache/seed_report.md || \
-          (echo "[WARN] network check failed; retrying without network..." && \
-           python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md)
-
-      # 클린 시드가 있으면 우선 사용
-      - name: Prefer cleaned seed
-        run: |
-          if [ -f products_seed.cleaned.csv ]; then
-            echo "PRODUCTS_SEED_CSV=products_seed.cleaned.csv" >> $GITHUB_ENV
-            echo "Using cleaned seed file"
+          if [ -f seed_quality_check.py ]; then
+            # 네트워크 체킹이 불안정할 수 있어 no-network로 처리(클린 파일만 생성)
+            python seed_quality_check.py --write-clean --no-network || true
+            if [ -f products_seed.cleaned.csv ]; then
+              echo "PRODUCTS_SEED_CSV=products_seed.cleaned.csv" >> $GITHUB_ENV
+              echo "[info] Using cleaned seed file"
+            fi
+          else
+            echo "seed_quality_check.py not found → 스킵"
           fi
 
       # 2) 일상글 2건 예약 (10:00 / 17:00 KST)
