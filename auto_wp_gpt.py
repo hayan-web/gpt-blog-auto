@@ -1,12 +1,7 @@
-# auto_wp_gpt.py — humanized daily posts (2/day)
-# - 사람 느낌 강화: 서사형 오프닝 → 요점 → 사례/팁 → 체크리스트 → 마무리
-# - AI티 방지: 반복어구/관용문구 치환, 문장 길이 다양화, 불필요한 메타 제거
-# - 순수 HTML만 사용: <h2>/<h3>/<p>/<ul>/<ol>/<li>/<table> 허용 (이미지/코드블록 X)
-# - 제목: 후킹형 자동 생성(‘쿠팡’/광고/과장 금지), 슬러그 자동 생성
-# - 키워드: keywords.csv에서 무작위 2개, 태그는 키워드 토큰 기반
-# - 예약: 10:00 / 17:00 KST, 해당 시각 충돌 시 다음날로 이월
-# - DRY_RUN=true 시 워드프레스 호출 없이 콘솔 출력만
-# - 광고 숏코드: 상단+중간 삽입(환경변수)
+# auto_wp_gpt.py — humanized daily posts (2/day) + WP TLS verify toggle
+# - 사람 느낌 강화 / 순수 HTML / 제목 후킹 / 10·17시 예약 중복 회피
+# - DRY_RUN=true 시 워드프레스 호출 없이 콘솔만
+# - NEW: WP_TLS_VERIFY 지원 (자체서명 SSL 환경 대응)
 
 import os, re, argparse, random, datetime as dt, html, requests
 from zoneinfo import ZoneInfo
@@ -26,6 +21,7 @@ client = OpenAI()
 WP_URL = os.getenv("WP_URL", "").rstrip("/")
 WP_USER = os.getenv("WP_USER", "")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
+WP_TLS_VERIFY = os.getenv("WP_TLS_VERIFY", "true").lower() != "false"  # <- NEW
 POST_STATUS = os.getenv("POST_STATUS", "future")
 
 KEYWORDS_CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
@@ -63,12 +59,12 @@ STYLES_CSS = """
 """
 
 AIY_PHRASES = [
-    "결론적으로", "요약하자면", "정리하자면", "전반적으로", "본 글에서는", "이번 글에서는",
-    "AI", "인공지능 모델로서", "독자 여러분", "마무리하면", "한편으로는"
+    "결론적으로","요약하자면","정리하자면","전반적으로","본 글에서는","이번 글에서는",
+    "AI","인공지능 모델로서","독자 여러분","마무리하면","한편으로는"
 ]
 AIY_REPLACEMENTS = [
-    "한 줄로 말하면", "핵심만 집어보면", "짧게 정리하면", "실전에서는", "", "",
-    "", "", "", "덧붙이면", ""
+    "한 줄로 말하면","핵심만 집어보면","짧게 정리하면","실전에서는","","",
+    "","","","덧붙이면",""
 ]
 
 def _md_headings_to_html(txt: str) -> str:
@@ -89,10 +85,8 @@ def _sanitize_llm_html(raw: str) -> str:
 
 def _humanize_text(html_text: str) -> str:
     s = html_text
-    # 반복적/관용적 표현 치환
     for a, b in zip(AIY_PHRASES, AIY_REPLACEMENTS):
         s = re.sub(rf"\b{re.escape(a)}\b", b, s)
-    # 너무 긴 문장 분절: 마침표 뒤 공백 2개로 변환 → 브라우저에서는 동일
     s = re.sub(r"([^.?!])\s{1}([가-힣A-Za-z])", r"\1 \2", s)
     return s
 
@@ -109,17 +103,10 @@ def process_body_html_or_md(body: str) -> str:
 def ask_openai(model: str, prompt: str, max_tokens=500, temperature=None):
     def _call(model, prompt, max_tokens=500, temperature=None):
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "너는 한국어 블로거. 군더더기 없이 명료하지만 건조하지 않게 쓴다. "
-                    "사실 확인이 어려운 수치는 범위(~, 약, 대략)로 표현하고, 과장 금지. "
-                    "클리셰/관료 표현/AI티 나는 문장 피하고, 문장 길이를 다양화하며 구체 예시를 든다."
-                ),
-            },
-            {"role": "user", "content": prompt},
+            {"role":"system","content":"너는 한국어 블로거. 군더더기 없이 명료하되 건조하지 않게 쓴다. 과장/광고 금지. 구체 팁과 사례."},
+            {"role":"user","content":prompt},
         ]
-        kwargs = {"model": model, "messages": messages, "n": 1}
+        kwargs = {"model":model, "messages":messages, "n":1}
         if max_tokens is not None:
             kwargs["max_completion_tokens"] = max_tokens
         resp = client.chat.completions.create(**kwargs)
@@ -151,9 +138,7 @@ def build_title(keyword:str,candidate:str)->str:
 
 def generate_hook_title(keyword, model_short):
     p=(f"키워드 '{keyword}'로 24~32자 한국어 블로그 제목 8개. "
-       "광고/쿠팡/과장/감탄사/이모지 금지. "
-       "짧고 명료, 실전형 단어(체크리스트/요령/가이드 등) 활용. "
-       "한 줄에 하나씩.")
+       "광고/쿠팡/과장/감탄사/이모지 금지. 실전형 단어 활용. 한 줄에 하나씩.")
     raw=ask_openai(model_short,p,max_tokens=220)["text"]
     cands=[normalize_title(x) for x in raw.splitlines() if x.strip()]
     if len(cands)<3:
@@ -185,7 +170,7 @@ def auto_category(keyword:str)->str:
     k=keyword.lower()
     if any(x in k for x in ["뉴스","속보","브리핑"]): return "뉴스"
     if any(x in k for x in ["쇼핑","추천","리뷰","제품"]): return "쇼핑"
-    return "전체글" if _has_category("전체글") else "정보"
+    return "전체글"
 
 def derive_tags_from_keyword(keyword:str,max_n=8):
     tags=[]; kw=(keyword or "").strip()
@@ -202,14 +187,16 @@ def wp_auth(): return (WP_USER, WP_APP_PASSWORD)
 def wp_post(url,**kw):
     if DRY_RUN:
         print(f"[DRY] POST {url}"); return {"id":0,"link":"(dry-run)"}
-    r=requests.post(url,auth=wp_auth(),timeout=60,**kw); r.raise_for_status(); return r.json()
+    r=requests.post(url,auth=wp_auth(),timeout=60,verify=WP_TLS_VERIFY,**kw)  # <- NEW
+    r.raise_for_status(); return r.json()
 def wp_get(url,**kw):
-    r=requests.get(url,auth=wp_auth(),timeout=60,**kw); r.raise_for_status(); return r.json()
+    r=requests.get(url,auth=wp_auth(),timeout=60,verify=WP_TLS_VERIFY,**kw)  # <- NEW
+    r.raise_for_status(); return r.json()
 
 def _has_category(name:str)->bool:
     try:
         url=f"{WP_URL}/wp-json/wp/v2/categories?search={requests.utils.quote(name)}&per_page=10"
-        arr=requests.get(url,auth=wp_auth(),timeout=20).json()
+        arr=requests.get(url,auth=wp_auth(),timeout=20,verify=WP_TLS_VERIFY).json()  # <- NEW
         return any(x.get("name")==name for x in arr)
     except Exception:
         return False
@@ -218,7 +205,7 @@ def ensure_categories(cat_names):
     want=set([c for c in cat_names if c]); cats=[]; page=1
     while True:
         url=f"{WP_URL}/wp-json/wp/v2/categories?per_page=100&page={page}"
-        r=requests.get(url,auth=wp_auth(),timeout=30)
+        r=requests.get(url,auth=wp_auth(),timeout=30,verify=WP_TLS_VERIFY)  # <- NEW
         if r.status_code==400: break
         r.raise_for_status(); arr=r.json()
         if not arr: break
@@ -226,7 +213,6 @@ def ensure_categories(cat_names):
         if len(arr)<100: break
         page+=1
     name_to_id={c.get("name"):c.get("id") for c in cats}
-    # '전체글' 있으면 항상 포함
     ids=[]
     if "전체글" in name_to_id: ids.append(name_to_id["전체글"])
     for n in want:
@@ -239,7 +225,8 @@ def ensure_tags(tag_names):
     for name in list(want)[:10]:
         try:
             url=f"{WP_URL}/wp-json/wp/v2/tags?search={requests.utils.quote(name)}&per_page=1"
-            r=requests.get(url,auth=wp_auth(),timeout=20); r.raise_for_status()
+            r=requests.get(url,auth=wp_auth(),timeout=20,verify=WP_TLS_VERIFY)  # <- NEW
+            r.raise_for_status()
             arr=r.json()
             if arr: ids.append(arr[0]["id"])
         except Exception: continue
@@ -250,7 +237,6 @@ def publish_to_wordpress(title, content, categories, tags, schedule_dt=None, sta
     payload={"title":title,"content":content,"status":status,
              "excerpt":approx_excerpt(content),
              "categories":categories or [],"tags":tags or []}
-    # 슬러그: 한글→영문
     try:
         payload["slug"]=slugify(title, separator="-")
     except Exception:
@@ -308,9 +294,8 @@ HUMAN_BODY_INSTR = (
     "아래 요구를 만족하는 '순수 HTML' 본문을 작성하라.\n"
     "형식: 섹션은 <h2>, 소제목은 <h3>, 문단은 <p>, 리스트는 <ul>/<ol>, 표는 <table><thead><tbody>만 사용.\n"
     "톤: 친근하지만 담백. 과장/광고 문구 금지. 구체 예시/실전 팁/자주 하는 실수/체크리스트 포함.\n"
-    "AI처럼 보이는 문구(결론적으로/요약하자면/본 글에서는 등) 금지. 불필요한 메타 코멘트 금지.\n"
-    "첫 부분에 2~3문장 '오프닝' → 이어서 '한 줄 요약'(<p><strong>…</strong></p>)을 넣고, 이후 본문 전개.\n"
-    "마지막은 <h2>마무리</h2> 섹션으로 실천 요점을 3~5개 리스트로 제시.\n"
+    "AI처럼 보이는 문구 금지. 첫 부분 오프닝 2~3문장 → <p><strong>한 줄 요약</strong></p> 포함.\n"
+    "마지막은 <h2>마무리</h2> 섹션으로 실천 요점 3~5개 리스트."
 )
 
 def generate_two_posts(keywords_today):
@@ -319,7 +304,6 @@ def generate_two_posts(keywords_today):
     M_LONG  = (models.get("long")  or "").strip() or "gpt-4o-mini"
     MAX_BODY = models.get("max_tokens_body", 950)
 
-    # 각 키워드별 개요 생성 (사람 느낌의 구성)
     ctx_all = {}
     for kw in keywords_today[:2]:
         ctx_prompt = (
@@ -346,7 +330,6 @@ def generate_two_posts(keywords_today):
     return posts
 
 def create_and_schedule_two_posts():
-    # 키워드 2개 랜덤
     words=[]
     if os.path.exists(KEYWORDS_CSV):
         with open(KEYWORDS_CSV,"r",encoding="utf-8") as f:
@@ -369,7 +352,6 @@ def create_and_schedule_two_posts():
         cat_ids = ensure_categories([cat_name])
         tag_ids = ensure_tags(derive_tags_from_keyword(kw,8))
         sched = pick_slot(idx)
-        # 본문 조립
         content = assemble_content(post["body"])
         res = publish_to_wordpress(
             title=final_title,
