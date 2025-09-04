@@ -1,7 +1,9 @@
 # update_keywords.py
-# 오늘의 키워드 K개 수집 → keywords.csv를 "그 한 줄만" 남기도록 완전 덮어쓰기
-# 소스: NewsAPI, Naver News API, Google News RSS (키 없으면 가능한 소스만 사용)
-# 패치: KEYWORDS_K(기본 10) 환경변수 반영, BAN_KEYWORDS(콤마) 필터링
+# 오늘의 키워드 10개 수집 → keywords.csv를 "그 한 줄만" 남기도록 완전 덮어쓰기
+# 개선점:
+#  - 문장형/존댓말/조사/매체 꼬리표 제거
+#  - 명사 위주 2~4그램 우선, 1그램은 보충 용도
+#  - 이상한 조합/예약됨/광고성 꼬리표 필터링 강화
 
 import os, re, random, requests, xml.etree.ElementTree as ET
 from urllib.parse import quote
@@ -28,7 +30,7 @@ def fetch_newsapi_titles(api_key: str, page_size=50):
 def fetch_naver_titles(client_id: str, client_secret: str, per_query=15):
     if not (client_id and client_secret):
         return []
-    queries = ["오늘", "속보", "경제", "정책", "기술", "신제품", "리뷰", "분석", "이슈"]
+    queries = ["오늘", "경제", "정책", "기술", "신제품", "리뷰", "분석", "이슈", "산업"]
     out = []
     for q in queries:
         try:
@@ -54,53 +56,105 @@ def fetch_google_rss_titles():
         for item in root.findall(".//item"):
             t = item.findtext("title")
             if t: titles.append(t)
-        return titles[:100]
+        return titles[:120]
     except Exception:
         return []
 
 # -------------------- 키워드 후보 추출 --------------------
+# 자주 보이는 군더더기/매체 꼬리표/문장 어미
+BAN_PATTERNS = re.compile(
+    r"(영상|포토|인터뷰|전문|기자|네티즌|종합|현장|단신|예약됨|속보|단독)"
+)
+
+# 조사/어미 정리
+JO_SA_1 = set("은는이가을를과와도만의에")  # 한 글자 조사
+JO_SA_2 = ("으로", "부터", "까지", "처럼", "보다", "에서", "에게", "조차", "마저")
+
+# 문장형/존댓말/불필요 꼬리 제거
+BAD_TAILS = (
+    "입니다", "합니다", "했다", "한다", "됐다", "되어", "된", "했다는", "한다는",
+    "될까", "될까?", "인가", "일까", "예정", "발표", "확인", "공식", "논란",
+)
+
 STOPWORDS = set("""
-속보 단독 영상 포토 인터뷰 전문 기자 네티즌 종합 현장 단신
-오늘 내일 어제 이번 지난 관련 발표 공개 확인 전망 공식 사실
+오늘 내일 어제 이번 지난 관련 발표 공개 확인 전망 공식 사실 계획 결정 효과 실시 진행
+정부 당국 당국자 업계 전문가 측 관계자 대표 위원회 협회 대학 은행 증권사
 """.split())
 
 def normalize_title(t: str) -> str:
-    t = re.sub(r"\s*[-–—]\s*[^-–—]+$", "", t)  # ' - 매체명' 제거
-    t = re.sub(r"\[[^\]]+\]|\([^)]+\)|【[^】]+】|<[^>]+>", " ", t)  # 괄호/태그 제거
-    t = re.sub(r"[“”\"'’‘·|·••▶▷▲△▼▽◆◇★☆…~!?:;]", " ", t)
+    # 뒤의 매체명/브랜드 꼬리 제거: ' - 매체', ' | 매체'
+    t = re.sub(r"\s*[-–—|]\s*[^\-–—\|]{1,20}$", "", t)
+    # 대괄호/괄호/태그 제거
+    t = re.sub(r"\[[^\]]+\]|\([^)]+\)|【[^】]+】|<[^>]+>", " ", t)
+    # 특수문자/이모지류 간소화
+    t = re.sub(r"[“”\"'’‘·|•▶▷▲△▼▽◆◇★☆…~!?:;#]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
+def strip_particle(w: str) -> str:
+    for j2 in JO_SA_2:
+        if w.endswith(j2) and len(w) > len(j2) + 1:
+            return w[: -len(j2)]
+    if len(w) >= 2 and w[-1] in JO_SA_1:
+        return w[:-1]
+    return w
+
+def valid_token(tok: str) -> bool:
+    if tok in STOPWORDS: return False
+    if BAN_PATTERNS.search(tok): return False
+    # 영숫자/한글만 허용
+    if not re.fullmatch(r"[가-힣A-Za-z0-9]+", tok): return False
+    # 한 글자명사 최소화
+    if len(tok) < 2: return False
+    return True
+
+def clean_phrase(p: str) -> str | None:
+    if BAN_PATTERNS.search(p): return None
+    for tail in BAD_TAILS:
+        if p.endswith(tail):
+            p = p[: -len(tail)]
+            break
+    toks = [strip_particle(x) for x in p.split() if x]
+    toks = [t for t in toks if valid_token(t)]
+    if not (2 <= len(toks) <= 4):  # 2~4그램 우선
+        return None
+    base = " ".join(toks)
+    if len(base.replace(" ", "")) < 4:
+        return None
+    return base
+
 def extract_phrases_ko(title: str):
     t = normalize_title(title)
-    toks = [w for w in t.split() if 2 <= len(w) <= 12 and w not in STOPWORDS]
+    if not t: return []
+    # 1) 2~4그램
+    toks = [w for w in t.split() if len(w) <= 12]
     cands = set()
-    # 2~4그램 우선
     for n in (4, 3, 2):
         if len(toks) < n: continue
         for i in range(len(toks)-n+1):
             p = " ".join(toks[i:i+n])
-            if len(p.replace(" ", "")) < 4: continue
-            cands.add(p)
-    # 1그램 보충
+            cp = clean_phrase(p)
+            if cp: cands.add(cp)
+    # 2) 1그램 보충(명사성 토큰만)
     for w in toks:
-        if 2 <= len(w) <= 10:
-            cands.add(w)
+        w2 = strip_particle(w)
+        if valid_token(w2) and 2 <= len(w2) <= 10:
+            cands.add(w2)
     return list(cands)
 
 def rank_and_pick(phrases, k=10):
-    # 빈도 + 길이 가중치
+    # 빈도 + 길이(명사성 가중) + 2~3그램 가산
     freq = {}
     for p in phrases:
         freq[p] = freq.get(p, 0) + 1
     scored = []
     for p, c in freq.items():
         L = len(p.replace(" ", ""))
-        score = c * 10 + min(L, 12)
+        grams = len(p.split())
+        score = c * 12 + min(L, 12) + (4 if grams in (2,3) else 0)
         scored.append((score, p))
     scored.sort(reverse=True)
-    # 상위 풀에서 무작위 섞어 k개 추출
-    pool = [p for _, p in scored[:60]]
+    pool = [p for _, p in scored[:80]]
     random.shuffle(pool)
     out, seen = [], set()
     for p in pool:
@@ -111,13 +165,12 @@ def rank_and_pick(phrases, k=10):
         if len(out) >= k: break
     return out
 
-# -------------------- CSV 쓰기(완전 덮어쓰기) --------------------
+# -------------------- CSV 덮어쓰기 --------------------
 def write_today_keywords_only(keywords):
-    """keywords.csv를 오늘 키워드 1줄만 남기도록 '완전히 덮어쓴다'."""
     new_first = ", ".join(keywords)
     with open(CSV, "w", encoding="utf-8", newline="\n") as f:
         f.write(new_first + "\n")
-    print("[OK] wrote ONLY today's keywords (file truncated):")
+    print("[OK] wrote ONLY today's 10 keywords (file truncated):")
     print(new_first)
 
 # -------------------- 메인 --------------------
@@ -130,30 +183,46 @@ SEED_BACKUP = [
 
 def main():
     titles = []
-    titles += fetch_newsapi_titles(NEWSAPI_KEY, page_size=50)
-    titles += fetch_naver_titles(NAVER_ID, NAVER_SECRET, per_query=15)
+    titles += fetch_newsapi_titles(NEWSAPI_KEY, page_size=60)
+    titles += fetch_naver_titles(NAVER_ID, NAVER_SECRET, per_query=18)
     titles += fetch_google_rss_titles()
 
     phrases = []
     for t in titles:
         phrases += extract_phrases_ko(t)
 
-    # BAN_KEYWORDS 필터링 (콤마 분리, 부분일치)
-    ban_raw = os.getenv("BAN_KEYWORDS", "").strip()
-    if ban_raw:
-        bans = [b.strip() for b in ban_raw.split(",") if b.strip()]
-        phrases = [p for p in phrases if not any(b in p for b in bans)]
-
-    # 소스가 비거나 부족하면 시드로 보충
-    K = int(os.getenv("KEYWORDS_K", "10"))
-    if len(set(phrases)) < K:
+    if len(set(phrases)) < 10:
         phrases += SEED_BACKUP
 
-    picked = rank_and_pick(phrases, k=K)
-    if len(picked) < 2:
-        picked = (SEED_BACKUP + picked)[:K]
+    picked = rank_and_pick(phrases, k=10)
+    if len(picked) < 10:
+        picked = (SEED_BACKUP + picked)[:10]
 
     write_today_keywords_only(picked)
 
 if __name__ == "__main__":
     main()
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--k", type=int, default=10, help="number of keywords to keep (default 10)")
+    args = ap.parse_args()
+    # expose desired k via env-like variable
+    K = args.k if args.k and args.k > 0 else 10
+    # monkey patch: rank_and_pick -> use K
+    def _main_with_k(k=K):
+        titles = []
+        titles.extend(fetch_newsapi_titles(NEWSAPI_KEY, page_size=50))
+        titles.extend(fetch_naver_titles(NAVER_ID, NAVER_SECRET, per_query=15))
+        titles.extend(fetch_google_rss_titles())
+        phrases = []
+        for t in titles:
+            phrases += extract_phrases_ko(t)
+        if len(set(phrases)) < k:
+            phrases += SEED_BACKUP
+        picked = rank_and_pick(phrases, k=k)
+        if len(picked) < 2:
+            picked = (SEED_BACKUP + picked)[:k]
+        write_today_keywords_only(picked)
+    _main_with_k()

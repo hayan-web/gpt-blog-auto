@@ -1,13 +1,15 @@
-# auto_wp_gpt.py — humanized daily posts (2/day) + WP TLS verify toggle
-# - 사람 느낌 강화 / 순수 HTML / 제목 후킹 / 10·17시 예약 중복 회피
-# - DRY_RUN=true 시 워드프레스 호출 없이 콘솔만
-# - NEW: WP_TLS_VERIFY 지원 (자체서명 SSL 환경 대응)
+# auto_wp_gpt.py — daily posts (fixed per-keyword outline + human titles)
+# - 각 키워드마다 개요/제목 별도 생성 (공유 ctx 버그 제거)
+# - 주제에 맞는 형식(뉴스/해설/가이드/리뷰/생활팁) 자동 선택 → 제목 품질 강화
+# - 어색한 꼬리(예약됨 등) 제거 필터
+# - 순수 HTML 본문(h2/h3/p + 1개 표), 상단/중간 숏코드 삽입 그대로 유지
+# - 예약: 10시/17시, 겹치면 익일로 자동 이월
 
-import os, re, argparse, random, datetime as dt, html, requests
+import os, re, argparse, random, datetime as dt, html
 from zoneinfo import ZoneInfo
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
-from slugify import slugify
 
 from utils_cache import cached_call
 from budget_guard import log_llm, recommend_models
@@ -21,7 +23,6 @@ client = OpenAI()
 WP_URL = os.getenv("WP_URL", "").rstrip("/")
 WP_USER = os.getenv("WP_USER", "")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD", "")
-WP_TLS_VERIFY = os.getenv("WP_TLS_VERIFY", "true").lower() != "false"  # <- NEW
 POST_STATUS = os.getenv("POST_STATUS", "future")
 
 KEYWORDS_CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
@@ -32,7 +33,13 @@ DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 # =========================
 def kst_now(): return dt.datetime.now(ZoneInfo("Asia/Seoul"))
 
-def approx_excerpt(body: str, n=160) -> str:
+def cleanup_title(s: str) -> str:
+    # 워드프레스 플러그인 자동 접두어/이상 문자열 제거
+    s = (s or "")
+    s = re.sub(r"\b예약됨\b", "", s)
+    return re.sub(r"\s{2,}", " ", s).strip()
+
+def approx_excerpt(body: str, n=140) -> str:
     s = body or ""
     s = re.sub(r"<style[^>]*>[\s\S]*?</style>", "", s, flags=re.I)
     s = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", s, flags=re.I)
@@ -45,11 +52,10 @@ def approx_excerpt(body: str, n=160) -> str:
 # =========================
 STYLES_CSS = """
 <style>
-.gpt-article{--accent:#2563eb;--line:#e5e7eb;font-size:16px;line-height:1.85;color:#0f172a}
+.gpt-article{--accent:#2563eb;--line:#e5e7eb;font-size:16px;line-height:1.8;color:#0f172a}
 .gpt-article h2{font-size:1.375rem;margin:28px 0 12px;padding:10px 14px;border-left:4px solid var(--accent);background:#f8fafc;border-radius:10px}
-.gpt-article h3{font-size:1.125rem;margin:18px 0 8px;color:#0b1440}
+.gpt-article h3{font-size:1.125rem;margin:20px 0 8px;color:#0b1440}
 .gpt-article p{margin:10px 0}
-.gpt-article ul, .gpt-article ol{margin:8px 0 12px 18px}
 .gpt-article .table-wrap{overflow-x:auto;margin:12px 0}
 .gpt-article table{width:100%;border-collapse:separate;border-spacing:0;border:1px solid var(--line);border-radius:12px;overflow:hidden}
 .gpt-article thead th{background:#f3f4f6;font-weight:600;padding:10px;text-align:left;border-bottom:1px solid var(--line)}
@@ -57,15 +63,6 @@ STYLES_CSS = """
 @media (max-width:640px){.gpt-article{font-size:15px}.gpt-article h2{font-size:1.25rem}.gpt-article h3{font-size:1.05rem}}
 </style>
 """
-
-AIY_PHRASES = [
-    "결론적으로","요약하자면","정리하자면","전반적으로","본 글에서는","이번 글에서는",
-    "AI","인공지능 모델로서","독자 여러분","마무리하면","한편으로는"
-]
-AIY_REPLACEMENTS = [
-    "한 줄로 말하면","핵심만 집어보면","짧게 정리하면","실전에서는","","",
-    "","","","덧붙이면",""
-]
 
 def _md_headings_to_html(txt: str) -> str:
     txt = re.sub(r'^\s*####\s+(.+)$', r'<h4>\1</h4>', txt, flags=re.M)
@@ -83,18 +80,10 @@ def _sanitize_llm_html(raw: str) -> str:
     s = html.unescape(s)
     return s.strip()
 
-def _humanize_text(html_text: str) -> str:
-    s = html_text
-    for a, b in zip(AIY_PHRASES, AIY_REPLACEMENTS):
-        s = re.sub(rf"\b{re.escape(a)}\b", b, s)
-    s = re.sub(r"([^.?!])\s{1}([가-힣A-Za-z])", r"\1 \2", s)
-    return s
-
 def process_body_html_or_md(body: str) -> str:
     body = _sanitize_llm_html(body or "")
     body = _md_headings_to_html(body)
     body = body.replace("<table", "<div class=\"table-wrap\"><table").replace("</table>", "</table></div>")
-    body = _humanize_text(body)
     return body
 
 # =========================
@@ -103,7 +92,7 @@ def process_body_html_or_md(body: str) -> str:
 def ask_openai(model: str, prompt: str, max_tokens=500, temperature=None):
     def _call(model, prompt, max_tokens=500, temperature=None):
         messages = [
-            {"role":"system","content":"너는 한국어 블로거. 군더더기 없이 명료하되 건조하지 않게 쓴다. 과장/광고 금지. 구체 팁과 사례."},
+            {"role": "system","content":"너는 간결한 한국어 SEO 라이터다. 군더더기 최소화, 사실 우선."},
             {"role":"user","content":prompt},
         ]
         kwargs = {"model":model, "messages":messages, "n":1}
@@ -113,64 +102,78 @@ def ask_openai(model: str, prompt: str, max_tokens=500, temperature=None):
         text = resp.choices[0].message.content
         log_llm(model, prompt, text)
         return {"text": text}
-    return cached_call(_call, model=model, prompt=prompt, max_tokens=max_tokens, temperature=temperature, namespace="openai")
+    return cached_call(_call, model=model, prompt=prompt, max_tokens=max_tokens, temperature=temperature)
 
 # =========================
-# Title
+# Title (humanized)
 # =========================
+BAN_TITLE_TOKENS = {"예약됨","테스트","임시","클릭","여기","바로가기"}
+HOOK_BENEFIT_TERMS=["총정리","가이드","방법","체크리스트","리뷰","한눈에","핵심","요약","브리핑","분석"]
+
 def normalize_title(s:str)->str:
     s = (s or "").strip()
     s = re.sub(r'^[\'"“”‘’《「(]+','',s); s=re.sub(r'[\'"“”‘’》」)]+$','',s)
-    return re.sub(r'\s+',' ',s)
+    s = re.sub(r'\s+',' ',s)
+    for bad in BAN_TITLE_TOKENS:
+        s = re.sub(bad, "", s)
+    return re.sub(r'\s{2,}',' ',s).strip()
 
-HOOK_BENEFIT_TERMS=["체크리스트","한눈에","실전","가이드","꿀팁","바로 써먹는","문제해결","요령","리스트","핵심"]
 def _score_title(t,kw):
     L=len(t)
-    return max(0,10-abs(26-L)) + (5 if any(ch.isdigit() for ch in t) else 0) + \
-           min(sum(1 for w in HOOK_BENEFIT_TERMS if w in t),6) + \
-           (6 if kw.replace(" ","") in t.replace(" ","") else -4)
-
-def build_title(keyword:str,candidate:str)->str:
-    t = normalize_title(candidate)
-    if len(t)<6: t=f"{keyword} 실전 체크리스트"
-    if len(t)>64: t=t[:64].rstrip()
-    return t
+    score = max(0,10-abs(26-L))
+    score += 6 if any(ch.isdigit() for ch in t) else 0
+    score += min(sum(1 for w in HOOK_BENEFIT_TERMS if w in t),6)
+    score += 6 if kw.replace(" ","") in t.replace(" ","") else -4
+    if any(bad in t for bad in BAN_TITLE_TOKENS): score -= 8
+    return score
 
 def generate_hook_title(keyword, model_short):
-    p=(f"키워드 '{keyword}'로 24~32자 한국어 블로그 제목 8개. "
-       "광고/쿠팡/과장/감탄사/이모지 금지. 실전형 단어 활용. 한 줄에 하나씩.")
-    raw=ask_openai(model_short,p,max_tokens=220)["text"]
+    prompt = (
+        "다음 키워드로 가장 적절한 형식을 고르고(뉴스 브리핑/해설/가이드/리뷰/생활팁 중 1개), "
+        "그 형식에 맞는 한국어 제목 8개를 22~32자로 제시하라.\n"
+        "- 키워드 의미와 맥락을 유지\n"
+        "- 사람 말투, 과장/낚시 금지\n"
+        "- 따옴표·이모지·대괄호·마침표 금지\n"
+        f"[키워드] {keyword}\n"
+        "한 줄에 하나씩 출력"
+    )
+    raw=ask_openai(model_short,prompt,max_tokens=220)["text"]
     cands=[normalize_title(x) for x in raw.splitlines() if x.strip()]
-    if len(cands)<3:
-        fb=ask_openai(model_short,f"'{keyword}' 핵심 24~28자 제목 3개만",max_tokens=120)["text"]
+    # 보완 샘플
+    if len(cands)<4:
+        fb=ask_openai(model_short,f"'{keyword}' 주제로 24~28자 자연스러운 제목 4개",max_tokens=120)["text"]
         cands+=[normalize_title(x) for x in fb.splitlines() if x.strip()]
-    best=sorted(cands,key=lambda t:_score_title(t,keyword),reverse=True)[0] if cands else f"{keyword} 실전 가이드"
-    return build_title(keyword,best)
+    # 점수화
+    cands=[t for t in cands if 8<=len(t)<=40 and all(b not in t for b in BAN_TITLE_TOKENS)]
+    best=sorted(set(cands), key=lambda t:_score_title(t,keyword), reverse=True)[:1]
+    return best[0] if best else f"{keyword} 핵심 브리핑"
 
 # =========================
 # Keywords/Category/Tags
 # =========================
-def read_keywords_random(need=2):
+def read_keywords_list():
     words=[]
+    if os.path.exists(KEYWORDS_CSV):
+        with open(KEYWORDS_CSV,"r",encoding="utf-8") as f:
+            raw=f.read().strip()
+    else:
+        raw=""
+    if raw and "\n" not in raw and "," in raw:
+        for w in raw.split(","):
+            w=w.strip()
+            if w: words.append(w)
+        return words
     if os.path.exists(KEYWORDS_CSV):
         with open(KEYWORDS_CSV,"r",encoding="utf-8") as f:
             for row in f:
                 parts=[x.strip() for x in row.strip().split(",") if x.strip()]
                 words.extend(parts)
-    uniq=[]; seen=set()
+    # unique preserve order
+    seen=set(); uniq=[]
     for w in words:
-        b=w.strip()
-        if b and b not in seen:
-            seen.add(b); uniq.append(b)
-    if len(uniq)>=need: return random.sample(uniq,k=need)
-    while len(uniq)<need: uniq.append(f"일반 키워드 {len(uniq)+1}")
-    return uniq[:need]
-
-def auto_category(keyword:str)->str:
-    k=keyword.lower()
-    if any(x in k for x in ["뉴스","속보","브리핑"]): return "뉴스"
-    if any(x in k for x in ["쇼핑","추천","리뷰","제품"]): return "쇼핑"
-    return "전체글"
+        if w not in seen:
+            seen.add(w); uniq.append(w)
+    return uniq
 
 def derive_tags_from_keyword(keyword:str,max_n=8):
     tags=[]; kw=(keyword or "").strip()
@@ -187,25 +190,15 @@ def wp_auth(): return (WP_USER, WP_APP_PASSWORD)
 def wp_post(url,**kw):
     if DRY_RUN:
         print(f"[DRY] POST {url}"); return {"id":0,"link":"(dry-run)"}
-    r=requests.post(url,auth=wp_auth(),timeout=60,verify=WP_TLS_VERIFY,**kw)  # <- NEW
-    r.raise_for_status(); return r.json()
+    r=requests.post(url,auth=wp_auth(),timeout=60,**kw); r.raise_for_status(); return r.json()
 def wp_get(url,**kw):
-    r=requests.get(url,auth=wp_auth(),timeout=60,verify=WP_TLS_VERIFY,**kw)  # <- NEW
-    r.raise_for_status(); return r.json()
-
-def _has_category(name:str)->bool:
-    try:
-        url=f"{WP_URL}/wp-json/wp/v2/categories?search={requests.utils.quote(name)}&per_page=10"
-        arr=requests.get(url,auth=wp_auth(),timeout=20,verify=WP_TLS_VERIFY).json()  # <- NEW
-        return any(x.get("name")==name for x in arr)
-    except Exception:
-        return False
+    r=requests.get(url,auth=wp_auth(),timeout=60,**kw); r.raise_for_status(); return r.json()
 
 def ensure_categories(cat_names):
-    want=set([c for c in cat_names if c]); cats=[]; page=1
+    want=set(["전체글"]+[c for c in cat_names if c]); cats=[]; page=1
     while True:
         url=f"{WP_URL}/wp-json/wp/v2/categories?per_page=100&page={page}"
-        r=requests.get(url,auth=wp_auth(),timeout=30,verify=WP_TLS_VERIFY)  # <- NEW
+        r=requests.get(url,auth=wp_auth(),timeout=30)
         if r.status_code==400: break
         r.raise_for_status(); arr=r.json()
         if not arr: break
@@ -213,20 +206,14 @@ def ensure_categories(cat_names):
         if len(arr)<100: break
         page+=1
     name_to_id={c.get("name"):c.get("id") for c in cats}
-    ids=[]
-    if "전체글" in name_to_id: ids.append(name_to_id["전체글"])
-    for n in want:
-        if n in name_to_id and name_to_id[n] not in ids:
-            ids.append(name_to_id[n])
-    return ids
+    return [name_to_id[n] for n in want if n in name_to_id]
 
 def ensure_tags(tag_names):
     want=set([t for t in tag_names if t]); ids=[]
     for name in list(want)[:10]:
         try:
             url=f"{WP_URL}/wp-json/wp/v2/tags?search={requests.utils.quote(name)}&per_page=1"
-            r=requests.get(url,auth=wp_auth(),timeout=20,verify=WP_TLS_VERIFY)  # <- NEW
-            r.raise_for_status()
+            r=requests.get(url,auth=wp_auth(),timeout=20); r.raise_for_status()
             arr=r.json()
             if arr: ids.append(arr[0]["id"])
         except Exception: continue
@@ -234,13 +221,8 @@ def ensure_tags(tag_names):
 
 def publish_to_wordpress(title, content, categories, tags, schedule_dt=None, status="future"):
     url=f"{WP_URL}/wp-json/wp/v2/posts"
-    payload={"title":title,"content":content,"status":status,
-             "excerpt":approx_excerpt(content),
-             "categories":categories or [],"tags":tags or []}
-    try:
-        payload["slug"]=slugify(title, separator="-")
-    except Exception:
-        pass
+    payload={"title":cleanup_title(title),"content":content,"status":status,
+             "excerpt":approx_excerpt(content),"categories":categories or [],"tags":tags or []}
     if status=="future" and schedule_dt:
         utc=schedule_dt.astimezone(dt.timezone.utc)
         payload["date_gmt"]=utc.strftime("%Y-%m-%dT%H:%M:%S")
@@ -290,72 +272,87 @@ def assemble_content(body:str):
     if ad_method!="shortcode" or not ad_sc: return html_doc
     return html_doc.replace("</style>", f"</style>\n{ad_sc}\n", 1) + (f"\n\n{ad_sc}\n\n" if ad_mid else "")
 
-HUMAN_BODY_INSTR = (
-    "아래 요구를 만족하는 '순수 HTML' 본문을 작성하라.\n"
-    "형식: 섹션은 <h2>, 소제목은 <h3>, 문단은 <p>, 리스트는 <ul>/<ol>, 표는 <table><thead><tbody>만 사용.\n"
-    "톤: 친근하지만 담백. 과장/광고 문구 금지. 구체 예시/실전 팁/자주 하는 실수/체크리스트 포함.\n"
-    "AI처럼 보이는 문구 금지. 첫 부분 오프닝 2~3문장 → <p><strong>한 줄 요약</strong></p> 포함.\n"
-    "마지막은 <h2>마무리</h2> 섹션으로 실천 요점 3~5개 리스트."
-)
+def make_outline_and_titles(kw:str, model_short:str):
+    prompt = (
+        "아래 키워드에 가장 적절한 형식을 고르고(뉴스 브리핑/해설/가이드/리뷰/생활팁 중 1개), "
+        "그 형식에 맞춰 5개 소제목과 한줄 인트로(각 110자 이내)를 제시하라. "
+        "이어 같은 형식에 맞는 제목 8개를 22~32자로 제시하라. "
+        "출력 형식은 다음과 같다:\n"
+        "==intro==\n(한줄 인트로)\n==outline==\n- 소제목1\n- 소제목2\n- 소제목3\n- 소제목4\n- 소제목5\n==titles==\n제목1\n제목2\n...\n제목8\n"
+        f"[키워드] {kw}\n"
+        "금지: 예약됨/임시/클릭/여기/바로가기/이모지/대괄호/따옴표"
+    )
+    txt = ask_openai(model_short, prompt, max_tokens=420)["text"]
+    intro = ""
+    outline = []
+    titles = []
+    sec = None
+    for line in txt.splitlines():
+        s = line.strip()
+        if s == "==intro==": sec="intro"; continue
+        if s == "==outline==": sec="outline"; continue
+        if s == "==titles==": sec="titles"; continue
+        if not s: continue
+        if sec=="intro": intro += (s+" ")
+        elif sec=="outline":
+            s = re.sub(r"^[-•]\s*","",s)
+            if s: outline.append(s)
+        elif sec=="titles":
+            titles.append(normalize_title(s))
+    if not outline: outline = [f"{kw} 핵심 정리", "핵심 포인트", "장단점과 유의점", "활용 사례", "마무리"]
+    titles=[t for t in titles if t and all(b not in t for b in BAN_TITLE_TOKENS)]
+    return intro.strip(), outline[:5], titles[:12]
 
-def generate_two_posts(keywords_today):
-    models = recommend_models()
+def build_body_from_outline(kw:str, intro:str, outline:list, model_long:str, max_tokens:int):
+    # 표는 한 개만, 순수 HTML
+    body_prompt = (
+        "아래 개요를 바탕으로 약 1100~1400자 본문을 '순수 HTML'로 작성하라. "
+        "섹션 <h2>, 소소제목 <h3>, 단락 <p>만 사용. "
+        "중간에 비교/요약 표 1개(<table><thead><tbody>) 포함. "
+        "마크다운(##, ``` 등) 금지. 과한 인라인 스타일 금지. "
+        "마지막에 <h2>결론</h2> 포함.\n\n"
+        f"[키워드] {kw}\n[인트로] {intro}\n[소제목]\n- " + "\n- ".join(outline)
+    )
+    return ask_openai(model_long, body_prompt, max_tokens=max_tokens)["text"]
+
+def generate_post_for_keyword(kw:str, models:dict):
     M_SHORT = (models.get("short") or "").strip() or "gpt-5-nano"
     M_LONG  = (models.get("long")  or "").strip() or "gpt-4o-mini"
-    MAX_BODY = models.get("max_tokens_body", 950)
+    MAX_BODY = models.get("max_tokens_body", 900)
 
-    ctx_all = {}
-    for kw in keywords_today[:2]:
-        ctx_prompt = (
-            f"키워드: {kw}\n"
-            "사람이 좋아할 구성의 개요를 만들자. 다음 항목을 목록으로:\n"
-            "- 핵심 문제/관찰 포인트 3개\n"
-            "- 실전 팁 3개(바로 적용 가능)\n"
-            "- 자주 하는 실수 3개(피하는 요령 포함)\n"
-            "- 비교/선택 기준 3개(표로 만들 수 있게 간단 문구)\n"
-        )
-        ctx_all[kw] = ask_openai(M_SHORT, ctx_prompt, max_tokens=350)["text"]
-
-    posts=[]
-    for kw in keywords_today[:2]:
-        body_prompt = (
-            HUMAN_BODY_INSTR +
-            f"\n[키워드] {kw}\n[개요]\n{ctx_all[kw]}\n"
-            "표가 들어갈 경우 1개만 넣고, 3~5행으로 간단히.\n"
-        )
-        body_html = ask_openai(M_LONG, body_prompt, max_tokens=MAX_BODY)["text"]
-        body_html = _sanitize_llm_html(body_html)
-        title = generate_hook_title(kw, M_SHORT)
-        posts.append({"keyword": kw, "title": title, "body": body_html})
-    return posts
+    intro, outline, titles = make_outline_and_titles(kw, M_SHORT)
+    cand_title = generate_hook_title(kw, M_SHORT) if not titles else \
+                 sorted(set(titles), key=lambda t:_score_title(t,kw), reverse=True)[0]
+    body_html = build_body_from_outline(kw, intro, outline, M_LONG, MAX_BODY)
+    body_html = _sanitize_llm_html(body_html)
+    return {"keyword": kw, "title": cand_title, "body": body_html}
 
 def create_and_schedule_two_posts():
-    words=[]
-    if os.path.exists(KEYWORDS_CSV):
-        with open(KEYWORDS_CSV,"r",encoding="utf-8") as f:
-            for row in f:
-                parts=[x.strip() for x in row.strip().split(",") if x.strip()]
-                words.extend(parts)
+    # 키워드 2개 랜덤(중복 방지)
+    words = read_keywords_list()
     uniq=[]; seen=set()
     for w in words:
         b=w.strip()
         if b and b not in seen:
             seen.add(b); uniq.append(b)
     if len(uniq)<2: uniq += ["일반 키워드 1","일반 키워드 2"]
-    keywords_today = random.sample(uniq, k=2)
+    keywords_today = random.sample(uniq, k=2) if len(uniq)>=2 else uniq[:2]
 
-    posts = generate_two_posts(keywords_today)
+    models = recommend_models()
+    posts=[]
+    for kw in keywords_today[:2]:
+        posts.append(generate_post_for_keyword(kw, models))
+
     for idx, post in enumerate(posts):
         kw = post["keyword"]
-        final_title = build_title(kw, post["title"])
-        cat_name = auto_category(kw)
+        final_title = cleanup_title(post["title"])
+        cat_name = "전체글"
         cat_ids = ensure_categories([cat_name])
         tag_ids = ensure_tags(derive_tags_from_keyword(kw,8))
         sched = pick_slot(idx)
-        content = assemble_content(post["body"])
         res = publish_to_wordpress(
             title=final_title,
-            content=content,
+            content=assemble_content(post["body"]),
             categories=cat_ids,
             tags=tag_ids,
             schedule_dt=sched,
