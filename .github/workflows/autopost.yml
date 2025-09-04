@@ -45,6 +45,8 @@ jobs:
           COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
           COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
           COUPANG_SUBID_PREFIX=${{ secrets.COUPANG_SUBID_PREFIX }}
+          REQUIRE_COUPANG_API=${{ secrets.REQUIRE_COUPANG_API }}
+          AFFILIATE_TIME_KST=${{ secrets.AFFILIATE_TIME_KST }}
 
           # ===== Posting / Taxonomy =====
           POST_STATUS=future
@@ -58,7 +60,6 @@ jobs:
           DEFAULT_TAGS=쿠팡,추천,리뷰
           AFFILIATE_CATEGORY=쇼핑
           AFFILIATE_TAGS=쿠팡,파트너스,추천
-          AFFILIATE_TIME_KST=${{ secrets.AFFILIATE_TIME_KST }}
           DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
 
           # ===== Ads =====
@@ -83,21 +84,24 @@ jobs:
           CACHE_MAX_FILES=500
           CACHE_DISABLE=false
 
-          # ===== Network / Quality =====
-          TIMEOUT_SEC=15
-          URL_CHECK_MODE=soft
-          MIN_PER_KEYWORD=2
-
           # ===== Flow switches =====
           KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}   # random(default) | rotate | first
           SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}         # rank(default) | shuffle | rotate
           USE_IMAGE=${{ secrets.USE_IMAGE }}                   # off | hotlink | upload
           BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}               # 비우면 랜덤 CTA
-          REQUIRE_COUPANG_API=${{ secrets.REQUIRE_COUPANG_API }}  # true면 실패/키없음 시 발행 스킵
 
           # ===== Debug =====
           DRY_RUN=
           EOF
+
+      # (NEW) Coupang secrets 프리플라이트 — 키 유무를 먼저 알려줌
+      - name: Preflight: show Coupang secrets status
+        run: |
+          if [ -n "${{ secrets.COUPANG_ACCESS_KEY }}" ] && [ -n "${{ secrets.COUPANG_SECRET_KEY }}" ]; then
+            echo "[OK] Coupang keys are set."
+          else
+            echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY are empty. Affiliate seed will be skipped (fallback will be used)."
+          fi
 
       # 0) 오늘의 키워드 10개로 덮어쓰기 (뉴스 기반)
       - name: Update keywords (오늘 키워드 10개)
@@ -108,7 +112,7 @@ jobs:
             echo "SKIP: update_keywords.py not found"
           fi
 
-      # 1) 쿠팡 씨앗 빌드
+      # 1) 쿠팡 씨앗 빌드 (키가 없으면 SKIP -> 아래 affiliate 폴백 사용)
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
@@ -117,7 +121,7 @@ jobs:
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      # 2) 씨앗 품질 체크
+      # 2) 씨앗 품질 체크 (없으면 통과: 폴백 경로 사용)
       - name: Seed quality check (report + cleaned csv)
         run: |
           if [ -f seed_quality_check.py ]; then
@@ -147,7 +151,7 @@ jobs:
           fi
 
           echo "---- Affiliate step tail ----"
-          tail -n 50 /tmp/affiliate_out.txt || true
+          tail -n 80 /tmp/affiliate_out.txt || true
 
           if grep -q '"post_id"' /tmp/affiliate_out.txt; then
             echo "[OK] affiliate post created/scheduled. Rotating keywords..."
