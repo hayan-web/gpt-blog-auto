@@ -33,13 +33,13 @@ jobs:
           WP_USER=${{ secrets.WP_USER }}
           WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
           WP_TLS_VERIFY=${{ secrets.WP_TLS_VERIFY }}
-          
-          # ===== OpenAI (for daily posts) =====
+
+          # ===== OpenAI (일상글 2건 생성용) =====
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
           OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
           MAX_TOKENS_BODY=900
-          
+
           # ===== Coupang Partners =====
           COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
           COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
@@ -61,15 +61,7 @@ jobs:
           AFFILIATE_TIME_KST=${{ secrets.AFFILIATE_TIME_KST }}
           DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
 
-          # ===== Selection modes =====
-          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}   # random|rotate|first (default random)
-          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}         # rank|rotate|shuffle (default rank)
-
-          # ===== Images & CTA =====
-          USE_IMAGE=${{ secrets.USE_IMAGE }}                   # off|hotlink|upload
-          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}
-
-          # ===== Ads (일상글용) =====
+          # ===== Ads =====
           AD_METHOD=${{ secrets.AD_METHOD }}
           AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
           AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
@@ -91,9 +83,17 @@ jobs:
           CACHE_MAX_FILES=500
           CACHE_DISABLE=false
 
-          # ===== Network tolerance =====
+          # ===== Network / Quality =====
           TIMEOUT_SEC=15
           URL_CHECK_MODE=soft
+          MIN_PER_KEYWORD=2
+
+          # ===== Flow switches =====
+          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}   # random(default) | rotate | first
+          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}         # rank(default) | shuffle | rotate
+          USE_IMAGE=${{ secrets.USE_IMAGE }}                   # off | hotlink | upload
+          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}               # 비우면 랜덤 CTA
+          REQUIRE_COUPANG_API=${{ secrets.REQUIRE_COUPANG_API }}  # true면 실패/키없음 시 발행 스킵
 
           # ===== Debug =====
           DRY_RUN=
@@ -108,7 +108,7 @@ jobs:
             echo "update_keywords.py not found → 스킵"
           fi
 
-      # 1) 시드 품질 체크(내성 모드 포함)
+      # 1) 시드 품질 체크(네트워크 내성: 실패 시 no-network로 재시도)
       - name: Seed quality check (strict + tolerant)
         shell: bash
         run: |
@@ -117,6 +117,7 @@ jobs:
           (echo "[WARN] network check failed; retrying without network..." && \
            python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md)
 
+      # 클린 시드가 있으면 우선 사용
       - name: Prefer cleaned seed
         run: |
           if [ -f products_seed.cleaned.csv ]; then
@@ -133,40 +134,41 @@ jobs:
             echo "auto_wp_gpt.py not found → 일상글 단계 스킵"
           fi
 
-      # (안전장치) 파이썬 문법 체크
-      - name: Syntax check (py_compile)
-        shell: bash
+      # ======= 시크릿 확인(빠른 프린트 스텝) =======
+      - name: Affiliate env quick-check (safe)
         run: |
-          python - <<'PY'
-          import glob, py_compile
-          for f in glob.glob("*.py"):
-              py_compile.compile(f, doraise=True)
-          print("[OK] py_compile passed")
+          python - << 'PY'
+          import os
+          def p(k): print(f"{k}=", "***" if os.getenv(k) else "(empty)")
+          for k in [
+            "COUPANG_ACCESS_KEY",
+            "COUPANG_SECRET_KEY",
+            "COUPANG_CHANNEL_ID",
+            "PRODUCTS_SEED_CSV",
+            "REQUIRE_COUPANG_API",
+            "BUTTON_TEXT",
+            "SEED_PICK_MODE",
+            "KEYWORD_PICK_MODE",
+            "USE_IMAGE"
+          ]:
+              p(k)
           PY
 
-      # 3) 쿠팡글 1건 생성 + 성공 시 키워드 회전
+      # 3) 쿠팡글 1건 생성(13:00 KST) + 성공 시 키워드 자동 회전
       - name: Create 1 affiliate post and rotate keywords on success
         shell: bash
         run: |
           set -o pipefail
           python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt
 
+          echo "---- Affiliate step tail ----"
+          tail -n 50 /tmp/affiliate_out.txt || true
+
           if grep -q '"post_id"' /tmp/affiliate_out.txt; then
             echo "[OK] affiliate post created/scheduled. Rotating keywords..."
             if [ -f rotate_keywords.py ]; then
               python rotate_keywords.py
-            else
-              echo "rotate_keywords.py not found → 회전 스킵"
             fi
           else
-            echo "[INFO] No post created (seed empty or API blocked). Skip rotation."
+            echo "[INFO] Affiliate post not created. See [AFFILIATE] lines above for reason."
           fi
-
-      # (선택) 현재 모드 로그로 확인
-      - name: Show active modes
-        run: |
-          python - <<'PY'
-          import os
-          print("KEYWORD_PICK_MODE =", os.getenv("KEYWORD_PICK_MODE","(default: random)"))
-          print("SEED_PICK_MODE    =", os.getenv("SEED_PICK_MODE","(default: rank)"))
-          PY
