@@ -100,71 +100,51 @@ jobs:
           EOF
 
       # 0) 오늘의 키워드 10개로 덮어쓰기 (뉴스 기반)
-      - name: Update today's keywords
+      - name: Update keywords (오늘 키워드 10개)
         run: |
           if [ -f update_keywords.py ]; then
             python update_keywords.py --k 10
+          else
+            echo "SKIP: update_keywords.py not found"
+          fi
+
+      # 1) 쿠팡 씨앗 빌드
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
             python build_products_seed.py || true
-          fi
           else
-            echo "update_keywords.py not found → 스킵"
+            echo "SKIP: build_products_seed.py not found"
           fi
 
-      # 1) 시드 품질 체크(네트워크 내성: 실패 시 no-network로 재시도)
-      - name: Seed quality check (strict + tolerant)
-        shell: bash
+      # 2) 씨앗 품질 체크
+      - name: Seed quality check (report + cleaned csv)
         run: |
-          set -o pipefail
-          python seed_quality_check.py --strict --write-clean --http-fallback --max-per-keyword 5 --report .cache/seed_report.md || \
-          (echo "[WARN] network check failed; retrying without network..." && \
-           python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md)
-
-      # 클린 시드가 있으면 우선 사용
-      - name: Prefer cleaned seed
-        run: |
-          if [ -f products_seed.cleaned.csv ]; then
-            echo "PRODUCTS_SEED_CSV=products_seed.cleaned.csv" >> $GITHUB_ENV
-            echo "Using cleaned seed file"
+          if [ -f seed_quality_check.py ]; then
+            python seed_quality_check.py --strict --write-clean --http-fallback --max-per-keyword 5 --report .cache/seed_report.md || \
+            python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md
+          else
+            echo "SKIP: seed_quality_check.py not found"
           fi
 
-      # 2) 일상글 2건 예약 (10:00 / 17:00 KST)
-      - name: Schedule 2 daily posts
+      # 3) 일상글 2건 예약 (10:00 / 17:00 KST)
+      - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
             python auto_wp_gpt.py --mode=two-posts
           else
-            echo "auto_wp_gpt.py not found → 일상글 단계 스킵"
+            echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      # ======= 시크릿 확인(빠른 프린트 스텝) =======
-      - name: Affiliate env quick-check (safe)
-        run: |
-          python - << 'PY'
-          import os
-          def p(k): print(f"{k}=", "***" if os.getenv(k) else "(empty)")
-          for k in [
-            "COUPANG_ACCESS_KEY",
-            "COUPANG_SECRET_KEY",
-            "COUPANG_CHANNEL_ID",
-            "PRODUCTS_SEED_CSV",
-            "REQUIRE_COUPANG_API",
-            "BUTTON_TEXT",
-            "SEED_PICK_MODE",
-            "KEYWORD_PICK_MODE",
-            "USE_IMAGE"
-          ]:
-              p(k)
-          PY
-
-      # 3) 쿠팡글 1건 생성(13:00 KST) + 성공 시 키워드 자동 회전
-      - name: Create 1 affiliate post and rotate keywords on success
-        shell: bash
+      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전
+      - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail
-          python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt
+          if [ -f affiliate_post.py ]; then
+            python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt
+          else
+            echo "SKIP: affiliate_post.py not found" | tee /tmp/affiliate_out.txt
+          fi
 
           echo "---- Affiliate step tail ----"
           tail -n 50 /tmp/affiliate_out.txt || true
