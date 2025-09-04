@@ -1,8 +1,8 @@
-name: Auto Post 2/day
+name: Daily 3 Posts (auto keywords + 2 daily + 1 affiliate + rotate)
 
 on:
   schedule:
-    - cron: "5 0 * * *"      # 매일 09:05 KST 실행
+    - cron: "5 0 * * *"   # 매일 09:05 KST (UTC 기준 00:05)
   workflow_dispatch: {}
 
 concurrency:
@@ -12,6 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -24,38 +25,117 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Write .env from Secrets
+      - name: Write .env from Secrets (do not commit secrets)
         run: |
           cat > .env << 'EOF'
           # WordPress
           WP_URL=${{ secrets.WP_URL }}
           WP_USER=${{ secrets.WP_USER }}
           WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
+          WP_TLS_VERIFY=${{ secrets.WP_TLS_VERIFY }}
 
           # OpenAI
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
           OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
+          MAX_TOKENS_BODY=900
 
-          # Posting
+          # Affiliate (Coupang)
+          COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
+          COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
+          COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
+          COUPANG_SUBID_PREFIX=${{ secrets.COUPANG_SUBID_PREFIX }}
+
+          # Posting / Taxonomy
           POST_STATUS=future
           KEYWORDS_CSV=keywords.csv
-          TAGS=${{ secrets.TAGS }}
+          ALLOW_CREATE_TERMS=${{ secrets.ALLOW_CREATE_TERMS }}
           EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
-          ALLOW_CREATE_TERMS=false
+
+          # Affiliate Content
+          PRODUCTS_SEED_CSV=products_seed.csv
+          DEFAULT_CATEGORY=정보
+          DEFAULT_TAGS=쿠팡,추천,리뷰
+          AFFILIATE_CATEGORY=쇼핑
+          AFFILIATE_TAGS=쿠팡,파트너스,추천
+          AFFILIATE_TIME_KST=13:00
+          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
 
           # Ads
           AD_METHOD=shortcode
           AD_SHORTCODE=[ads_top]
           AD_INSERT_MIDDLE=true
 
-          # Paths
+          # Keywords Auto Update
+          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
+          KEYWORDS_K=10
+          BAN_KEYWORDS=${{ secrets.BAN_KEYWORDS }}
+          BACKUP_OLD_KEYWORDS=true
+          USER_AGENT=gpt-blog-keywords/1.0
+
+          # Cache / Logs
           USAGE_DIR=.usage
           CACHE_DIR=.cache
+          LLM_LOG_FILENAME=llm.log
+          CACHE_TTL_DEFAULT=86400
+          CACHE_MAX_FILES=500
+          CACHE_DISABLE=false
+
+          # Debug
+          DRY_RUN=
           EOF
 
-      - name: Update keywords (overwrite 10)
-        run: python update_keywords.py
+      # 0) 오늘의 키워드 10개로 덮어쓰기 (뉴스 기반)
+      - name: Update today's keywords
+        run: |
+          if [ -f update_keywords.py ]; then
+            python update_keywords.py --k 10
+          else
+            echo "update_keywords.py not found → 스킵"
+          fi
 
-      - name: Generate & schedule two posts
-        run: python auto_wp_gpt.py --mode=two-posts
+      # 1) 시드 품질 체크(필수) + 클린 파일 생성
+      - name: Seed quality check (strict + write clean)
+        run: |
+          if [ -f seed_quality_check.py ]; then
+            python seed_quality_check.py --strict --write-clean --http-fallback --max-per-keyword 5 --report .cache/seed_report.md
+          else
+            echo "seed_quality_check.py not found → 스킵 (권장 아님)"
+          fi
+
+      # 클린 시드가 있으면 우선 사용
+      - name: Prefer cleaned seed
+        run: |
+          if [ -f products_seed.cleaned.csv ]; then
+            echo "PRODUCTS_SEED_CSV=products_seed.cleaned.csv" >> $GITHUB_ENV
+            echo "Using cleaned seed file"
+          fi
+
+      # 2) 일상글 2건 예약 (10:00 / 17:00 KST)
+      - name: Schedule 2 daily posts
+        run: |
+          if [ -f auto_wp_gpt.py ]; then
+            python auto_wp_gpt.py --mode=two-posts
+          else
+            echo "auto_wp_gpt.py not found → 일상글 단계 스킵"
+          fi
+
+      # 3) 쿠팡글 1건 생성(13:00 KST) + 성공 시 키워드 회전
+      - name: Create 1 affiliate post and rotate keywords on success
+        shell: bash
+        run: |
+          set -o pipefail
+          python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt
+
+          if grep -q '"post_id"' /tmp/affiliate_out.txt; then
+            echo "[OK] affiliate post created/scheduled. Rotating keywords..."
+            if [ -f rotate_keywords.py ]; then
+              python rotate_keywords.py
+            else
+              echo "rotate_keywords.py not found → 회전 스킵"
+            fi
+          else
+            echo "[INFO] No post created (seed empty or API blocked). Skip rotation."
+          fi

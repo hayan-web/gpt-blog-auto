@@ -4,6 +4,7 @@
 # - 제목: 후킹형 자동 생성
 # - 키워드: keywords.csv 전체에서 무작위 2개
 # - 태그: 키워드 기반만
+# - 카테고리: WP_CATEGORY_DEFAULT(기본 '정보')로 고정 → 쿠팡글(쇼핑)과 분리
 # - 예약: 10/17시, 해당 시각에 이미 예약 있으면 다음날로 자동 이월
 # - DRY_RUN=true 시 WordPress 호출 없이 로컬 시뮬만
 
@@ -29,6 +30,9 @@ POST_STATUS = os.getenv("POST_STATUS", "future")
 
 KEYWORDS_CSV = os.getenv("KEYWORDS_CSV", "keywords.csv")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+
+# 일상글 전용 카테고리(고정) — 기본 '정보'
+WP_CATEGORY_DEFAULT = os.getenv("WP_CATEGORY_DEFAULT", "정보").strip()
 
 # =========================
 # Utils
@@ -138,7 +142,7 @@ def generate_hook_title(keyword, model_short):
     return build_title(keyword,best)
 
 # =========================
-# Keywords/Category/Tags
+# Keywords/Tags
 # =========================
 def read_keywords_random(need=2):
     words=[]
@@ -155,12 +159,6 @@ def read_keywords_random(need=2):
     if len(uniq)>=need: return random.sample(uniq,k=need)
     while len(uniq)<need: uniq.append(f"일반 키워드 {len(uniq)+1}")
     return uniq[:need]
-
-def auto_category(keyword:str)->str:
-    k=keyword.lower()
-    if any(x in k for x in ["뉴스","속보","브리핑"]): return "뉴스"
-    if any(x in k for x in ["쇼핑","추천","리뷰","제품"]): return "쇼핑"
-    return "정보"
 
 def derive_tags_from_keyword(keyword:str,max_n=8):
     tags=[]; kw=(keyword or "").strip()
@@ -306,10 +304,16 @@ def create_and_schedule_two_posts():
     for idx, post in enumerate(posts):
         kw = post["keyword"]
         final_title = build_title(kw, post["title"])
-        cat_name = auto_category(kw)
-        cat_ids = ensure_categories([cat_name])
+
+        # ✅ 일상글은 항상 WP_CATEGORY_DEFAULT(기본 '정보')로 고정
+        cat_ids = ensure_categories([WP_CATEGORY_DEFAULT])
+
+        # 태그는 키워드 기반만
         tag_ids = ensure_tags(derive_tags_from_keyword(kw,8))
+
+        # 10시/17시 슬롯 + 중복 예약 시 다음날로 이월
         sched = pick_slot(idx)
+
         res = publish_to_wordpress(
             title=final_title,
             content=assemble_content(post["body"]),
