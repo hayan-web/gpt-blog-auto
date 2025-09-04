@@ -104,6 +104,11 @@ jobs:
         run: |
           if [ -f update_keywords.py ]; then
             python update_keywords.py --k 10
+      - name: Build products_seed (from Coupang API)
+        run: |
+          if [ -f build_products_seed.py ]; then
+            python build_products_seed.py || true
+          fi
           else
             echo "update_keywords.py not found → 스킵"
           fi

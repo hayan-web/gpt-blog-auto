@@ -40,13 +40,3 @@ Thumbs.db
 # misc
 *.zip
 # 주의: 파이썬 소스 추적을 위해 '*.py'는 절대 넣지 마세요.
-# --- local secrets & caches ---
-.env
-.usage/
-.cache/
-.venv/
-__pycache__/
-*.pyc
-*.log
-# generated auxiliary
-products_seed.cleaned.csv
