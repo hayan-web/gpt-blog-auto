@@ -86,10 +86,9 @@ jobs:
           EOF
 
       - name: "Preflight: show Coupang secrets status"
-        env:
-          COUPANG_ACCESS_KEY: ${{ secrets.COUPANG_ACCESS_KEY }}
-          COUPANG_SECRET_KEY: ${{ secrets.COUPANG_SECRET_KEY }}
         run: |
+          COUPANG_ACCESS_KEY="${{ secrets.COUPANG_ACCESS_KEY }}"
+          COUPANG_SECRET_KEY="${{ secrets.COUPANG_SECRET_KEY }}"
           if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
             echo "[OK] Coupang keys are set."
           else
