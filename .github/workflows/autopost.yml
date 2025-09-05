@@ -77,15 +77,14 @@ jobs:
           CACHE_MAX_FILES=500
           CACHE_DISABLE=false
           # ===== Flow switches =====
-          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}   # random | rotate | first
-          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}         # rank | shuffle | rotate
-          USE_IMAGE=${{ secrets.USE_IMAGE }}                   # off | hotlink | upload
-          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}               # 비우면 랜덤 CTA
+          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}
+          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}
+          USE_IMAGE=${{ secrets.USE_IMAGE }}
+          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}
           # ===== Debug =====
           DRY_RUN=
           EOF
 
-      # Preflight: run 블록에서만 secrets 사용 (YAML 파싱 오류 방지)
       - name: Preflight (Coupang keys present?)
         run: |
           if [ -n "${{ secrets.COUPANG_ACCESS_KEY }}" ] && [ -n "${{ secrets.COUPANG_SECRET_KEY }}" ]; then
@@ -94,7 +93,6 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 검색/딥링크는 폴백 사용"
           fi
 
-      # 0) 오늘 키워드 수집/검수/분리(일반·쇼핑) + 골든 생성 (병렬)
       - name: Update keywords (일반+쇼핑, 자동검수, 병렬)
         run: |
           if [ -f update_keywords.py ]; then
@@ -103,7 +101,6 @@ jobs:
             echo "SKIP: update_keywords.py not found"
           fi
 
-      # 0.1) 키워드 안전 폴백(수집 실패 시라도 비어있지 않도록 보장)
       - name: Ensure non-empty keyword files (safety fallback)
         run: |
           python - << 'PY'
@@ -112,7 +109,7 @@ jobs:
               if os.path.exists(path):
                   txt=open(path,'r',encoding='utf-8',errors='ignore').read().strip()
                   if txt: return
-              os.makedirs(os.path.dirname(path), exist_ok=True) if '/' in path else None
+              if '/' in path: os.makedirs(os.path.dirname(path), exist_ok=True)
               if col:
                   with open(path,'w',encoding='utf-8') as f:
                       if header: f.write(header+"\n")
@@ -121,10 +118,8 @@ jobs:
                   with open(path,'w',encoding='utf-8') as f:
                       f.write(",".join(lines)+"\n")
           m=datetime.date.today().month
-          summer=["무더위 꿀팁","열대야 이기는 법","시원한 집중 루틴","여름 건강 수분전략",
-                  "땀과 컨디션 관리","여름 밤 숙면 체크","햇빛과 멜라토닌","체온과 생산성"]
-          winter=["따뜻한 생산성 루틴","한파 컨디션 유지","면역과 수면 리듬","겨울 운동의 핵심",
-                  "차가운 손발 순환","비타민D와 기분","보온과 호흡","겨울 우울 탈출"]
+          summer=["무더위 꿀팁","열대야 이기는 법","시원한 집중 루틴","여름 건강 수분전략","땀과 컨디션 관리","여름 밤 숙면 체크","햇빛과 멜라토닌","체온과 생산성"]
+          winter=["따뜻한 생산성 루틴","한파 컨디션 유지","면역과 수면 리듬","겨울 운동의 핵심","차가운 손발 순환","비타민D와 기분","보온과 호흡","겨울 우울 탈출"]
           general = summer if m in (6,7,8,9) else winter
           shopping = ["넥쿨러","휴대용 선풍기","아이스 넥밴드","쿨링 타월","공기청정기","무선 청소기","가습기","전기요"]
           random.shuffle(general); random.shuffle(shopping)
@@ -136,7 +131,6 @@ jobs:
               write_once("keywords.csv", general[:10])
           PY
 
-      # 디버그: 키워드 파일 헤드 출력
       - name: Show keyword heads (debug)
         run: |
           echo "== golden_shopping_keywords.csv (head) =="; head -n 5 golden_shopping_keywords.csv || true
@@ -144,16 +138,18 @@ jobs:
           echo "== keywords_general.csv (head) =="; head -n 5 keywords_general.csv || true
           echo "== keywords.csv (line) =="; if [ -f keywords.csv ]; then head -n 1 keywords.csv; fi
 
-      # 1) (선택) 쿠팡 씨앗 빌드 — 키 없으면 다음 단계에서 폴백 처리
+      # >>> 환경 변수 export 후 실행: build_products_seed.py가 dotenv를 안쓸 경우 대비
       - name: Build products_seed (from Coupang API)
         run: |
+          set -a
+          [ -f .env ] && source .env
+          set +a
           if [ -f build_products_seed.py ]; then
             python build_products_seed.py || true
           else
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      # 2) (선택) 씨앗 품질 체크 — 실패해도 워크플로 지속
       - name: Seed quality check (report + cleaned csv)
         run: |
           if [ -f seed_quality_check.py ]; then
@@ -163,7 +159,6 @@ jobs:
             echo "SKIP: seed_quality_check.py not found"
           fi
 
-      # 3) 일상글 2건 예약 (10:00 / 17:00 KST)
       - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -172,7 +167,6 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전
       - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail

@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
-- 키워드: keywords_general.csv 우선. 없으면 keywords.csv에서 '쇼핑스멜' 강력 차단 후 사용
-- 제목: 후킹형(브리핑/정리/알아보기/해야할 것 금지, 14~26자)
-- 본문: 정보형 칼럼 스타일 + 인라인 CSS(표/불릿 포함)
-- 톤: 사람스러운 정보형(광고/구매/할인/최저가/쿠팡 등 쇼핑 표현 금지)
-- 태그: 키워드 1개만
+- keywords_general.csv 우선, 없으면 keywords.csv에서 '쇼핑스멜' 제거
+- 후킹형 제목, 정보형 본문(+CSS), 쇼핑 단어 금지
 """
 import os, re, json, sys
 from datetime import datetime, timedelta, timezone
@@ -119,7 +116,7 @@ def pick_daily_keywords(n:int=2)->List[str]:
         if len(out)>=n: break
     return out[:n]
 
-# ===== OpenAI helper (Chat→Responses 폴백) =====
+# ===== OpenAI helper (Chat→Responses 폴백; temperature 미지원 모델 자동 재시도) =====
 def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int, temperature: float) -> str:
     try:
         r = _oai.chat.completions.create(
@@ -130,20 +127,23 @@ def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int
         )
         return (r.choices[0].message.content or "").strip()
     except BadRequestError as e:
-        if "max_tokens" in str(e) or "unsupported_parameter" in str(e):
-            rr = _oai.responses.create(
-                model=model,
-                input=f"[시스템]\n{system}\n\n[사용자]\n{user}",
-                max_output_tokens=max_tokens,
-                temperature=temperature,
-            )
+        kwargs = dict(model=model, input=f"[시스템]\n{system}\n\n[사용자]\n{user}", max_output_tokens=max_tokens)
+        try:
+            rr = _oai.responses.create(**kwargs, temperature=temperature)
+        except BadRequestError as e2:
+            if "temperature" in str(e2):
+                rr = _oai.responses.create(**kwargs)
+            else:
+                raise
+        txt = getattr(rr, "output_text", None)
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+        if getattr(rr, "output", None) and rr.output and rr.output[0].content:
             try:
-                return rr.output_text.strip()
+                return rr.output[0].content[0].text.strip()
             except Exception:
-                if getattr(rr, "output", None) and rr.output and rr.output[0].content:
-                    return rr.output[0].content[0].text.strip()
-                return ""
-        raise
+                pass
+        return ""
 
 # ===== TITLE / BODY =====
 BANNED_TITLE_PATTERNS = ["브리핑","정리","알아보기","대해 알아보기","에 대해 알아보기","해야 할 것","해야할 것","해야할것"]

@@ -26,7 +26,7 @@ POST_STATUS = (os.getenv("POST_STATUS") or "future").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
 OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-OPENAI_MODEL_LONG = os.getenv("OPENAI_MODEL_LONG") or ""  # 비면 아래에서 OPENAI_MODEL로 대체
+OPENAI_MODEL_LONG = os.getenv("OPENAI_MODEL_LONG") or ""
 
 COUPANG_ACCESS_KEY = os.getenv("COUPANG_ACCESS_KEY") or ""
 COUPANG_SECRET_KEY = os.getenv("COUPANG_SECRET_KEY") or ""
@@ -177,7 +177,7 @@ def _pick_product_and_link(kw: str) -> Dict:
         "search_url": search_url
     }
 
-# ===== OpenAI helper (Chat → 실패 시 Responses 폴백) =====
+# ===== OpenAI helper (Chat → Responses 폴백; temperature 미지원 모델 자동 재시도) =====
 _client = OpenAI(api_key=OPENAI_API_KEY)
 MODEL_TITLE = OPENAI_MODEL or "gpt-4o-mini"
 MODEL_BODY  = OPENAI_MODEL_LONG or OPENAI_MODEL or "gpt-4o-mini"
@@ -192,20 +192,26 @@ def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int
         )
         return (r.choices[0].message.content or "").strip()
     except BadRequestError as e:
-        if "max_tokens" in str(e) or "unsupported_parameter" in str(e):
-            rr = _client.responses.create(
-                model=model,
-                input=f"[시스템]\n{system}\n\n[사용자]\n{user}",
-                max_output_tokens=max_tokens,
-                temperature=temperature,
-            )
+        # Chat 미지원/파라미터 오류 → Responses 사용
+        kwargs = dict(model=model, input=f"[시스템]\n{system}\n\n[사용자]\n{user}", max_output_tokens=max_tokens)
+        try:
+            rr = _client.responses.create(**kwargs, temperature=temperature)
+        except BadRequestError as e2:
+            # 일부 모델은 temperature 자체를 지원하지 않음 → 제거 후 재시도
+            if "temperature" in str(e2):
+                rr = _client.responses.create(**kwargs)
+            else:
+                raise
+        # output_text helper 또는 수동 추출
+        txt = getattr(rr, "output_text", None)
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+        if getattr(rr, "output", None) and rr.output and rr.output[0].content:
             try:
-                return rr.output_text.strip()
+                return rr.output[0].content[0].text.strip()
             except Exception:
-                if getattr(rr, "output", None) and rr.output and rr.output[0].content:
-                    return rr.output[0].content[0].text.strip()
-                return ""
-        raise
+                pass
+        return ""
 
 # ===== TITLE / BODY =====
 BANNED_TITLE = ["브리핑","정리","알아보기","대해 알아보기","해야 할 것","해야할 것","해야할것","리뷰","가이드"]
