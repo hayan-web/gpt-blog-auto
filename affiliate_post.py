@@ -1,370 +1,322 @@
 # -*- coding: utf-8 -*-
 """
-affiliate_post.py — 쿠팡글: 13:00 KST 예약
-- 사람스러운 1200~1300자 1인칭 리뷰
-- 후킹형 제목(브리핑/정리/알아보기/해야할것 금지)
-- 코드펜스/잔여 마크다운 제거
-- 태그=키워드 1개(쿠팡/파트너스 금지)
-
-키워드 우선순위:
-  golden_shopping_keywords.csv → golden_keywords.csv → keywords.csv 첫 키워드
+affiliate_post.py — 쿠팡글 1건 예약(기본 13:00 KST)
+- 키워드: golden_shopping_keywords.csv -> keywords_shopping.csv -> keywords.csv 순
+- 본문: 사람스러운 1인칭 리뷰형(1200~1300자) + 섹션/불릿/CTA/가격·가성비/장단점/추천대상
+- 태그: 키워드 한 개만(쿠팡/파트너스/최저가/할인 등 금지)
+- 이미지: seed/검색에서 얻으면 사용(없어도 동작)
+- 딥링크: 쿠팡 파트너스 API 있으면 변환, 없으면 검색URL 폴백
 """
 
-import os, csv, re, json, random, sys, hashlib
+import os, re, csv, json, sys, html, urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Tuple
+from typing import List, Dict, Optional
 
 import requests
 from dotenv import load_dotenv
 load_dotenv()
 
-# ===== ENV =====
+# OpenAI (>=1.x)
+from openai import OpenAI
+
+# ====== ENV ======
 WP_URL = (os.getenv("WP_URL") or "").strip().rstrip("/")
 WP_USER = os.getenv("WP_USER") or ""
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD") or ""
 WP_TLS_VERIFY = (os.getenv("WP_TLS_VERIFY") or "true").lower() != "false"
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-
-AFFILIATE_CATEGORY = (os.getenv("AFFILIATE_CATEGORY") or "쇼핑").strip()
-DISCLOSURE_TEXT = os.getenv("DISCLOSURE_TEXT") or "이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다."
-AFFILIATE_TIME_KST = (os.getenv("AFFILIATE_TIME_KST") or "13:00").strip()
-
-PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv"
-COUPANG_ACCESS_KEY = os.getenv("COUPANG_ACCESS_KEY") or ""
-COUPANG_SECRET_KEY = os.getenv("COUPANG_SECRET_KEY") or ""
-COUPANG_CHANNEL_ID = os.getenv("COUPANG_CHANNEL_ID") or None
-COUPANG_SUBID_PREFIX = os.getenv("COUPANG_SUBID_PREFIX") or "auto_wp_"
-REQUIRE_COUPANG_API = (os.getenv("REQUIRE_COUPANG_API") or "false").lower() == "true"
-
-DEFAULT_CATEGORY = (os.getenv("DEFAULT_CATEGORY") or AFFILIATE_CATEGORY or "정보").strip()
-KEYWORDS_CSV = os.getenv("KEYWORDS_CSV") or "keywords.csv"
 POST_STATUS = (os.getenv("POST_STATUS") or "future").strip()
 
-# ===== OpenAI =====
-from openai import OpenAI
-_oai = OpenAI()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
+OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+OPENAI_MODEL_LONG = os.getenv("OPENAI_MODEL_LONG") or OPENAI_MODEL
 
-# ===== Coupang helpers =====
-from coupang_deeplink import create_deeplinks
-from coupang_search import search_products
+COUPANG_ACCESS_KEY = os.getenv("COUPANG_ACCESS_KEY") or ""
+COUPANG_SECRET_KEY = os.getenv("COUPANG_SECRET_KEY") or ""
+COUPANG_CHANNEL_ID = os.getenv("COUPANG_CHANNEL_ID") or ""
+COUPANG_SUBID_PREFIX = os.getenv("COUPANG_SUBID_PREFIX") or "auto"
+REQUIRE_COUPANG_API = (os.getenv("REQUIRE_COUPANG_API") or "").lower() == "true"
 
-# ===== Utils =====
-def _log(s: str): print(s, flush=True)
-def _now_kst() -> datetime: return datetime.now(ZoneInfo("Asia/Seoul"))
-def _hash(s: str) -> str: return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+AFFILIATE_TIME_KST = os.getenv("AFFILIATE_TIME_KST") or "13:00"
 
-def next_time_kst_utc_str(hhmm: str) -> str:
+DISCLOSURE_TEXT = os.getenv("DISCLOSURE_TEXT") or \
+    "이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다."
+
+DEFAULT_CATEGORY = os.getenv("AFFILIATE_CATEGORY") or os.getenv("DEFAULT_CATEGORY") or "쇼핑"
+# 태그는 정책상 “키워드 1개만” 사용. .env의 AFFILIATE_TAGS/DEFAULT_TAGS는 무시하도록 강제.
+FORCE_SINGLE_TAG = True
+
+KEYWORDS_PRIMARY = ["golden_shopping_keywords.csv", "keywords_shopping.csv", "keywords.csv"]
+PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv"
+
+USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.1"
+
+
+# ====== HELPERS ======
+def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
+
+def _to_gmt_at_kst(time_hhmm: str) -> str:
+    hh, mm = (time_hhmm.split(":") + ["0"])[:2]
+    h = int(hh); m = int(mm)
     now = _now_kst()
-    try: hh, mm = [int(x) for x in hhmm.split(":")]
-    except Exception: hh, mm = 13, 0
-    tgt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    tgt = now.replace(hour=h, minute=m, second=0, microsecond=0)
     if tgt <= now: tgt += timedelta(days=1)
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-def read_keywords_first(path: str) -> str:
-    if not os.path.exists(path): return "추천 상품"
-    with open(path, "r", encoding="utf-8") as f:
-        parts = [x.strip() for x in f.readline().strip().split(",") if x.strip()]
-    return parts[0] if parts else "추천 상품"
-
-def _resolve_seed_csv() -> str:
-    return "products_seed.cleaned.csv" if os.path.exists("products_seed.cleaned.csv") else PRODUCTS_SEED_CSV
-
-def read_seed_for_keyword(path: str, keyword: str, max_n: int = 5) -> List[Dict]:
-    rows = []
-    if not os.path.exists(path): return rows
-    with open(path, "r", encoding="utf-8") as f:
-        rd = csv.DictReader(f)
-        for r in rd:
-            if (r.get("keyword") or "").strip() == keyword.strip():
-                rows.append({
-                    "keyword": r.get("keyword","").strip(),
-                    "product_name": r.get("product_name","").strip(),
-                    "raw_url": r.get("raw_url","").strip(),
-                    "pros": r.get("pros","").strip(),
-                    "cons": r.get("cons","").strip(),
-                    "imageUrl": r.get("imageUrl","").strip() if "imageUrl" in r else "",
-                })
-    return rows[:max_n]
-
-def validate_urls(rows: List[Dict]) -> List[Dict]:
+def _read_col_csv(path: str) -> List[str]:
+    if not os.path.exists(path): return []
     out = []
-    for r in rows:
-        url = (r.get("raw_url") or "").strip()
-        name = (r.get("product_name") or "").strip()
-        if not (url and name): continue
-        if not re.match(r"^https?://", url): continue
-        out.append(r)
+    with open(path, "r", encoding="utf-8") as f:
+        r = csv.reader(f)
+        rows = list(r)
+        # header 여부와 무관하게 첫컬럼만
+        for i, row in enumerate(rows):
+            if not row: continue
+            if i == 0 and (row[0].lower() == "keyword" or row[0].lower() == "title"):
+                continue
+            kw = row[0].strip()
+            if kw: out.append(kw)
     return out
 
-# ===== WordPress =====
-def _ensure_category(name: str) -> int:
-    name = name or DEFAULT_CATEGORY or "정보"
-    r = requests.get(f"{WP_URL}/wp-json/wp/v2/categories",
-                     params={"search": name, "per_page": 50},
+def _read_line_csv(path: str) -> List[str]:
+    if not os.path.exists(path): return []
+    with open(path, "r", encoding="utf-8") as f:
+        arr = [x.strip() for x in f.readline().split(",") if x.strip()]
+    return arr
+
+def _pick_keyword() -> str:
+    for p in KEYWORDS_PRIMARY:
+        arr = _read_col_csv(p) if p.endswith(".csv") and p != "keywords.csv" else _read_line_csv(p)
+        if arr:
+            return arr[0]
+    return "여름 필수템"
+
+def _clean_hashtag_token(s: str) -> str:
+    s = re.sub(r"[^\w가-힣]", "", s)
+    # 금지 토큰 제거
+    bans = {"쿠팡", "파트너스", "최저가", "할인", "세일", "쿠폰", "딜", "무료배송"}
+    if s in bans or not s: return ""
+    return s
+
+def _make_tags_from_keyword(kw: str) -> List[str]:
+    if not FORCE_SINGLE_TAG:
+        toks = [_clean_hashtag_token(t) for t in re.split(r"\s+|,|/|_", kw)]
+        toks = [t for t in toks if t][:3]
+        return toks or [kw]
+    return [kw]  # 단일 태그 강제
+
+def _ensure_term(kind: str, name: str) -> Optional[int]:
+    url = f"{WP_URL}/wp-json/wp/v2/{kind}"
+    r = requests.get(url, params={"search": name, "per_page": 50},
                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     for item in r.json():
         if (item.get("name") or "").strip() == name:
             return int(item["id"])
-    r = requests.post(f"{WP_URL}/wp-json/wp/v2/categories",
-                      json={"name": name}, auth=(WP_USER, WP_APP_PASSWORD),
-                      verify=WP_TLS_VERIFY, timeout=15)
+    r = requests.post(url, json={"name": name},
+                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     return int(r.json()["id"])
 
-def _ensure_tags(tag_names: List[str]) -> List[int]:
-    # 태그(해시태그)는 키워드 1개만 사용
-    ids = []
-    for t in tag_names:
-        t = t.strip()
-        if not t: continue
-        r = requests.get(f"{WP_URL}/wp-json/wp/v2/tags",
-                         params={"search": t, "per_page": 50},
-                         auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
-        r.raise_for_status()
-        tag_id = None
-        for item in r.json():
-            if (item.get("name") or "").strip() == t:
-                tag_id = int(item["id"]); break
-        if tag_id is None:
-            r = requests.post(f"{WP_URL}/wp-json/wp/v2/tags",
-                              json={"name": t}, auth=(WP_USER, WP_APP_PASSWORD),
-                              verify=WP_TLS_VERIFY, timeout=15)
-            r.raise_for_status()
-            tag_id = int(r.json()["id"])
-        ids.append(tag_id)
-    return ids
-
-def wp_create_or_schedule(title: str, html: str, category_name: str, tag_names: List[str], when_kst: str) -> Dict:
-    cat_id = _ensure_category(category_name or DEFAULT_CATEGORY)
-    tag_ids = _ensure_tags(tag_names)
+def _post_wp(title: str, content_html: str, when_gmt: str, category: str, tags: List[str]) -> Dict:
+    cat_id = _ensure_term("categories", category or DEFAULT_CATEGORY)
+    tag_ids = []
+    for t in (tags or []):
+        tid = _ensure_term("tags", t)
+        if tid: tag_ids.append(tid)
     payload = {
         "title": title,
-        "content": html,
+        "content": content_html,
         "status": POST_STATUS,
         "categories": [cat_id],
         "tags": tag_ids,
         "comment_status": "closed",
         "ping_status": "closed",
-        "date_gmt": next_time_kst_utc_str(when_kst),
+        "date_gmt": when_gmt,
     }
     r = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
                       auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
     r.raise_for_status()
     return r.json()
 
-# ===== Coupang =====
-def enrich_with_deeplink(rows: List[Dict]) -> List[Dict]:
-    if not rows: return rows
-    origin = [(r.get("raw_url") or "").strip() for r in rows]
-    if not (COUPANG_ACCESS_KEY and COUPANG_SECRET_KEY):
-        if REQUIRE_COUPANG_API: _log("[AFFILIATE] SKIP: 쿠팡 API 키 없음 (REQUIRE_COUPANG_API=true)"); return []
-        _log("[AFFILIATE] WARN: 쿠팡 API 키 없음 -> raw_url 사용"); return rows
+# ====== PRODUCT SOURCE / LINK ======
+def _read_products_seed() -> List[Dict]:
+    if not os.path.exists(PRODUCTS_SEED_CSV): return []
+    out = []
+    with open(PRODUCTS_SEED_CSV, "r", encoding="utf-8") as f:
+        rd = csv.DictReader(f)
+        for row in rd:
+            out.append(row)
+    return out
+
+def _best_seed_for_kw(seed: List[Dict], kw: str) -> Optional[Dict]:
+    kw_l = kw.lower()
+    scored = []
+    for it in seed:
+        t = (it.get("title") or it.get("name") or "").lower()
+        url = (it.get("url") or it.get("link") or "")
+        if not url: continue
+        s = 0
+        for tok in re.split(r"\s+", kw_l):
+            if tok and tok in t: s += 1
+        if s == 0: continue
+        scored.append((s, it))
+    if not scored: return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
+
+def _coupang_search_url(kw: str) -> str:
+    base = "https://www.coupang.com/np/search"
+    return f"{base}?q={urllib.parse.quote(kw)}"
+
+def _deeplink(urls: List[str], subid: str) -> List[str]:
+    """
+    딥링크 API가 있으면 변환, 실패/키 없음이면 원본 반환
+    """
+    if not (COUPANG_ACCESS_KEY and COUPANG_SECRET_KEY and COUPANG_CHANNEL_ID):
+        return urls
+    # repo에 있는 보조 모듈 사용(있으면)
     try:
-        sub_id = f"{COUPANG_SUBID_PREFIX}{_now_kst().strftime('%Y%m%d_%H%M')}"
-        mapping = create_deeplinks(origin, COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY,
-                                   sub_id=sub_id, channel_id=COUPANG_CHANNEL_ID)
-        _log(f"[AFFILIATE] deeplink OK: {len(mapping)}/{len(origin)}")
-        return [{**r, "deeplink": mapping.get(url, url)} for r, url in zip(rows, origin)]
-    except Exception as e:
-        if REQUIRE_COUPANG_API: _log(f"[AFFILIATE] SKIP: deeplink 실패 (REQUIRE_COUPANG_API=true) -> {e}"); return []
-        _log(f"[AFFILIATE] WARN: deeplink 실패 -> raw_url 사용 ({e})"); return rows
+        from coupang_deeplink import make_deeplinks
+        dk = make_deeplinks(urls, COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY,
+                            COUPANG_CHANNEL_ID, subid)
+        # 실패하면 원본 섞여 있을 수 있음
+        out = []
+        for i, u in enumerate(urls):
+            out.append(dk.get(i, u))
+        return out
+    except Exception:
+        return urls
 
-def fetch_or_fallback_products(keyword: str, seed_path: str) -> List[Dict]:
-    seed = validate_urls(read_seed_for_keyword(seed_path, keyword, max_n=5))
-    if seed: return seed
-    _log("[AFFILIATE] INFO: seed CSV 비어 -> 자동 검색/폴백")
-    if COUPANG_ACCESS_KEY and COUPANG_SECRET_KEY:
-        try:
-            items = search_products(keyword, COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY, limit=5, sort="salesVolume")
-            seed = [{
-                "keyword": keyword,
-                "product_name": it.get("productName",""),
-                "raw_url": it.get("productUrl",""),
-                "imageUrl": it.get("imageUrl",""),
-                "pros": "", "cons": "",
-            } for it in items if it.get("productUrl")]
-            _log(f"[AFFILIATE] search API -> {len(seed)}건")
-            if seed: return seed
-        except Exception as e:
-            _log(f"[AFFILIATE] WARN: search 실패 -> {e}")
-    if not REQUIRE_COUPANG_API:
-        kw_enc = re.sub(r"\s+", "+", keyword.strip())
-        bases = [
-            f"https://www.coupang.com/np/search?q={kw_enc}&sort=salesVolumeDesc",
-            f"https://www.coupang.com/np/search?q={kw_enc}&sort=bestAsc",
-            f"https://www.coupang.com/np/search?q={kw_enc}&sort=accuracyDesc",
-            f"https://www.coupang.com/np/search?q={kw_enc}&brand=&rating=4",
-        ]
-        seed = [{
-            "keyword": keyword,
-            "product_name": f"{keyword} 인기상품 모음 #{i+1}",
-            "raw_url": u,
-            "imageUrl": "", "pros": "", "cons": "",
-        } for i,u in enumerate(bases[:random.randint(3,5)])]
-        _log(f"[AFFILIATE] keyless fallback -> {len(seed)} 카드")
-        return seed
-    return []
+def _pick_product_and_link(kw: str) -> Dict:
+    """
+    return { 'title', 'url', 'image', 'deeplink', 'search_url' }
+    """
+    seed = _read_products_seed()
+    best = _best_seed_for_kw(seed, kw) if seed else None
+    search_url = _coupang_search_url(kw)
+    cand = []
+    if best and (best.get("url") or best.get("link")):
+        cand.append(best.get("url") or best.get("link"))
+    cand.append(search_url)
+    subid = f"{COUPANG_SUBID_PREFIX}-{datetime.utcnow().strftime('%Y%m%d')}"
+    dee = _deeplink(cand, subid)
+    dee_link = dee[0] if dee else cand[0]
+    return {
+        "title": best.get("title") if best else kw,
+        "url": best.get("url") or best.get("link") if best else "",
+        "image": best.get("image") or best.get("img") if best else "",
+        "deeplink": dee_link,
+        "search_url": search_url
+    }
 
-# ===== Title & Review =====
-BANNED_TITLE_PATTERNS = [
-    "브리핑","정리","알아보기","알아보자","대해 알아보기","에 대해 알아보기","해야 할 것","해야할 것","해야할것"
-]
+# ====== TITLE / BODY ======
+BANNED_TITLE = ["브리핑", "정리", "알아보기", "대해 알아보기", "해야 할 것", "해야할 것", "해야할것", "리뷰", "가이드"]
 
 def _bad_title(t: str) -> bool:
-    t = t.strip()
-    if any(p in t for p in BANNED_TITLE_PATTERNS): return True
-    return not (10 <= len(t) <= 35)
+    if any(p in t for p in BANNED_TITLE): return True
+    L = len(t.strip())
+    return not (14 <= L <= 32)
 
-def gen_hook_title(keyword: str) -> str:
-    sys_prompt = "너는 한국어 카피라이터다. 클릭을 부르는 짧고 강한 제목만 출력한다."
-    user = f"""키워드: {keyword}
+def _hook_title(product_kw: str) -> str:
+    sys_p = "너는 한국어 카피라이터다. 클릭을 부르는 강한 후킹 제목만 출력."
+    usr = f"""제품/키워드: {product_kw}
 조건:
-- 길이 14~26자
-- 금지어: {", ".join(BANNED_TITLE_PATTERNS)}
+- 14~32자
+- 금지어: {", ".join(BANNED_TITLE)}
 - '~브리핑', '~정리', '~대해 알아보기', '~해야 할 것' 류 금지
-- '리뷰/가이드/사용기' 표지어 지양
-- 출력은 제목 1줄만"""
+- '리뷰/가이드/사용기' 같은 표지어 금지(사람스럽게)
+- 출력: 제목 한 줄만"""
+    client = OpenAI(api_key=OPENAI_API_KEY)
     for _ in range(3):
-        rsp = _oai.chat.completions.create(
+        rsp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role":"system","content":sys_prompt},{"role":"user","content":user}],
+            messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
             temperature=0.9, max_tokens=60,
         )
-        t = (rsp.choices[0].message.content or "").strip().replace("\n"," ")
-        if not _bad_title(t): return t
-    return f"{keyword}, 이렇게 고르니 실패가 줄었다"
+        t = (rsp.choices[0].message.content or "").strip().replace("\n", " ").strip("“”\"'")
+        if not _bad_title(t):
+            return t
+    return f"{product_kw} 제대로 써보고 알게 된 포인트"
 
-def strip_code_fences(s: str) -> str:
-    # ``` / ```html / 따옴표 잔재 제거
+def _strip_fences(s: str) -> str:
     s = re.sub(r"```(?:\w+)?", "", s)
     s = s.replace("```", "")
-    s = s.strip().strip("“”\"'")
-    return s
+    return s.strip()
 
-def clip_chars(text: str, min_chars=1200, max_chars=1300) -> str:
-    s = re.sub(r"\s+\n", "\n", text).strip()
-    if len(s) > max_chars:
-        cut = s[:max_chars]
-        last = max(cut.rfind("다."), cut.rfind("."), cut.rfind("요."), cut.rfind("!"), cut.rfind("?"))
-        s = cut[:last+1] if last >= min_chars*0.7 else cut
-    elif len(s) < min_chars:
-        s += "\n\n덧붙이면, 위 기준만 챙겨도 비용 대비 만족도가 높았습니다. 결국 중요한 건 내 생활에 맞춘 선택이라는 점입니다."
-    return s
-
-def gen_human_review(keyword: str, products: List[Dict]) -> str:
-    names = [p.get("product_name") or p.get("productName") for p in products if (p.get("product_name") or p.get("productName"))][:3]
-    sys_prompt = "너는 실제 사용자처럼 자연스럽게 쓰는 한국어 리뷰 작성자다. 과장하지 말고 생활밀착의 톤으로 쓴다."
-    user = f"""주제 키워드: {keyword}
-리뷰 대상(참고용): {", ".join(names) if names else "카테고리 전반"}
-요청:
-- 1인칭 자연스러운 톤
-- 도입부: 왜 필요했는지/갈아탄 이유
-- 본문: 체감 포인트 3~4가지 + 상황 예시 2개
-- 선택 팁: 체크리스트 4~5줄
-- 마무리: '결국 ~'로 시작하는 한 줄 요약
-- 'AI/작성/본 글은' 같은 표현 금지, 과장/광고체 금지
-- 단락은 3~5문장으로 나눔
-- 길이: 1200~1300자(한글 기준)
-- 출력: 본문만(코드/마크다운/HTML 금지)"""
-    rsp = _oai.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":sys_prompt},{"role":"user","content":user}],
-        temperature=0.85, max_tokens=800,
+def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
+    """
+    예시처럼: 인사/후킹 → 왜 인기인가 → CTA(쿠팡 링크) → 특징(숫자 소제목) →
+    가격/가성비 → 장단점 → 추천대상 → 결론 → 마지막 CTA/카드(링크)
+    - 1200~1300자
+    - 쇼핑몰 광고문구/과장 금지, 사람스러운 1인칭
+    - 해시태그는 코드에서 따로 붙이므로 본문 말미에 넣지 않음
+    """
+    sys_p = "너는 사람스러운 한국어 블로거다. 광고처럼 보이지 않게, 직접 써본 듯 차분히 쓴다."
+    # 안내문: 긴 프롬프트지만 f-string 내부엔 { } 표기만 조심
+    usr = (
+        "주제 제품: " + kw + "\n"
+        "링크: " + deeplink + "\n"
+        "요청:\n"
+        "- 도입부에 근황/상황 2~3문장으로 공감대 형성(이모지/이모티콘 과다 금지)\n"
+        "- <h2>~<h3> 소제목으로 구획, 문단은 3~5문장으로 구성\n"
+        "- '왜 이 제품을 선택했는지'를 사람스럽게 설명\n"
+        "- 핵심 포인트 불릿 <ul><li> 4~6개 포함(과장 금지)\n"
+        "- 중간중간 자연스러운 문장 링크로 CTA 2회 배치(텍스트: '쿠팡에서 최저가 확인하기', '쿠팡 상품 상세 보러 가기')\n"
+        "- <h3> 가격과 가성비 분석 섹션 포함(숫자/가격은 가늠치로, 허위/확정 표현 금지)\n"
+        "- <h3> 사용해 본 솔직 후기: 장점/단점 소제목에 불릿 3~5개씩\n"
+        "- <h3> 이런 분께 추천: 4~6개 불릿\n"
+        "- 마지막에 <h2> 결론 섹션\n"
+        "- 분량: 1200~1300자\n"
+        "- 출력: 순수 HTML 태그만 사용(<p>,<h2>,<h3>,<a>,<ul>,<li>,<strong>,<em>,<blockquote>,<img>)\n"
+        "- 딥링크는 자연스럽게 <a href>로 넣고, 과장/확정/질병치료/성능보장 표현 금지"
     )
-    body = (rsp.choices[0].message.content or "").strip()
-    body = strip_code_fences(body)
-    return clip_chars(body, 1200, 1300)
-
-# ===== Cards/HTML =====
-def _cta_text() -> str:
-    explicit = os.getenv("BUTTON_TEXT")
-    if explicit: return explicit.strip()
-    return random.choice(["최저가 확인하기","상세 보기","혜택 보러가기","지금 확인"])
-
-def cards_html(keyword: str, products: List[Dict]) -> str:
-    is_search_fallback = any("coupang.com/np/search" in (p.get("raw_url") or "") for p in products)
-    blocks = []
-    for p in products:
-        name = p.get("product_name") or p.get("productName") or f"{keyword} 추천"
-        link = p.get("deeplink") or p.get("raw_url","")
-        pros = p.get("pros") or ""
-        cons = p.get("cons") or ""
-        img  = p.get("imageUrl") or ""
-        label = _cta_text() if not is_search_fallback or os.getenv("BUTTON_TEXT") \
-            else f"쿠팡에서 '{keyword}' 검색 결과 보기"
-        img_html = f"<img src='{img}' alt='{name}' style='max-width:100%;border-radius:10px;margin:0 0 8px 0;'/>" if img else ""
-        blocks.append(f"""
-<div style="margin:20px 0;padding:16px;border:1px solid #e5e7eb;border-radius:12px;">
-  <h3 style="margin:0 0 8px 0;font-size:18px;">{name}</h3>
-  {img_html}
-  <ul style="margin:0 0 8px 18px;">
-    {"<li>"+pros+"</li>" if pros else ""}
-    {"<li>"+cons+"</li>" if cons else ""}
-  </ul>
-  <p><a href="{link}" target="_blank" rel="sponsored nofollow noopener" style="display:inline-block;padding:12px 18px;border-radius:12px;background:#0f172a;color:#fff;text-decoration:none;">{label}</a></p>
-</div>""")
-    return "".join(blocks)
-
-def compose_post(keyword: str, products: List[Dict]) -> Tuple[str, str]:
-    title = gen_hook_title(keyword)
-    review_text = gen_human_review(keyword, products)
-    rendered_review = review_text.replace("\n", "<br/>")  # ← f-string 내부에서 계산하지 않음
-    cards = cards_html(keyword, products)
-    html = (
-        f"<p style='color:#64748b;font-size:14px;'>{DISCLOSURE_TEXT}</p>"
-        f"<div style='margin:16px 0 24px 0; line-height:1.8;'>{rendered_review}</div>"
-        f"{cards}"
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    rsp = client.chat.completions.create(
+        model=OPENAI_MODEL_LONG,
+        messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
+        temperature=0.85, max_tokens=1100,
     )
-    return title, html
+    html_body = _strip_fences(rsp.choices[0].message.content or "")
+    # 상단 고지 + 선택적 대표이미지
+    parts = []
+    parts.append(f'<p style="color:#b23;">{html.escape(DISCLOSURE_TEXT)}</p>')
+    if img_url:
+        parts.append(f'<p><img src="{html.escape(img_url)}" alt="{html.escape(kw)}" loading="lazy"></p>')
+    parts.append(html_body)
+    # 마지막 카드/최종 CTA(이미 링크가 없으면 검색URL로 대체)
+    final_link = deeplink or search_url
+    parts.append(f'<p style="text-align:center;"><a href="{html.escape(final_link)}" target="_blank" rel="sponsored noopener">쿠팡 최저가 바로가기</a></p>')
+    return "\n".join(parts)
 
-# ===== Keyword pick =====
-def pick_keyword() -> Tuple[str, List[str]]:
-    if os.path.exists("golden_shopping_keywords.csv"):
-        with open("golden_shopping_keywords.csv","r",encoding="utf-8") as f:
-            rows=list(csv.DictReader(f))
-        if rows and (rows[0].get("keyword") or "").strip():
-            kw=rows[0]["keyword"].strip()
-            return kw, [kw]
-    if os.path.exists("golden_keywords.csv"):
-        with open("golden_keywords.csv","r",encoding="utf-8") as f:
-            rows=list(csv.DictReader(f))
-        if rows and (rows[0].get("keyword") or "").strip():
-            kw=rows[0]["keyword"].strip()
-            return kw, [kw]
-    kw = read_keywords_first(KEYWORDS_CSV)
-    return kw, [kw]
-
-# ===== Main =====
+# ====== MAIN FLOW ======
 def main():
     if not (WP_URL and WP_USER and WP_APP_PASSWORD):
         raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY 필요")
 
-    keyword, tags = pick_keyword()
-    seed_path = _resolve_seed_csv()
-    _log(f"[AFFILIATE] keyword='{keyword}', seed='{seed_path}'")
+    kw = _pick_keyword()
+    tags = _make_tags_from_keyword(kw)
 
-    products = fetch_or_fallback_products(keyword, seed_path)
-    if not products:
-        _log("[AFFILIATE] SKIP: 유효한 상품 없음"); return 0
+    prod = _pick_product_and_link(kw)
+    deeplink = prod.get("deeplink") or prod.get("url") or _coupang_search_url(kw)
+    search_url = prod.get("search_url") or _coupang_search_url(kw)
+    hero_img = prod.get("image") or ""
 
-    products = enrich_with_deeplink(products)
-    if not products:
-        _log("[AFFILIATE] SKIP: 딥링크 조건 미충족"); return 0
+    title = _hook_title(kw)
+    html_body = _gen_review_html(kw, deeplink, hero_img, search_url)
 
-    title, html = compose_post(keyword, products)
-    res = wp_create_or_schedule(title, html, AFFILIATE_CATEGORY, tags, AFFILIATE_TIME_KST)
+    when_gmt = _to_gmt_at_kst(AFFILIATE_TIME_KST)
+
+    res = _post_wp(title, html_body, when_gmt, DEFAULT_CATEGORY, tags)
     print(json.dumps({
         "post_id": res.get("id"),
         "link": res.get("link"),
         "status": res.get("status"),
         "date_gmt": res.get("date_gmt"),
-        "title": (res.get("title") or {}).get("rendered"),
+        "title": res.get("title", {}).get("rendered", title)
     }, ensure_ascii=False))
-    return 0
 
 if __name__ == "__main__":
     sys.exit(main())

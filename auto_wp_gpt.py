@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-auto_wp_gpt.py — 일상글 2건 예약(10:00/17:00 KST)
-- 키워드: keywords_general.csv 우선(없으면 keywords.csv)
-- 후킹형 제목(브리핑/정리/알아보기/해야할것 금지)
-- 본문에 코드펜스 제거(```html 등), 태그=키워드 1개
+auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
+- 키워드: keywords_general.csv 우선 사용. 없으면 keywords.csv에서 '쇼핑스멜' 강력 차단 후 사용
+- 제목: 후킹형(브리핑/정리/알아보기/해야할 것 금지, 14~26자)
+- 본문: 예시 글 스타일(정의/배경/메커니즘/연구/사례/적용/정리), 간단 표/불릿 포함
+- 톤: 사람스러운 정보형(광고/구매/할인/최저가/쿠팡 등 쇼핑 표현 금지)
+- 태그: 키워드 1개만
 """
 
-import os, re, json, sys
+import os, re, json, sys, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List
@@ -14,9 +16,11 @@ import requests
 from dotenv import load_dotenv
 load_dotenv()
 
+# OpenAI 1.x
 from openai import OpenAI
 _oai = OpenAI()
 
+# ===== ENV =====
 WP_URL = (os.getenv("WP_URL") or "").strip().rstrip("/")
 WP_USER = os.getenv("WP_USER") or ""
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD") or ""
@@ -25,6 +29,7 @@ WP_TLS_VERIFY = (os.getenv("WP_TLS_VERIFY") or "true").lower() != "false"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 POST_STATUS = (os.getenv("POST_STATUS") or "future").strip()
 
+# ===== SCHED =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
 def _to_gmt_at_kst_time(h:int, m:int=0) -> str:
     now = _now_kst()
@@ -32,57 +37,25 @@ def _to_gmt_at_kst_time(h:int, m:int=0) -> str:
     if tgt <= now: tgt += timedelta(days=1)
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-BANNED_TITLE_PATTERNS = ["브리핑","정리","알아보기","대해 알아보기","에 대해 알아보기","해야 할 것","해야할 것","해야할것"]
+# ===== SHOPPING FILTER =====
+SHOPPING_WORDS = set("""
+추천 리뷰 후기 가격 최저가 세일 특가 쇼핑 쿠폰 할인 핫딜 언박싱 스펙 사용법 베스트
+가전 노트북 스마트폰 냉장고 세탁기 건조기 에어컨 공기청정기 이어폰 헤드폰 카메라 렌즈 TV 모니터 키보드 마우스 의자 책상 침대 매트리스
+에어프라이어 로봇청소기 무선청소기 가습기 제습기 식기세척기 빔프로젝터 유모차 카시트 분유 기저귀 골프 캠핑 텐트 보조배터리 배터리
+가방 지갑 신발 패딩 스니커즈 선크림 드라이어 면도기 전동칫솔 워치 태블릿 케이스 케이블 충전기 허브 SSD HDD
+쿠팡 파트너스 링크 딜 특가전 무료배송 사은품 공동구매 라이브커머스
+""".split())
 
-def _bad_title(t:str)->bool:
-    if any(p in t for p in BANNED_TITLE_PATTERNS): return True
-    return not (12 <= len(t.strip()) <= 32)
+def is_shopping_like(kw: str) -> bool:
+    k = kw or ""
+    if any(w in k for w in SHOPPING_WORDS): return True
+    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}", k): return True   # 모델/형번
+    if re.search(r"(구매|판매|가격|최저가|할인|특가|딜|프로모션|쿠폰|배송)", k): return True
+    return False
 
-def hook_title(kw:str)->str:
-    sys_p = "너는 한국어 카피라이터다. 클릭을 부르는 짧고 강한 제목만 출력."
-    usr = f"""키워드: {kw}
-조건:
-- 14~26자
-- 금지어: {", ".join(BANNED_TITLE_PATTERNS)}
-- ~브리핑, ~정리, ~대해 알아보기 류 금지
-- '가이드/리뷰' 같은 표지어 지양
-- 출력은 제목 1줄"""
-    for _ in range(3):
-        rsp = _oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
-            temperature=0.9, max_tokens=60,
-        )
-        t = (rsp.choices[0].message.content or "").strip().replace("\n"," ")
-        if not _bad_title(t): return t
-    return f"{kw}, 오늘 이거 하나만 기억하세요"
-
-def strip_code_fences(s: str) -> str:
-    s = re.sub(r"```(?:\w+)?", "", s)
-    s = s.replace("```", "")
-    s = s.strip().strip("“”\"'")
-    return s
-
-def gen_body(kw:str)->str:
-    sys_p = "너는 짧고 읽기 쉬운 한국어 칼럼니스트다."
-    usr = f"""주제: {kw}
-형식:
-- 오프닝 훅 2~3문장
-- 소제목 2개와 짧은 본문(각 3~4문장), 불릿 1개 섞기
-- 마무리 한 문장(실천 촉구/인사이트)
-금지: '브리핑/정리/알아보기/가이드/AI' 표현
-분량: 700~1000자
-출력: 간단한 HTML(<h3>, <p>, <ul><li>) 포함, 코드블록 금지"""
-    rsp = _oai.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
-        temperature=0.85, max_tokens=900,
-    )
-    body = (rsp.choices[0].message.content or "").strip()
-    body = strip_code_fences(body)
-    return body
-
+# ===== WP =====
 def _ensure_category(name:str)->int:
+    name = name or "정보"
     r = requests.get(f"{WP_URL}/wp-json/wp/v2/categories",
                      params={"search": name, "per_page": 50},
                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
@@ -96,24 +69,29 @@ def _ensure_category(name:str)->int:
     return int(r.json()["id"])
 
 def _ensure_tag(tag:str)->int:
+    t = (tag or "").strip()
+    if not t: return None
     r = requests.get(f"{WP_URL}/wp-json/wp/v2/tags",
-                     params={"search": tag, "per_page": 50},
+                     params={"search": t, "per_page": 50},
                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     for item in r.json():
-        if (item.get("name") or "").strip()==tag: return int(item["id"])
+        if (item.get("name") or "").strip()==t: return int(item["id"])
     r = requests.post(f"{WP_URL}/wp-json/wp/v2/tags",
-                      json={"name": tag}, auth=(WP_USER, WP_APP_PASSWORD),
+                      json={"name": t}, auth=(WP_USER, WP_APP_PASSWORD),
                       verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     return int(r.json()["id"])
 
 def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str="")->dict:
     cat_id = _ensure_category(category)
-    tags = [_ensure_tag(tag)] if tag else []
+    tag_ids = []
+    if tag:
+        tid = _ensure_tag(tag)
+        if tid: tag_ids = [tid]
     payload = {
         "title": title, "content": html, "status": POST_STATUS,
-        "categories": [cat_id], "tags": tags,
+        "categories": [cat_id], "tags": tag_ids,
         "comment_status":"closed","ping_status":"closed",
         "date_gmt": when_gmt
     }
@@ -122,31 +100,102 @@ def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str=""
     r.raise_for_status()
     return r.json()
 
-def read_keywords_from_line(path:str, n:int)->List[str]:
+# ===== KEYWORDS =====
+def _read_line(path:str)->List[str]:
     if not os.path.exists(path): return []
     with open(path,"r",encoding="utf-8") as f:
         arr=[x.strip() for x in f.readline().split(",") if x.strip()]
-    return arr[:n]
+    return arr
 
-def read_keywords(n:int=2)->List[str]:
-    # 일반 키워드 우선
-    k = read_keywords_from_line("keywords_general.csv", n)
-    if len(k) < n:
-        k2 = read_keywords_from_line("keywords.csv", n)
-        k = (k + k2)[:n]
-    if not k: k = ["오늘의 인사이트","작은 성취"]
-    return k
+def pick_daily_keywords(n:int=2)->List[str]:
+    # 1) 일반 전용 라인 최우선
+    arr = _read_line("keywords_general.csv")
+    # 2) 없으면 keywords.csv에서 쇼핑스멜 제거 후 사용
+    if not arr:
+        base = _read_line("keywords.csv")
+        arr = [k for k in base if not is_shopping_like(k)]
+    # 3) 그래도 부족하면 안전한 기본
+    if len(arr) < n:
+        arr += ["오늘의 작은 통찰", "생각이 자라는 순간", "일상을 바꾸는 관찰"]
+    # 중복 제거 후 상위 n
+    seen=set(); out=[]
+    for k in arr:
+        if k not in seen and not is_shopping_like(k):
+            seen.add(k); out.append(k)
+        if len(out)>=n: break
+    return out[:n]
 
+# ===== TITLE / BODY =====
+BANNED_TITLE_PATTERNS = ["브리핑","정리","알아보기","대해 알아보기","에 대해 알아보기","해야 할 것","해야할 것","해야할것"]
+
+def _bad_title(t:str)->bool:
+    if any(p in t for p in BANNED_TITLE_PATTERNS): return True
+    L=len(t.strip())
+    return not (14 <= L <= 26)
+
+def hook_title(kw:str)->str:
+    sys_p = "너는 한국어 카피라이터다. 클릭을 부르는 짧고 강한 제목만 출력."
+    usr = f"""키워드: {kw}
+조건:
+- 14~26자
+- 금지어: {", ".join(BANNED_TITLE_PATTERNS)}
+- '~브리핑', '~정리', '~대해 알아보기', '~해야 할 것' 류 금지
+- 쇼핑/구매/할인/최저가/쿠폰/딜/가격 관련 단어 금지
+- '리뷰/가이드/사용기' 표지어 지양
+- 출력은 제목 1줄"""
+    for _ in range(3):
+        rsp = _oai.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
+            temperature=0.9, max_tokens=60,
+        )
+        t = (rsp.choices[0].message.content or "").strip().replace("\n"," ")
+        if not _bad_title(t): return t
+    return f"{kw}, 오늘 시야가 넓어지는 순간"
+
+def strip_code_fences(s: str) -> str:
+    s = re.sub(r"```(?:\w+)?", "", s)
+    s = s.replace("```", "")
+    s = s.strip().strip("“”\"'")
+    return s
+
+def gen_body_info(kw:str)->str:
+    """
+    예시 글처럼 정보 구조화. 쇼핑 표현 금지, 1000~1300자 목표.
+    """
+    sys_p = "너는 사람스러운 한국어 칼럼니스트다. 광고/구매 표현 없이 지식형 글을 쓴다."
+    usr = f"""주제: {kw}
+스타일: 정의 → 배경/원리 → 실제 영향/사례 → 관련 연구/수치(개념적) → 비교/표 1개 → 적용 팁 → 정리
+요건:
+- 도입부 2~3문장에 '왜 지금 이 주제가 흥미로운지' 훅
+- 본문은 3~5문장 단락으로 나누고, 소제목 <h2>/<h3> 사용
+- 간단한 2~3행 표 1개를 <table><thead><tbody>로 구성 (과장 없이)
+- 불릿 <ul><li> 1세트 포함
+- '구매, 가격, 할인, 최저가, 쿠폰, 쿠팡, 쇼핑' 등 상업 단어 금지
+- 'AI/작성' 같은 메타표현 금지
+- 분량: 1000~1300자 (한국어 기준)
+- 출력: 순수 HTML만(<p>, <h2>, <h3>, <ul>, <li>, <table>, <thead>, <tbody>, <tr>, <th>, <td>)"""
+    rsp = _oai.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
+        temperature=0.8, max_tokens=950,
+    )
+    body = (rsp.choices[0].message.content or "").strip()
+    return strip_code_fences(body)
+
+# ===== RUNNERS =====
 def run_two_posts():
-    kws = read_keywords(2)
+    kws = pick_daily_keywords(2)
     times = [ (10,0), (17,0) ]
     for idx,(kw,(h,m)) in enumerate(zip(kws,times)):
         title = hook_title(kw)
-        body  = gen_body(kw)
-        link = post_wp(title, body, _to_gmt_at_kst_time(h,m), category="정보", tag=kw).get("link")
+        html  = gen_body_info(kw)
+        link = post_wp(title, html, _to_gmt_at_kst_time(h,m), category="정보", tag=kw).get("link")
         print(f"[OK] scheduled ({idx}) '{title}' -> {link}")
 
 def main():
+    if not (WP_URL and WP_USER and WP_APP_PASSWORD):
+        raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["two-posts"], default="two-posts")
