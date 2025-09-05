@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
-- 키워드: keywords_general.csv 우선 사용. 없으면 keywords.csv에서 '쇼핑스멜' 강력 차단 후 사용
-- 제목: 후킹형(브리핑/정리/알아보기/해야할 것 금지, 14~26자)
-- 본문: 예시 글 스타일(정의/배경/메커니즘/연구/사례/적용/정리), 간단 표/불릿 포함
-- 톤: 사람스러운 정보형(광고/구매/할인/최저가/쿠팡 등 쇼핑 표현 금지)
-- 태그: 키워드 1개만
-- 스케줄: 같은 날 같은 슬롯(10:00, 17:00)에 예약글이 있으면 자동으로 +1일씩 이월
+- 쇼핑 키워드 필터링 유지
+- 제목/본문 가이드 유지
+- NEW: 동일 시각 이미 예약 있으면 +1일씩 자동 이월
 """
 
 import os, re, json, sys
@@ -29,16 +26,55 @@ WP_TLS_VERIFY = (os.getenv("WP_TLS_VERIFY") or "true").lower() != "false"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 POST_STATUS = (os.getenv("POST_STATUS") or "future").strip()
 
-# ===== TIME / SCHED =====
+# ===== TIME / SLOT =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
 
-def _to_utc_iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+def _wp_has_future_at(when_gmt_dt: datetime) -> bool:
+    after = (when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    before = (when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    url = f"{WP_URL}/wp-json/wp/v2/posts"
+    r = requests.get(
+        url,
+        params={"status": "future", "after": after, "before": before, "per_page": 5},
+        auth=(WP_USER, WP_APP_PASSWORD),
+        verify=WP_TLS_VERIFY,
+        timeout=15,
+    )
+    r.raise_for_status()
+    return len(r.json()) > 0
 
-def _slot_kst_for_today(h:int, m:int=0) -> datetime:
-    now = _now_kst()
-    return now.replace(hour=h, minute=m, second=0, microsecond=0)
+def _next_free_gmt_at_kst_time(h:int, m:int=0) -> str:
+    now_kst = _now_kst()
+    day = 0
+    while day < 30:
+        tgt_kst = now_kst.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=day)
+        if tgt_kst <= now_kst:
+            day += 1
+            continue
+        tgt_gmt = tgt_kst.astimezone(timezone.utc)
+        if not _wp_has_future_at(tgt_gmt):
+            return tgt_gmt.strftime("%Y-%m-%dT%H:%M:%S")
+        day += 1
+    fallback = (now_kst + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0).astimezone(timezone.utc)
+    return fallback.strftime("%Y-%m-%dT%H:%M:%S")
 
+# ===== SHOPPING FILTER =====
+SHOPPING_WORDS = set("""
+추천 리뷰 후기 가격 최저가 세일 특가 쇼핑 쿠폰 할인 핫딜 언박싱 스펙 사용법 베스트
+가전 노트북 스마트폰 냉장고 세탁기 건조기 에어컨 공기청정기 이어폰 헤드폰 카메라 렌즈 TV 모니터 키보드 마우스 의자 책상 침대 매트리스
+에어프라이어 로봇청소기 무선청소기 가습기 제습기 식기세척기 빔프로젝터 유모차 카시트 분유 기저귀 골프 캠핑 텐트 보조배터리 배터리
+가방 지갑 신발 패딩 스니커즈 선크림 드라이어 면도기 전동칫솔 워치 태블릿 케이스 케이블 충전기 허브 SSD HDD
+쿠팡 파트너스 링크 딜 특가전 무료배송 사은품 공동구매 라이브커머스
+""".split())
+
+def is_shopping_like(kw: str) -> bool:
+    k = kw or ""
+    if any(w in k for w in SHOPPING_WORDS): return True
+    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}", k): return True
+    if re.search(r"(구매|판매|가격|최저가|할인|특가|딜|프로모션|쿠폰|배송)", k): return True
+    return False
+
+# ===== WP =====
 def _ensure_category(name:str)->int:
     name = name or "정보"
     r = requests.get(f"{WP_URL}/wp-json/wp/v2/categories",
@@ -53,7 +89,7 @@ def _ensure_category(name:str)->int:
     r.raise_for_status()
     return int(r.json()["id"])
 
-def _ensure_tag(tag:str)->int:
+def _ensure_tag(tag:str)->int|None:
     t = (tag or "").strip()
     if not t: return None
     r = requests.get(f"{WP_URL}/wp-json/wp/v2/tags",
@@ -67,38 +103,6 @@ def _ensure_tag(tag:str)->int:
                       verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     return int(r.json()["id"])
-
-def _has_future_in_window_kst(category: str, center_kst: datetime, window_min: int = 45) -> bool:
-    """해당 카테고리에서 center_kst ± window_min 분 사이에 예약글이 있으면 True"""
-    cat_id = _ensure_category(category)
-    start = (center_kst - timedelta(minutes=window_min)).astimezone(timezone.utc)
-    end   = (center_kst + timedelta(minutes=window_min)).astimezone(timezone.utc)
-    params = {
-        "status": "future",
-        "per_page": 50,
-        "orderby": "date",
-        "order": "asc",
-        "categories": cat_id,
-        "after": start.strftime("%Y-%m-%dT%H:%M:%S"),
-        "before": end.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    r = requests.get(f"{WP_URL}/wp-json/wp/v2/posts", params=params,
-                     auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    return isinstance(data, list) and len(data) > 0
-
-def _next_free_slot_gmt(h:int, m:int, category:str="정보") -> str:
-    """오늘 h:m KST 기준 → 지났으면 +1일, 충돌 있으면 하루씩 이월하여 빈 날 반환"""
-    kst = _slot_kst_for_today(h, m)
-    now = _now_kst()
-    if kst <= now:
-        kst += timedelta(days=1)
-    for _ in range(14):
-        if not _has_future_in_window_kst(category, kst, window_min=45):
-            return _to_utc_iso(kst)
-        kst += timedelta(days=1)
-    return _to_utc_iso(now + timedelta(days=1))
 
 def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str="")->dict:
     cat_id = _ensure_category(category)
@@ -116,22 +120,6 @@ def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str=""
                       auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
     r.raise_for_status()
     return r.json()
-
-# ===== SHOPPING FILTER =====
-SHOPPING_WORDS = set("""
-추천 리뷰 후기 가격 최저가 세일 특가 쇼핑 쿠폰 할인 핫딜 언박싱 스펙 사용법 베스트
-가전 노트북 스마트폰 냉장고 세탁기 건조기 에어컨 공기청정기 이어폰 헤드폰 카메라 렌즈 TV 모니터 키보드 마우스 의자 책상 침대 매트리스
-에어프라이어 로봇청소기 무선청소기 가습기 제습기 식기세척기 빔프로젝터 유모차 카시트 분유 기저귀 골프 캠핑 텐트 보조배터리 배터리
-가방 지갑 신발 패딩 스니커즈 선크림 드라이어 면도기 전동칫솔 워치 태블릿 케이스 케이블 충전기 허브 SSD HDD
-쿠팡 파트너스 링크 딜 특가전 무료배송 사은품 공동구매 라이브커머스
-""".split())
-
-def is_shopping_like(kw: str) -> bool:
-    k = kw or ""
-    if any(w in k for w in SHOPPING_WORDS): return True
-    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}", k): return True
-    if re.search(r"(구매|판매|가격|최저가|할인|특가|딜|프로모션|쿠폰|배송)", k): return True
-    return False
 
 # ===== KEYWORDS =====
 def _read_line(path:str)->List[str]:
@@ -183,7 +171,9 @@ def hook_title(kw:str)->str:
     return f"{kw}, 오늘 시야가 넓어지는 순간"
 
 def strip_code_fences(s: str) -> str:
-    s = re.sub(r"```(?:\w+)?", "", s).replace("```", "").strip().strip("“”\"'")
+    s = re.sub(r"```(?:\w+)?", "", s)
+    s = s.replace("```", "")
+    s = s.strip().strip("“”\"'")
     return s
 
 def gen_body_info(kw:str)->str:
@@ -193,28 +183,29 @@ def gen_body_info(kw:str)->str:
 요건:
 - 도입부 2~3문장에 '왜 지금 이 주제가 흥미로운지' 훅
 - 본문은 3~5문장 단락으로 나누고, 소제목 <h2>/<h3> 사용
-- 간단한 2~3행 표 1개를 <table><thead><tbody>로 구성
+- 간단한 2~3행 표 1개를 <table><thead><tbody>로 구성 (과장 없이)
 - 불릿 <ul><li> 1세트 포함
 - '구매, 가격, 할인, 최저가, 쿠폰, 쿠팡, 쇼핑' 등 상업 단어 금지
 - 'AI/작성' 같은 메타표현 금지
-- 분량: 1000~1300자
+- 분량: 1000~1300자 (한국어 기준)
 - 출력: 순수 HTML만(<p>, <h2>, <h3>, <ul>, <li>, <table>, <thead>, <tbody>, <tr>, <th>, <td>)"""
     rsp = _oai.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
         temperature=0.8, max_tokens=950,
     )
-    return strip_code_fences(rsp.choices[0].message.content or "")
+    body = (rsp.choices[0].message.content or "").strip()
+    return strip_code_fences(body)
 
 # ===== RUNNERS =====
 def run_two_posts():
     kws = pick_daily_keywords(2)
-    slots = [("정보",10,0), ("정보",17,0)]  # (category,hour,minute)
-    for idx,(kw,(cat,h,m)) in enumerate(zip(kws,slots)):
+    targets = [(10,0),(17,0)]
+    for idx,(kw,(h,m)) in enumerate(zip(kws, targets)):
         title = hook_title(kw)
         html  = gen_body_info(kw)
-        when_gmt = _next_free_slot_gmt(h, m, category=cat)
-        link = post_wp(title, html, when_gmt, category=cat, tag=kw).get("link")
+        when_gmt = _next_free_gmt_at_kst_time(h,m)   # ★ 이월 스케줄러
+        link = post_wp(title, html, when_gmt, category="정보", tag=kw).get("link")
         print(f"[OK] scheduled ({idx}) '{title}' -> {link}")
 
 def main():

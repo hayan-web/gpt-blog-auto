@@ -2,10 +2,10 @@
 """
 affiliate_post.py — 쿠팡글 1건 예약(기본 13:00 KST)
 - 키워드: golden_shopping_keywords.csv -> keywords_shopping.csv -> keywords.csv -> 계절 폴백
-- 본문: 사람스러운 1인칭 리뷰형(1200~1300자) + 인라인 CSS + 눈에 띄는 버튼
+- 본문: 사람스러운 1인칭 리뷰형(1200~1300자) + 인라인 CSS + 그라데이션 버튼
 - 태그: 키워드 1개만(쿠팡/파트너스/최저가/할인 금지)
 - 딥링크: 키 있으면 API 변환, 없으면 검색 URL 폴백
-- 스케줄: 같은 날 같은 슬롯(시각) 충돌 시 +1일씩 이월하여 빈 슬롯에 예약
+- NEW: 예약 슬롯(동일 시각) 이미 있으면 +1일씩 자동 이월
 """
 import os, re, csv, json, sys, html, urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -48,16 +48,50 @@ USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.2"
 # ===== TIME =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
 
-def _parse_hhmm(hhmm: str) -> (int,int):
-    h, m = (hhmm.split(":") + ["0"])[:2]
-    return int(h), int(m)
+def _parse_hhmm(hhmm: str) -> tuple[int,int]:
+    try:
+        h, m = (hhmm.split(":") + ["0"])[:2]
+        return int(h), int(m)
+    except Exception:
+        return 13, 0
 
-def _to_kst_dt_for_today(h: int, m: int) -> datetime:
-    now = _now_kst()
-    return now.replace(hour=h, minute=m, second=0, microsecond=0)
+def _wp_has_future_at(when_gmt_dt: datetime) -> bool:
+    """
+    해당 UTC 시각 ±1분 사이에 예약글이 있는지 WP REST로 확인
+    """
+    after = (when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    before = (when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    url = f"{WP_URL}/wp-json/wp/v2/posts"
+    r = requests.get(
+        url,
+        params={"status": "future", "after": after, "before": before, "per_page": 5},
+        auth=(WP_USER, WP_APP_PASSWORD),
+        verify=WP_TLS_VERIFY,
+        timeout=15,
+    )
+    r.raise_for_status()
+    return len(r.json()) > 0
 
-def _to_utc_iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+def _next_free_gmt_at_kst(hhmm: str) -> str:
+    """
+    오늘 같은 시각이 이미 예약돼 있으면 +1일씩 밀어서 빈 슬롯 찾기
+    반환: UTC ISO8601 (date_gmt)
+    """
+    h, m = _parse_hhmm(hhmm)
+    now_kst = _now_kst()
+    day = 0
+    while day < 30:  # 안전장치
+        tgt_kst = now_kst.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=day)
+        if tgt_kst <= now_kst:
+            day += 1
+            continue
+        tgt_gmt = tgt_kst.astimezone(timezone.utc)
+        if not _wp_has_future_at(tgt_gmt):
+            return tgt_gmt.strftime("%Y-%m-%dT%H:%M:%S")
+        day += 1
+    # 30일 내 빈 슬롯이 없으면 그냥 내일 같은 시각으로
+    fallback = (now_kst + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0).astimezone(timezone.utc)
+    return fallback.strftime("%Y-%m-%dT%H:%M:%S")
 
 # ===== CSV IO =====
 def _read_col_csv(path: str) -> List[str]:
@@ -104,7 +138,7 @@ def _clean_hashtag_token(s: str) -> str:
 def _make_tags_from_keyword(kw: str) -> List[str]:
     return [kw] if FORCE_SINGLE_TAG else [t for t in {_clean_hashtag_token(x) for x in re.split(r"\s+|,|/|_", kw)} if t][:3] or [kw]
 
-# ===== WP helpers =====
+# ===== WP =====
 def _ensure_term(kind: str, name: str) -> Optional[int]:
     url = f"{WP_URL}/wp-json/wp/v2/{kind}"
     r = requests.get(url, params={"search": name, "per_page": 50},
@@ -117,41 +151,6 @@ def _ensure_term(kind: str, name: str) -> Optional[int]:
                       auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     return int(r.json()["id"])
-
-def _has_future_in_window_kst(category: str, center_kst: datetime, window_min: int = 45) -> bool:
-    """해당 카테고리에서 center_kst ± window_min 분 사이에 예약글이 있으면 True"""
-    cat_id = _ensure_term("categories", category)
-    start = (center_kst - timedelta(minutes=window_min)).astimezone(timezone.utc)
-    end   = (center_kst + timedelta(minutes=window_min)).astimezone(timezone.utc)
-    params = {
-        "status": "future",
-        "per_page": 50,
-        "orderby": "date",
-        "order": "asc",
-        "categories": cat_id,
-        "after": start.strftime("%Y-%m-%dT%H:%M:%S"),
-        "before": end.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    r = requests.get(f"{WP_URL}/wp-json/wp/v2/posts", params=params,
-                     auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    return isinstance(data, list) and len(data) > 0
-
-def _next_free_slot_gmt(hhmm: str, category: str) -> str:
-    """오늘 hh:mm KST 기준 → 지나갔으면 +1일, 또는 충돌 있으면 하루씩 이월하여 빈 날 찾기"""
-    h, m = _parse_hhmm(hhmm)
-    kst = _to_kst_dt_for_today(h, m)
-    now = _now_kst()
-    if kst <= now:
-        kst += timedelta(days=1)
-    # 충돌 체크 → 있으면 하루씩 밀기 (최대 14일)
-    for _ in range(14):
-        if not _has_future_in_window_kst(category, kst, window_min=45):
-            return _to_utc_iso(kst)
-        kst += timedelta(days=1)
-    # 14일 내 계속 충돌이면 어쩔 수 없이 현재 기준 +1일 반환
-    return _to_utc_iso(now + timedelta(days=1))
 
 def _post_wp(title: str, content_html: str, when_gmt: str, category: str, tags: List[str]) -> Dict:
     cat_id = _ensure_term("categories", category or DEFAULT_CATEGORY)
@@ -218,7 +217,7 @@ def _pick_product_and_link(kw: str) -> Dict:
         "search_url": search_url
     }
 
-# ===== OpenAI helper (Chat → Responses 폴백; temperature 미지원 모델 자동 재시도) =====
+# ===== OpenAI helper =====
 _client = OpenAI(api_key=OPENAI_API_KEY)
 MODEL_TITLE = OPENAI_MODEL or "gpt-4o-mini"
 MODEL_BODY  = OPENAI_MODEL_LONG or OPENAI_MODEL or "gpt-4o-mini"
@@ -286,27 +285,12 @@ def _css_block() -> str:
 .post-affil ul{padding-left:22px;margin:10px 0}
 .post-affil li{margin:6px 0}
 .post-affil .cta{text-align:center;margin:24px 0}
-.post-affil .cta a{display:inline-block;padding:10px 18px;border:1px solid #94a3b8;border-radius:10px;text-decoration:none}
+.post-affil .cta a{display:inline-block;padding:12px 20px;border-radius:12px;text-decoration:none;font-weight:700;
+background:linear-gradient(135deg,#2563eb,#06b6d4);color:#fff;box-shadow:0 6px 14px rgba(2,132,199,.25)}
+.post-affil .cta a:hover{transform:translateY(-1px);box-shadow:0 8px 18px rgba(2,132,199,.32)}
 .post-affil .disc{color:#a21caf;font-size:.92rem;margin:10px 0 18px}
-/* CTA buttons */
-.aff-cta{display:inline-block;padding:13px 20px;border-radius:12px;text-decoration:none;font-weight:700}
-.aff-cta.primary{background:linear-gradient(135deg,#2563eb,#06b6d4);color:#fff;box-shadow:0 6px 14px rgba(37,99,235,.25)}
-.aff-cta.secondary{background:linear-gradient(135deg,#10b981,#3b82f6);color:#fff;box-shadow:0 6px 14px rgba(16,185,129,.25)}
-.aff-cta:hover{filter:brightness(1.03)}
-.btn-wrap{text-align:center;margin:26px 0}
 </style>
 """
-
-def _cta_block(url: str, label_primary="쿠팡 최저가 확인하기", label_secondary="상세 스펙 보러가기") -> str:
-    u = html.escape(url)
-    return f'''
-<div class="btn-wrap">
-  <a class="aff-cta primary" href="{u}" target="_blank" rel="sponsored noopener">{html.escape(label_primary)}</a>
-</div>
-<div class="btn-wrap">
-  <a class="aff-cta secondary" href="{u}" target="_blank" rel="sponsored noopener">{html.escape(label_secondary)}</a>
-</div>
-'''.strip()
 
 def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
     sys_p = "너는 사람스러운 한국어 블로거다. 광고처럼 보이지 않게 직접 써본 것처럼 쓴다."
@@ -329,10 +313,9 @@ def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str 
     parts = [_css_block(), '<div class="post-affil">', f'<p class="disc">{html.escape(DISCLOSURE_TEXT)}</p>']
     if img_url:
         parts.append(f'<p><img src="{html.escape(img_url)}" alt="{html.escape(kw)}" loading="lazy"></p>')
-    parts.append(_cta_block(deeplink or search_url))
     parts.append(body)
     final_link = deeplink or search_url or _coupang_search_url(kw)
-    parts.append(_cta_block(final_link, "지금 최저가 보기", "자세히 살펴보기"))
+    parts.append(f'<p class="cta"><a href="{html.escape(final_link)}" target="_blank" rel="sponsored noopener">쿠팡 최저가 바로가기</a></p>')
     parts.append("</div>")
     return "\n".join(parts)
 
@@ -353,9 +336,7 @@ def main():
 
     title = _hook_title(kw)
     html_body = _gen_review_html(kw, deeplink, hero_img, search_url)
-
-    # === 이월 스케줄 ===
-    when_gmt = _next_free_slot_gmt(AFFILIATE_TIME_KST, DEFAULT_CATEGORY)
+    when_gmt = _next_free_gmt_at_kst(AFFILIATE_TIME_KST)  # ★ 이월 스케줄러
 
     res = _post_wp(title, html_body, when_gmt, DEFAULT_CATEGORY, tags)
     print(json.dumps({
