@@ -25,7 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Secrets -> .env (리터럴 EOF, 확장/치환 방지)
+      # Secrets -> .env (리터럴 EOF)
       - name: Write .env from Secrets (do not commit secrets)
         run: |
           cat > .env << 'EOF'
@@ -78,16 +78,16 @@ jobs:
           CACHE_MAX_FILES=500
           CACHE_DISABLE=false
           # ===== Flow switches =====
-          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}   # random | rotate | first
-          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}         # rank | shuffle | rotate
-          USE_IMAGE=${{ secrets.USE_IMAGE }}                   # off | hotlink | upload
-          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}               # 비우면 랜덤 CTA
+          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}
+          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}
+          USE_IMAGE=${{ secrets.USE_IMAGE }}
+          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}
           # ===== Debug =====
           DRY_RUN=
           EOF
 
-      # .env 내용을 안전하게 GITHUB_ENV에 주입
-      - name: Export .env to GITHUB_ENV (no eval)
+      # .env -> GITHUB_ENV (no eval)
+      - name: Export .env to GITHUB_ENV
         run: |
           python - << 'PY'
           import os
@@ -108,7 +108,6 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 검색/딥링크는 폴백 사용"
           fi
 
-      # 0) 오늘 키워드 수집/검수/분리(일반·쇼핑) + 골든 생성
       - name: Update keywords (일반+쇼핑)
         run: |
           if [ -f update_keywords.py ]; then
@@ -124,38 +123,43 @@ jobs:
           echo "== keywords_general.csv (head) ==" && head -n 5 keywords_general.csv || true
           echo "== keywords.csv (line) ==" && ( [ -f keywords.csv ] && head -n 1 keywords.csv || true )
 
-      # 1) 쿠팡 씨앗 빌드 — 실패해도 계속
+      # ---------- FIX 1: Truthy 체크로 API 호출 ----------
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
-            if [ "${REQUIRE_COUPANG_API}" = "true" ]; then
-              echo "[INFO] REQUIRE_COUPANG_API=true -> try Coupang API"
+            v="${REQUIRE_COUPANG_API:-false}"
+            v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$v" =~ ^(true|1|yes|y|on)$ ]]; then
+              echo "[INFO] REQUIRE_COUPANG_API=$v -> try Coupang API"
               python build_products_seed.py || true
             else
-              echo "[INFO] REQUIRE_COUPANG_API!=true -> skip API and use search fallback"
+              echo "[INFO] REQUIRE_COUPANG_API=$v -> skip API and use search fallback"
             fi
           else
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      # 1-1) (NEW) 씨앗 파일 보정: 없으면 플레이스홀더 생성
-      - name: Ensure products_seed.csv exists (placeholder)
+      # ---------- FIX 2: 기대 헤더로 플레이스홀더 생성 ----------
+      - name: Ensure products_seed.csv exists (placeholder with expected headers)
         run: |
           if [ ! -s products_seed.csv ]; then
-            echo "keyword,title,url,image" > products_seed.csv
-            echo "[INFO] created placeholder products_seed.csv"
+            echo "product_name,raw_url,pros,cons,keyword,title,url,image" > products_seed.csv
+            echo "[INFO] created placeholder products_seed.csv (expected headers)"
           fi
 
-      # 2) 씨앗 품질 체크 — 파일 없거나 비어도 통과
+      # ---------- FIX 3: 데이터 없으면 품질체크 스킵 ----------
       - name: Seed quality check (report + cleaned csv)
         run: |
           if [ -f seed_quality_check.py ] && [ -s products_seed.csv ]; then
-            python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md || true
+            if [ "$(wc -l < products_seed.csv)" -gt 1 ]; then
+              python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md || true
+            else
+              echo "[INFO] skip seed_quality_check: only header (no rows)"
+            fi
           else
             echo "[INFO] skip seed_quality_check (missing or empty products_seed.csv)"
           fi
 
-      # 3) 일상글 2건 예약 (10:00 / 17:00 KST)
       - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -164,7 +168,6 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전
       - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail
