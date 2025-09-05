@@ -27,7 +27,7 @@ jobs:
 
       - name: Write .env from Secrets (do not commit secrets)
         run: |
-          cat > .env << EOF
+          cat > .env << 'EOF'
           # ===== WordPress =====
           WP_URL=${{ secrets.WP_URL }}
           WP_USER=${{ secrets.WP_USER }}
@@ -56,7 +56,7 @@ jobs:
           DEFAULT_TAGS=
           AFFILIATE_CATEGORY=쇼핑
           AFFILIATE_TAGS=
-          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
+          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.
           # ===== Ads =====
           AD_METHOD=${{ secrets.AD_METHOD }}
           AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
@@ -75,24 +75,40 @@ jobs:
           LLM_LOG_FILENAME=llm.log
           CACHE_TTL_DEFAULT=86400
           CACHE_MAX_FILES=500
-          CACHE_DISABLE=false
+          CACHE_DISABLE=${{ secrets.CACHE_DISABLE }}
           # ===== Flow switches =====
-          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}
-          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}
-          USE_IMAGE=${{ secrets.USE_IMAGE }}
-          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}
+          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}   # random | rotate | first
+          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}         # rank | shuffle | rotate
+          USE_IMAGE=${{ secrets.USE_IMAGE }}                   # off | hotlink | upload
+          BUTTON_TEXT=                                         # 비우면 랜덤 CTA
           # ===== Debug =====
           DRY_RUN=
           EOF
 
+      # ⬇⬇⬇ set -a / source .env 대신: python-dotenv로 안전하게 주입 ⬇⬇⬇
+      - name: Export .env safely to $GITHUB_ENV
+        run: |
+          python - << 'PY'
+          import os
+          from dotenv import dotenv_values
+          env = dotenv_values(".env")  # just parse; no execution
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              for k, v in env.items():
+                  if v is None: 
+                      continue
+                  # Support any characters by using EOF blocks
+                  f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
+          PY
+
       - name: Preflight (Coupang keys present?)
         run: |
-          if [ -n "${{ secrets.COUPANG_ACCESS_KEY }}" ] && [ -n "${{ secrets.COUPANG_SECRET_KEY }}" ]; then
+          if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
             echo "[OK] Coupang keys are set."
           else
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 검색/딥링크는 폴백 사용"
           fi
 
+      # 0) 오늘 키워드 수집/검수/분리(일반·쇼핑) + 골든 생성 (병렬)
       - name: Update keywords (일반+쇼핑, 자동검수, 병렬)
         run: |
           if [ -f update_keywords.py ]; then
@@ -101,15 +117,16 @@ jobs:
             echo "SKIP: update_keywords.py not found"
           fi
 
-      - name: Ensure non-empty keyword files (safety fallback)
+      - name: Lifeboat keywords (ensure non-empty)
         run: |
           python - << 'PY'
-          import os,random,datetime
+          import os, datetime
           def write_once(path, lines, header=None, col=False):
               if os.path.exists(path):
                   txt=open(path,'r',encoding='utf-8',errors='ignore').read().strip()
                   if txt: return
-              if '/' in path: os.makedirs(os.path.dirname(path), exist_ok=True)
+              if '/' in path:
+                  os.makedirs(os.path.dirname(path), exist_ok=True)
               if col:
                   with open(path,'w',encoding='utf-8') as f:
                       if header: f.write(header+"\n")
@@ -117,12 +134,11 @@ jobs:
               else:
                   with open(path,'w',encoding='utf-8') as f:
                       f.write(",".join(lines)+"\n")
-          m=datetime.date.today().month
-          summer=["무더위 꿀팁","열대야 이기는 법","시원한 집중 루틴","여름 건강 수분전략","땀과 컨디션 관리","여름 밤 숙면 체크","햇빛과 멜라토닌","체온과 생산성"]
-          winter=["따뜻한 생산성 루틴","한파 컨디션 유지","면역과 수면 리듬","겨울 운동의 핵심","차가운 손발 순환","비타민D와 기분","보온과 호흡","겨울 우울 탈출"]
-          general = summer if m in (6,7,8,9) else winter
+          m = datetime.date.today().month
+          summer_gen = ["여름 건강 수분전략","여름 밤 숙면 체크","무더위 꿀팁","열대야 이기는 법","땀과 컨디션 관리","시원한 집중 루틴","햇빛과 멜라토닌","체온과 생산성"]
+          winter_gen = ["따뜻한 생산성 루틴","한파 컨디션 유지","면역과 수면 리듬","겨울 운동의 핵심","차가운 손발 순환","비타민D와 기분","보온과 호흡","겨울 우울 탈출"]
+          general = summer_gen if m in (6,7,8,9) else winter_gen
           shopping = ["넥쿨러","휴대용 선풍기","아이스 넥밴드","쿨링 타월","공기청정기","무선 청소기","가습기","전기요"]
-          random.shuffle(general); random.shuffle(shopping)
           write_once("keywords_general.csv", general[:10], header="keyword", col=True)
           write_once("golden_keywords.csv", general[:5], header="keyword", col=True)
           write_once("keywords_shopping.csv", shopping[:12], header="keyword", col=True)
@@ -133,17 +149,13 @@ jobs:
 
       - name: Show keyword heads (debug)
         run: |
-          echo "== golden_shopping_keywords.csv (head) =="; head -n 5 golden_shopping_keywords.csv || true
-          echo "== keywords_shopping.csv (head) =="; head -n 5 keywords_shopping.csv || true
-          echo "== keywords_general.csv (head) =="; head -n 5 keywords_general.csv || true
-          echo "== keywords.csv (line) =="; if [ -f keywords.csv ]; then head -n 1 keywords.csv; fi
+          echo "== golden_shopping_keywords.csv (head) ==" && head -n 5 golden_shopping_keywords.csv || true
+          echo "== keywords_shopping.csv (head) ==" && head -n 5 keywords_shopping.csv || true
+          echo "== keywords_general.csv (head) ==" && head -n 5 keywords_general.csv || true
+          echo "== keywords.csv (line) ==" && ( [ -f keywords.csv ] && head -n 1 keywords.csv || true )
 
-      # >>> 환경 변수 export 후 실행: build_products_seed.py가 dotenv를 안쓸 경우 대비
       - name: Build products_seed (from Coupang API)
         run: |
-          set -a
-          [ -f .env ] && source .env
-          set +a
           if [ -f build_products_seed.py ]; then
             python build_products_seed.py || true
           else

@@ -44,6 +44,9 @@ KEYWORDS_PRIMARY = ["golden_shopping_keywords.csv", "keywords_shopping.csv", "ke
 PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv"
 USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.2"
 
+# requests 공통 헤더
+REQ_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+
 # ===== TIME =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
 def _to_gmt_at_kst(hhmm: str) -> str:
@@ -102,13 +105,15 @@ def _make_tags_from_keyword(kw: str) -> List[str]:
 def _ensure_term(kind: str, name: str) -> Optional[int]:
     url = f"{WP_URL}/wp-json/wp/v2/{kind}"
     r = requests.get(url, params={"search": name, "per_page": 50},
-                     auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
+                     headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
+                     verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     for it in r.json():
         if (it.get("name") or "").strip() == name:
             return int(it["id"])
     r = requests.post(url, json={"name": name},
-                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
+                      headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
+                      verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     return int(r.json()["id"])
 
@@ -121,7 +126,8 @@ def _post_wp(title: str, content_html: str, when_gmt: str, category: str, tags: 
         "comment_status":"closed", "ping_status":"closed", "date_gmt": when_gmt,
     }
     r = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
-                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
+                      headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
+                      verify=WP_TLS_VERIFY, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -201,7 +207,14 @@ def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int
             if "temperature" in str(e2):
                 rr = _client.responses.create(**kwargs)
             else:
-                raise
+                # 일부 모델은 Chat/Responses 모두 거부 → 안전 모델로 재시도
+                r2 = _client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role":"system","content":system},{"role":"user","content":user}],
+                    temperature=0.8,
+                    max_tokens=max_tokens,
+                )
+                return (r2.choices[0].message.content or "").strip()
         # output_text helper 또는 수동 추출
         txt = getattr(rr, "output_text", None)
         if isinstance(txt, str) and txt.strip():
