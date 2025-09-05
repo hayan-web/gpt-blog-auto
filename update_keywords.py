@@ -42,11 +42,14 @@ USER_AGENT = os.getenv("USER_AGENT") or "keywords-bot/1.1"
 OUT_TOPK = int(os.getenv("KEYWORDS_K") or "10")
 BAN_KEYWORDS_ENV = [t.strip() for t in (os.getenv("BAN_KEYWORDS") or "").split(",") if t.strip()]
 
-DEFAULT_BANS = set(BAN_KEYWORDS_ENV + """
+DEFAULT_BANS_EXTRA = [
+    x.strip() for x in """
 사망,사고,화재,폭행,성폭력,성범죄,강간,혐의,검찰,기소,징역,피해자,피습,테러,총격,전쟁,참사,
 도박,불법,마약,음주운전,자가격리,코로나,확진,파산,부도,성비위,갑질,자살,자해,분신,
 단독,속보,영상,무릎,분노했다,충격,논란,해명,어제,오늘,내일,9월,10월,11월,12월
-""".replace("\n","")).difference({""})
+""".replace("\n", " ").split(",") if x.strip()
+]
+DEFAULT_BANS = set(BAN_KEYWORDS_ENV) | set(DEFAULT_BANS_EXTRA)
 
 HEADERS = {"User-Agent": USER_AGENT}
 SESSION = requests.Session()
