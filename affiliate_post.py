@@ -2,12 +2,12 @@
 """
 affiliate_post.py — 쿠팡글 1건 예약(기본 13:00 KST)
 - 키워드: golden_shopping_keywords.csv -> keywords_shopping.csv -> keywords.csv -> 계절 폴백
-- 본문: 사람스러운 1인칭 리뷰형(1200~1300자) + 인라인 CSS
+- 본문: 사람스러운 1인칭 리뷰형(1200~1300자) + 인라인 CSS + 눈에 띄는 버튼
 - 태그: 키워드 1개만(쿠팡/파트너스/최저가/할인 금지)
 - 딥링크: 키 있으면 API 변환, 없으면 검색 URL 폴백
-- CTA: 본문 중간 1회 + 끝 1회 버튼형(gradient/hover/shadow, 모바일 100%)
+- 스케줄: 같은 날 같은 슬롯(시각) 충돌 시 +1일씩 이월하여 빈 슬롯에 예약
 """
-import os, re, csv, json, sys, html, urllib.parse, random
+import os, re, csv, json, sys, html, urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
@@ -41,22 +41,23 @@ DISCLOSURE_TEXT = os.getenv("DISCLOSURE_TEXT") or \
 DEFAULT_CATEGORY = os.getenv("AFFILIATE_CATEGORY") or os.getenv("DEFAULT_CATEGORY") or "쇼핑"
 FORCE_SINGLE_TAG = True
 
-BUTTON_TEXT_ENV = (os.getenv("BUTTON_TEXT") or "").strip()
-
 KEYWORDS_PRIMARY = ["golden_shopping_keywords.csv", "keywords_shopping.csv", "keywords.csv"]
 PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv"
 USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.2"
 
-REQ_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-
 # ===== TIME =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
-def _to_gmt_at_kst(hhmm: str) -> str:
+
+def _parse_hhmm(hhmm: str) -> (int,int):
     h, m = (hhmm.split(":") + ["0"])[:2]
+    return int(h), int(m)
+
+def _to_kst_dt_for_today(h: int, m: int) -> datetime:
     now = _now_kst()
-    tgt = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-    if tgt <= now: tgt += timedelta(days=1)
-    return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    return now.replace(hour=h, minute=m, second=0, microsecond=0)
+
+def _to_utc_iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 # ===== CSV IO =====
 def _read_col_csv(path: str) -> List[str]:
@@ -103,21 +104,54 @@ def _clean_hashtag_token(s: str) -> str:
 def _make_tags_from_keyword(kw: str) -> List[str]:
     return [kw] if FORCE_SINGLE_TAG else [t for t in {_clean_hashtag_token(x) for x in re.split(r"\s+|,|/|_", kw)} if t][:3] or [kw]
 
-# ===== WP =====
+# ===== WP helpers =====
 def _ensure_term(kind: str, name: str) -> Optional[int]:
     url = f"{WP_URL}/wp-json/wp/v2/{kind}"
     r = requests.get(url, params={"search": name, "per_page": 50},
-                     headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
-                     verify=WP_TLS_VERIFY, timeout=15)
+                     auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     for it in r.json():
         if (it.get("name") or "").strip() == name:
             return int(it["id"])
     r = requests.post(url, json={"name": name},
-                      headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
-                      verify=WP_TLS_VERIFY, timeout=15)
+                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
     r.raise_for_status()
     return int(r.json()["id"])
+
+def _has_future_in_window_kst(category: str, center_kst: datetime, window_min: int = 45) -> bool:
+    """해당 카테고리에서 center_kst ± window_min 분 사이에 예약글이 있으면 True"""
+    cat_id = _ensure_term("categories", category)
+    start = (center_kst - timedelta(minutes=window_min)).astimezone(timezone.utc)
+    end   = (center_kst + timedelta(minutes=window_min)).astimezone(timezone.utc)
+    params = {
+        "status": "future",
+        "per_page": 50,
+        "orderby": "date",
+        "order": "asc",
+        "categories": cat_id,
+        "after": start.strftime("%Y-%m-%dT%H:%M:%S"),
+        "before": end.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    r = requests.get(f"{WP_URL}/wp-json/wp/v2/posts", params=params,
+                     auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return isinstance(data, list) and len(data) > 0
+
+def _next_free_slot_gmt(hhmm: str, category: str) -> str:
+    """오늘 hh:mm KST 기준 → 지나갔으면 +1일, 또는 충돌 있으면 하루씩 이월하여 빈 날 찾기"""
+    h, m = _parse_hhmm(hhmm)
+    kst = _to_kst_dt_for_today(h, m)
+    now = _now_kst()
+    if kst <= now:
+        kst += timedelta(days=1)
+    # 충돌 체크 → 있으면 하루씩 밀기 (최대 14일)
+    for _ in range(14):
+        if not _has_future_in_window_kst(category, kst, window_min=45):
+            return _to_utc_iso(kst)
+        kst += timedelta(days=1)
+    # 14일 내 계속 충돌이면 어쩔 수 없이 현재 기준 +1일 반환
+    return _to_utc_iso(now + timedelta(days=1))
 
 def _post_wp(title: str, content_html: str, when_gmt: str, category: str, tags: List[str]) -> Dict:
     cat_id = _ensure_term("categories", category or DEFAULT_CATEGORY)
@@ -128,8 +162,7 @@ def _post_wp(title: str, content_html: str, when_gmt: str, category: str, tags: 
         "comment_status":"closed", "ping_status":"closed", "date_gmt": when_gmt,
     }
     r = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
-                      headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
-                      verify=WP_TLS_VERIFY, timeout=20)
+                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
     r.raise_for_status()
     return r.json()
 
@@ -207,13 +240,7 @@ def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int
             if "temperature" in str(e2):
                 rr = _client.responses.create(**kwargs)
             else:
-                r2 = _client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role":"system","content":system},{"role":"user","content":user}],
-                    temperature=0.8,
-                    max_tokens=max_tokens,
-                )
-                return (r2.choices[0].message.content or "").strip()
+                raise
         txt = getattr(rr, "output_text", None)
         if isinstance(txt, str) and txt.strip():
             return txt.strip()
@@ -258,65 +285,28 @@ def _css_block() -> str:
 .post-affil h3{margin:22px 0 10px;font-size:1.15rem;color:#0f172a}
 .post-affil ul{padding-left:22px;margin:10px 0}
 .post-affil li{margin:6px 0}
-.post-affil .cta{ text-align:center;margin:24px 0 }
-.post-affil .btn-cta{
-  display:inline-flex;align-items:center;gap:8px;justify-content:center;
-  padding:14px 22px;border-radius:999px;font-weight:800;text-decoration:none;
-  background: linear-gradient(135deg,#ff6a00,#ee0979); color:#fff;
-  box-shadow:0 6px 16px rgba(238,9,121,.35); transition:.12s ease;
-}
-.post-affil .btn-cta:hover{ transform:translateY(-1px); box-shadow:0 10px 22px rgba(238,9,121,.45); filter:brightness(1.05) }
-.post-affil .btn-ghost{
-  display:inline-flex;align-items:center;gap:8px;justify-content:center;
-  padding:12px 20px;border-radius:999px;font-weight:700;text-decoration:none;
-  background:#fff;color:#0f172a;border:1px solid #d1d5db; box-shadow:0 2px 6px rgba(2,6,23,.06);
-}
+.post-affil .cta{text-align:center;margin:24px 0}
+.post-affil .cta a{display:inline-block;padding:10px 18px;border:1px solid #94a3b8;border-radius:10px;text-decoration:none}
 .post-affil .disc{color:#a21caf;font-size:.92rem;margin:10px 0 18px}
-@media (max-width:640px){
-  .post-affil .btn-cta, .post-affil .btn-ghost{ width:100% }
-}
+/* CTA buttons */
+.aff-cta{display:inline-block;padding:13px 20px;border-radius:12px;text-decoration:none;font-weight:700}
+.aff-cta.primary{background:linear-gradient(135deg,#2563eb,#06b6d4);color:#fff;box-shadow:0 6px 14px rgba(37,99,235,.25)}
+.aff-cta.secondary{background:linear-gradient(135deg,#10b981,#3b82f6);color:#fff;box-shadow:0 6px 14px rgba(16,185,129,.25)}
+.aff-cta:hover{filter:brightness(1.03)}
+.btn-wrap{text-align:center;margin:26px 0}
 </style>
 """
 
-def _cta_text() -> str:
-    if BUTTON_TEXT_ENV:
-        return BUTTON_TEXT_ENV
-    choices = [
-        "쿠팡에서 최저가 확인하기",
-        "지금 혜택/상세 스펙 보기",
-        "실사용 후기와 옵션 보기",
-        "빠른 배송 가능한 상품 보기",
-    ]
-    return random.choice(choices)
-
-def _cta_html(link: str, primary: bool = True) -> str:
-    label = html.escape(_cta_text())
-    cls = "btn-cta" if primary else "btn-ghost"
-    return f'<a class="{cls}" href="{html.escape(link)}" target="_blank" rel="sponsored noopener">{label}</a>'
-
-def _inject_mid_cta(body_html: str, cta_html: str) -> str:
-    """
-    본문 두 번째 </p> 뒤에 CTA 삽입. 실패 시 첫 <h3> 앞 또는 맨 앞에 삽입.
-    """
-    # 두 번째 </p>
-    idx = -1
-    count = 0
-    for m in re.finditer(r"</p>", body_html, flags=re.I):
-        count += 1
-        if count == 2:
-            idx = m.end()
-            break
-    if idx != -1:
-        return body_html[:idx] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[idx:]
-
-    # 첫 <h3> 앞
-    m2 = re.search(r"<h3[^>]*>", body_html, flags=re.I)
-    if m2:
-        pos = m2.start()
-        return body_html[:pos] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[pos:]
-
-    # 맨 앞
-    return f'<div class="cta">{cta_html}</div>\n' + body_html
+def _cta_block(url: str, label_primary="쿠팡 최저가 확인하기", label_secondary="상세 스펙 보러가기") -> str:
+    u = html.escape(url)
+    return f'''
+<div class="btn-wrap">
+  <a class="aff-cta primary" href="{u}" target="_blank" rel="sponsored noopener">{html.escape(label_primary)}</a>
+</div>
+<div class="btn-wrap">
+  <a class="aff-cta secondary" href="{u}" target="_blank" rel="sponsored noopener">{html.escape(label_secondary)}</a>
+</div>
+'''.strip()
 
 def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
     sys_p = "너는 사람스러운 한국어 블로거다. 광고처럼 보이지 않게 직접 써본 것처럼 쓴다."
@@ -336,21 +326,13 @@ def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str 
     )
     body = _ask_chat_then_responses(MODEL_BODY, sys_p, usr, max_tokens=1100, temperature=0.85)
     body = _strip_fences(body or "")
-    final_link = deeplink or search_url or _coupang_search_url(kw)
-
-    # CSS + 상단 디스클로저
     parts = [_css_block(), '<div class="post-affil">', f'<p class="disc">{html.escape(DISCLOSURE_TEXT)}</p>']
-
-    # 히어로 이미지
     if img_url:
         parts.append(f'<p><img src="{html.escape(img_url)}" alt="{html.escape(kw)}" loading="lazy"></p>')
-
-    # 본문 중간 CTA(ghost)
-    mid = _inject_mid_cta(body, _cta_html(final_link, primary=False))
-    parts.append(mid)
-
-    # 맨 끝 CTA(gradient primary)
-    parts.append(f'<div class="cta">{_cta_html(final_link, primary=True)}</div>')
+    parts.append(_cta_block(deeplink or search_url))
+    parts.append(body)
+    final_link = deeplink or search_url or _coupang_search_url(kw)
+    parts.append(_cta_block(final_link, "지금 최저가 보기", "자세히 살펴보기"))
     parts.append("</div>")
     return "\n".join(parts)
 
@@ -371,7 +353,9 @@ def main():
 
     title = _hook_title(kw)
     html_body = _gen_review_html(kw, deeplink, hero_img, search_url)
-    when_gmt = _to_gmt_at_kst(AFFILIATE_TIME_KST)
+
+    # === 이월 스케줄 ===
+    when_gmt = _next_free_slot_gmt(AFFILIATE_TIME_KST, DEFAULT_CATEGORY)
 
     res = _post_wp(title, html_body, when_gmt, DEFAULT_CATEGORY, tags)
     print(json.dumps({
