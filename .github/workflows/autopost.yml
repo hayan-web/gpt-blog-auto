@@ -33,7 +33,7 @@ jobs:
           WP_USER=${{ secrets.WP_USER }}
           WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
           WP_TLS_VERIFY=${{ secrets.WP_TLS_VERIFY }}
-          # ===== OpenAI (일상글 2건 생성용) =====
+          # ===== OpenAI =====
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
           OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
@@ -53,9 +53,9 @@ jobs:
           # ===== Affiliate Content =====
           PRODUCTS_SEED_CSV=products_seed.csv
           DEFAULT_CATEGORY=정보
-          DEFAULT_TAGS=쿠팡,추천,리뷰
+          DEFAULT_TAGS=
           AFFILIATE_CATEGORY=쇼핑
-          AFFILIATE_TAGS=쿠팡,파트너스,추천
+          AFFILIATE_TAGS=
           DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
           # ===== Ads =====
           AD_METHOD=${{ secrets.AD_METHOD }}
@@ -85,7 +85,8 @@ jobs:
           DRY_RUN=
           EOF
 
-      - name: "Preflight: show Coupang secrets status"
+      # YAML 파서 안전: run 블록 내부에서만 secrets 참조
+      - name: Preflight: show Coupang secrets status
         run: |
           COUPANG_ACCESS_KEY="${{ secrets.COUPANG_ACCESS_KEY }}"
           COUPANG_SECRET_KEY="${{ secrets.COUPANG_SECRET_KEY }}"
@@ -95,16 +96,16 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY are empty. Affiliate seed will be skipped (fallback will be used)."
           fi
 
-      # ▶ 일상/쇼핑 분리 수집 + 자동검수 + 병렬
+      # 0) 오늘 키워드 수집/검수/분리(일반·쇼핑) + '황금' 생성 (병렬)
       - name: Update keywords (일반+쇼핑, 자동검수, 병렬)
         run: |
           if [ -f update_keywords.py ]; then
-            python update_keywords.py --k 10 --gold 3 --shop-k 12 --shop-gold 3 --review auto --days 3 --min-volume 0 --parallel 8
+            python update_keywords.py --k 10 --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8
           else
             echo "SKIP: update_keywords.py not found"
           fi
 
-      # 1) 쿠팡 씨앗 빌드 (키 없으면 SKIP -> 아래 affiliate 폴백 사용)
+      # 1) (선택) 쿠팡 씨앗 빌드 — 키 없으면 아래 단계에서 폴백 경로 사용
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
@@ -113,17 +114,17 @@ jobs:
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      # 2) 씨앗 품질 체크 (없으면 통과: 폴백 경로 사용)
+      # 2) (선택) 씨앗 품질 체크 — 실패해도 워크플로 지속
       - name: Seed quality check (report + cleaned csv)
         run: |
           if [ -f seed_quality_check.py ]; then
             python seed_quality_check.py --strict --write-clean --http-fallback --max-per-keyword 5 --report .cache/seed_report.md || \
-            python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md
+            python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md || true
           else
             echo "SKIP: seed_quality_check.py not found"
           fi
 
-      # 3) 일상글 2건 예약 (10:00 / 17:00 KST)
+      # 3) 일상글 2건 예약 (10:00 / 17:00 KST) — auto_wp_gpt.py가 keywords_general.csv 우선 사용
       - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -132,18 +133,18 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전
+      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전 (실패해도 워크플로 지속)
       - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail
           if [ -f affiliate_post.py ]; then
-            python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt
+            python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt || true
           else
             echo "SKIP: affiliate_post.py not found" | tee /tmp/affiliate_out.txt
           fi
 
           echo "---- Affiliate step tail ----"
-          tail -n 80 /tmp/affiliate_out.txt || true
+          tail -n 120 /tmp/affiliate_out.txt || true
 
           if grep -q '"post_id"' /tmp/affiliate_out.txt; then
             echo "[OK] affiliate post created/scheduled. Rotating keywords..."
