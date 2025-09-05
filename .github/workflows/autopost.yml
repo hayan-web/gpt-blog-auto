@@ -68,7 +68,7 @@ jobs:
           KEYWORDS_K=10
           BAN_KEYWORDS=${{ secrets.BAN_KEYWORDS }}
           BACKUP_OLD_KEYWORDS=true
-          USER_AGENT=gpt-blog-keywords/1.0
+          USER_AGENT=gpt-blog-keywords/1.1
           # ===== Cache / Logs =====
           USAGE_DIR=.usage
           CACHE_DIR=.cache
@@ -95,14 +95,16 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY are empty. Affiliate seed will be skipped (fallback will be used)."
           fi
 
-      - name: Update keywords (오늘 키워드 10개)
+      # ▶ 일상/쇼핑 분리 수집 + 자동검수 + 병렬
+      - name: Update keywords (일반+쇼핑, 자동검수, 병렬)
         run: |
           if [ -f update_keywords.py ]; then
-            python update_keywords.py --k 10
+            python update_keywords.py --k 10 --gold 3 --shop-k 12 --shop-gold 3 --review auto --days 3 --min-volume 0 --parallel 8
           else
             echo "SKIP: update_keywords.py not found"
           fi
 
+      # 1) 쿠팡 씨앗 빌드 (키 없으면 SKIP -> 아래 affiliate 폴백 사용)
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
@@ -111,6 +113,7 @@ jobs:
             echo "SKIP: build_products_seed.py not found"
           fi
 
+      # 2) 씨앗 품질 체크 (없으면 통과: 폴백 경로 사용)
       - name: Seed quality check (report + cleaned csv)
         run: |
           if [ -f seed_quality_check.py ]; then
@@ -120,6 +123,7 @@ jobs:
             echo "SKIP: seed_quality_check.py not found"
           fi
 
+      # 3) 일상글 2건 예약 (10:00 / 17:00 KST)
       - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -128,6 +132,7 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
+      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전
       - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail
