@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
-- 쇼핑 키워드 필터링 유지
-- 제목/본문 가이드 유지
-- NEW: 동일 시각 이미 예약 있으면 +1일씩 자동 이월
+- keywords_general.csv 우선, 없으면 keywords.csv에서 '쇼핑스멜' 제거
+- 후킹형 제목, 정보형 본문(+CSS), 쇼핑 단어 금지
+- NEW: 해당 슬롯에 예약글 있으면 '다음날 같은 시각'으로 1회 이월
 """
-
 import os, re, json, sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -14,7 +13,7 @@ import requests
 from dotenv import load_dotenv
 load_dotenv()
 
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 _oai = OpenAI()
 
 # ===== ENV =====
@@ -26,37 +25,37 @@ WP_TLS_VERIFY = (os.getenv("WP_TLS_VERIFY") or "true").lower() != "false"
 OPENAI_MODEL = os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
 POST_STATUS = (os.getenv("POST_STATUS") or "future").strip()
 
-# ===== TIME / SLOT =====
+# ===== SCHED =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
+def _to_gmt_at_kst_time(h:int, m:int=0) -> str:
+    now = _now_kst()
+    tgt = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if tgt <= now: tgt += timedelta(days=1)
+    return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
+# NEW: 해당 UTC 시각 주변에 예약글 있는지 검사
 def _wp_has_future_at(when_gmt_dt: datetime) -> bool:
     after = (when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
     before = (when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    url = f"{WP_URL}/wp-json/wp/v2/posts"
     r = requests.get(
-        url,
+        f"{WP_URL}/wp-json/wp/v2/posts",
         params={"status": "future", "after": after, "before": before, "per_page": 5},
-        auth=(WP_USER, WP_APP_PASSWORD),
-        verify=WP_TLS_VERIFY,
-        timeout=15,
+        auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15,
     )
     r.raise_for_status()
     return len(r.json()) > 0
 
-def _next_free_gmt_at_kst_time(h:int, m:int=0) -> str:
+# NEW: 충돌 시 '다음날 같은 시각'으로 1회만 이월
+def _slot_or_next_day_time(h:int, m:int=0) -> str:
     now_kst = _now_kst()
-    day = 0
-    while day < 30:
-        tgt_kst = now_kst.replace(hour=h, minute=m, second=0, microsecond=0) + timedelta(days=day)
-        if tgt_kst <= now_kst:
-            day += 1
-            continue
-        tgt_gmt = tgt_kst.astimezone(timezone.utc)
-        if not _wp_has_future_at(tgt_gmt):
-            return tgt_gmt.strftime("%Y-%m-%dT%H:%M:%S")
-        day += 1
-    fallback = (now_kst + timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0).astimezone(timezone.utc)
-    return fallback.strftime("%Y-%m-%dT%H:%M:%S")
+    tgt_kst = now_kst.replace(hour=h, minute=m, second=0, microsecond=0)
+    if tgt_kst <= now_kst:
+        tgt_kst += timedelta(days=1)
+    tgt_utc = tgt_kst.astimezone(timezone.utc)
+    if _wp_has_future_at(tgt_utc):
+        nxt_utc = (tgt_kst + timedelta(days=1)).astimezone(timezone.utc)
+        return nxt_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    return tgt_utc.strftime("%Y-%m-%dT%H:%M:%S")
 
 # ===== SHOPPING FILTER =====
 SHOPPING_WORDS = set("""
@@ -142,6 +141,28 @@ def pick_daily_keywords(n:int=2)->List[str]:
         if len(out)>=n: break
     return out[:n]
 
+# ===== OpenAI helper (Chat→Responses 폴백; temperature 미지원 모델 자동 재시도) =====
+def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int, temperature: float) -> str:
+    try:
+        r = _oai.chat.completions.create(
+            model=model,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return (r.choices[0].message.content or "").strip()
+    except BadRequestError:
+        rr = _oai.responses.create(model=model, input=f"[시스템]\n{system}\n\n[사용자]\n{user}", max_output_tokens=max_tokens)
+        txt = getattr(rr, "output_text", None)
+        if isinstance(txt, str) and txt.strip():
+            return txt.strip()
+        if getattr(rr, "output", None) and rr.output and rr.output[0].content:
+            try:
+                return rr.output[0].content[0].text.strip()
+            except Exception:
+                pass
+        return ""
+
 # ===== TITLE / BODY =====
 BANNED_TITLE_PATTERNS = ["브리핑","정리","알아보기","대해 알아보기","에 대해 알아보기","해야 할 것","해야할 것","해야할것"]
 
@@ -161,20 +182,27 @@ def hook_title(kw:str)->str:
 - '리뷰/가이드/사용기' 표지어 지양
 - 출력은 제목 1줄"""
     for _ in range(3):
-        rsp = _oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
-            temperature=0.9, max_tokens=60,
-        )
-        t = (rsp.choices[0].message.content or "").strip().replace("\n"," ")
+        t = _ask_chat_then_responses(OPENAI_MODEL, sys_p, usr, max_tokens=60, temperature=0.9)
+        t = (t or "").strip().replace("\n"," ")
         if not _bad_title(t): return t
     return f"{kw}, 오늘 시야가 넓어지는 순간"
 
 def strip_code_fences(s: str) -> str:
-    s = re.sub(r"```(?:\w+)?", "", s)
-    s = s.replace("```", "")
-    s = s.strip().strip("“”\"'")
-    return s
+    return re.sub(r"```(?:\w+)?", "", s).replace("```", "").strip().strip("“”\"'")
+
+def _css_block()->str:
+    return """
+<style>
+.post-info p{line-height:1.86;margin:0 0 14px;color:#222}
+.post-info h2{margin:28px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
+.post-info h3{margin:22px 0 10px;font-size:1.12rem;color:#0f172a}
+.post-info ul{padding-left:22px;margin:10px 0}
+.post-info li{margin:6px 0}
+.post-info table{border-collapse:collapse;width:100%;margin:16px 0}
+.post-info thead th{background:#f1f5f9}
+.post-info th,.post-info td{border:1px solid #e2e8f0;padding:8px 10px;text-align:left}
+</style>
+"""
 
 def gen_body_info(kw:str)->str:
     sys_p = "너는 사람스러운 한국어 칼럼니스트다. 광고/구매 표현 없이 지식형 글을 쓴다."
@@ -189,23 +217,18 @@ def gen_body_info(kw:str)->str:
 - 'AI/작성' 같은 메타표현 금지
 - 분량: 1000~1300자 (한국어 기준)
 - 출력: 순수 HTML만(<p>, <h2>, <h3>, <ul>, <li>, <table>, <thead>, <tbody>, <tr>, <th>, <td>)"""
-    rsp = _oai.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
-        temperature=0.8, max_tokens=950,
-    )
-    body = (rsp.choices[0].message.content or "").strip()
-    return strip_code_fences(body)
+    body = _ask_chat_then_responses(OPENAI_MODEL, sys_p, usr, max_tokens=950, temperature=0.8)
+    return _css_block() + '\n<div class="post-info">\n' + strip_code_fences(body) + "\n</div>"
 
 # ===== RUNNERS =====
 def run_two_posts():
     kws = pick_daily_keywords(2)
-    targets = [(10,0),(17,0)]
-    for idx,(kw,(h,m)) in enumerate(zip(kws, targets)):
+    times = [ (10,0), (17,0) ]
+    for idx,(kw,(h,m)) in enumerate(zip(kws,times)):
         title = hook_title(kw)
         html  = gen_body_info(kw)
-        when_gmt = _next_free_gmt_at_kst_time(h,m)   # ★ 이월 스케줄러
-        link = post_wp(title, html, when_gmt, category="정보", tag=kw).get("link")
+        when  = _slot_or_next_day_time(h,m)  # ★ 충돌 시 다음날로만 이월
+        link = post_wp(title, html, when, category="정보", tag=kw).get("link")
         print(f"[OK] scheduled ({idx}) '{title}' -> {link}")
 
 def main():
