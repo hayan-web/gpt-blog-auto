@@ -287,19 +287,38 @@ def _css_block() -> str:
 .post-affil h3{margin:22px 0 10px;font-size:1.15rem;color:#0f172a}
 .post-affil ul{padding-left:22px;margin:10px 0}
 .post-affil li{margin:6px 0}
-.post-affil .cta{ text-align:center;margin:24px 0 }
+.post-affil .cta{ text-align:center;margin:26px 0 }
+
+/* ⭐ 메인 CTA: 크게, 강한 대비, 시선집중 효과 */
 .post-affil .btn-cta{
-  display:inline-flex;align-items:center;gap:8px;justify-content:center;
-  padding:14px 22px;border-radius:999px;font-weight:800;text-decoration:none;
-  background: linear-gradient(135deg,#ff6a00,#ee0979); color:#fff;
-  box-shadow:0 6px 16px rgba(238,9,121,.35); transition:.12s ease;
+  display:inline-flex;align-items:center;justify-content:center;gap:10px;
+  padding:16px 28px;border-radius:999px;font-weight:900;font-size:1.18rem;
+  letter-spacing:.2px;text-decoration:none;border:0;outline:0;
+  color:#fff;background:linear-gradient(135deg,#ff3d00 0%,#ff007a 45%,#7c3aed 100%);
+  box-shadow:0 12px 26px rgba(124,58,237,.35), 0 2px 0 rgba(0,0,0,.18) inset;
+  transform:translateZ(0);transition:transform .12s ease, box-shadow .12s ease, filter .12s ease;
+  position:relative; overflow:hidden;
 }
-.post-affil .btn-cta:hover{ transform:translateY(-1px); box-shadow:0 10px 22px rgba(238,9,121,.45); filter:brightness(1.05) }
+.post-affil .btn-cta:hover{ transform:translateY(-1px); filter:brightness(1.05);
+  box-shadow:0 16px 32px rgba(124,58,237,.45), 0 2px 0 rgba(0,0,0,.18) inset; }
+.post-affil .btn-cta:active{ transform:translateY(0); filter:brightness(.98); }
+.post-affil .btn-cta:focus-visible{ outline:3px solid rgba(59,130,246,.55); outline-offset:2px; }
+
+/* 광택 스캔 효과 */
+.post-affil .btn-cta::after{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background:linear-gradient(120deg, transparent 0%, rgba(255,255,255,.35) 40%, transparent 60%);
+  transform:translateX(-120%); transition:transform .5s ease;
+}
+.post-affil .btn-cta:hover::after{ transform:translateX(120%); }
+
+/* 보조(고스트) 버튼은 그대로 두되 여백/가독성만 약간 업 */
 .post-affil .btn-ghost{
-  display:inline-flex;align-items:center;gap:8px;justify-content:center;
-  padding:12px 20px;border-radius:999px;font-weight:700;text-decoration:none;
+  display:inline-flex;align-items:center;justify-content:center;gap:8px;
+  padding:12px 20px;border-radius:999px;font-weight:700;font-size:1rem;
   background:#fff;color:#0f172a;border:1px solid #d1d5db; box-shadow:0 2px 6px rgba(2,6,23,.06);
 }
+
 .post-affil .disc{color:#a21caf;font-size:.92rem;margin:10px 0 18px}
 @media (max-width:640px){
   .post-affil .btn-cta, .post-affil .btn-ghost{ width:100% }
@@ -307,9 +326,13 @@ def _css_block() -> str:
 </style>
 """
 
-def _cta_text() -> str:
+# 1) 버튼 라벨 로직: 메인(primary=True)은 고정, 고스트(primary=False)는 랜덤
+def _cta_text(primary: bool = False) -> str:
     if BUTTON_TEXT_ENV:
         return BUTTON_TEXT_ENV
+    if primary:
+        return "제품 보러가기"  # 메인 CTA는 항상 고정
+    # 중간(고스트) CTA만 랜덤 문구
     choices = [
         "쿠팡에서 최저가 확인하기",
         "지금 혜택/상세 스펙 보기",
@@ -318,8 +341,9 @@ def _cta_text() -> str:
     ]
     return random.choice(choices)
 
+# 2) CTA HTML 생성: primary 여부에 따라 클래스/라벨 결정
 def _cta_html(link: str, primary: bool = True) -> str:
-    label = html.escape(_cta_text())
+    label = html.escape(_cta_text(primary))
     cls = "btn-cta" if primary else "btn-ghost"
     return f'<a class="{cls}" href="{html.escape(link)}" target="_blank" rel="sponsored noopener">{label}</a>'
 
@@ -339,6 +363,7 @@ def _inject_mid_cta(body_html: str, cta_html: str) -> str:
         return body_html[:pos] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[pos:]
     return f'<div class="cta">{cta_html}</div>\n' + body_html
 
+# 3) 본문 생성: 중간에는 고스트 버튼, 끝에는 메인 그라디언트 버튼
 def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
     sys_p = "너는 사람스러운 한국어 블로거다. 광고처럼 보이지 않게 직접 써본 것처럼 쓴다."
     usr = (
@@ -360,10 +385,15 @@ def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str 
     final_link = deeplink or search_url or _coupang_search_url(kw)
 
     parts = [_css_block(), '<div class="post-affil">', f'<p class="disc">{html.escape(DISCLOSURE_TEXT)}</p>']
+
     if img_url:
         parts.append(f'<p><img src="{html.escape(img_url)}" alt="{html.escape(kw)}" loading="lazy"></p>')
+
+    # 중간 CTA: 고스트(랜덤 라벨)
     mid = _inject_mid_cta(body, _cta_html(final_link, primary=False))
     parts.append(mid)
+
+    # 끝 CTA: 메인 그라디언트(항상 "제품 보러가기")
     parts.append(f'<div class="cta">{_cta_html(final_link, primary=True)}</div>')
     parts.append("</div>")
     return "\n".join(parts)
