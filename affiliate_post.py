@@ -287,83 +287,64 @@ def _css_block() -> str:
 .post-affil h3{margin:22px 0 10px;font-size:1.15rem;color:#0f172a}
 .post-affil ul{padding-left:22px;margin:10px 0}
 .post-affil li{margin:6px 0}
-.post-affil .cta{ text-align:center;margin:26px 0 }
-
-/* ⭐ 메인 CTA: 크게, 강한 대비, 시선집중 효과 */
+.post-affil .cta{text-align:center;margin:26px 0}
 .post-affil .btn-cta{
-  display:inline-flex;align-items:center;justify-content:center;gap:10px;
-  padding:16px 28px;border-radius:999px;font-weight:900;font-size:1.18rem;
-  letter-spacing:.2px;text-decoration:none;border:0;outline:0;
-  color:#fff;background:linear-gradient(135deg,#ff3d00 0%,#ff007a 45%,#7c3aed 100%);
-  box-shadow:0 12px 26px rgba(124,58,237,.35), 0 2px 0 rgba(0,0,0,.18) inset;
-  transform:translateZ(0);transition:transform .12s ease, box-shadow .12s ease, filter .12s ease;
-  position:relative; overflow:hidden;
+  display:inline-flex;align-items:center;gap:8px;justify-content:center;
+  padding:16px 28px;border-radius:999px;font-weight:900;font-size:1.05rem;text-decoration:none;
+  background:linear-gradient(135deg,#ff6a00,#ee0979);color:#fff;
+  box-shadow:0 10px 26px rgba(238,9,121,.42);transition:transform .12s ease,box-shadow .12s ease,filter .12s ease;
 }
-.post-affil .btn-cta:hover{ transform:translateY(-1px); filter:brightness(1.05);
-  box-shadow:0 16px 32px rgba(124,58,237,.45), 0 2px 0 rgba(0,0,0,.18) inset; }
-.post-affil .btn-cta:active{ transform:translateY(0); filter:brightness(.98); }
-.post-affil .btn-cta:focus-visible{ outline:3px solid rgba(59,130,246,.55); outline-offset:2px; }
-
-/* 광택 스캔 효과 */
-.post-affil .btn-cta::after{
-  content:""; position:absolute; inset:0; pointer-events:none;
-  background:linear-gradient(120deg, transparent 0%, rgba(255,255,255,.35) 40%, transparent 60%);
-  transform:translateX(-120%); transition:transform .5s ease;
-}
-.post-affil .btn-cta:hover::after{ transform:translateX(120%); }
-
-/* 보조(고스트) 버튼은 그대로 두되 여백/가독성만 약간 업 */
+.post-affil .btn-cta:hover{transform:translateY(-1px);box-shadow:0 14px 30px rgba(238,9,121,.5);filter:brightness(1.05)}
 .post-affil .btn-ghost{
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  padding:12px 20px;border-radius:999px;font-weight:700;font-size:1rem;
-  background:#fff;color:#0f172a;border:1px solid #d1d5db; box-shadow:0 2px 6px rgba(2,6,23,.06);
+  display:inline-flex;align-items:center;gap:8px;justify-content:center;
+  padding:14px 22px;border-radius:999px;font-weight:700;font-size:1rem;text-decoration:none;
+  background:#fff;color:#0f172a;border:1px solid #d1d5db;box-shadow:0 4px 10px rgba(2,6,23,.08)
 }
-
 .post-affil .disc{color:#a21caf;font-size:.92rem;margin:10px 0 18px}
-@media (max-width:640px){
-  .post-affil .btn-cta, .post-affil .btn-ghost{ width:100% }
-}
+@media (max-width:640px){ .post-affil .btn-cta,.post-affil .btn-ghost{width:100%} }
 </style>
 """
 
-# 1) 버튼 라벨 로직: 메인(primary=True)은 고정, 고스트(primary=False)는 랜덤
-def _cta_text(primary: bool = False) -> str:
-    if BUTTON_TEXT_ENV:
-        return BUTTON_TEXT_ENV
+def _sanitize_label(s: str) -> str:
+    # 환경변수에 '# 코멘트' 같이 들어온 경우 제거
+    import re
+    return re.sub(r'^[#\s]+', '', (s or '')).strip()
+
+def _cta_text(primary: bool) -> str:
+    # 마지막 큰 버튼은 항상 고정 문구
     if primary:
-        return "제품 보러가기"  # 메인 CTA는 항상 고정
-    # 중간(고스트) CTA만 랜덤 문구
+        return "제품 보러가기"
+    # 중간(ghost) 버튼은 환경변수 우선 → 없으면 랜덤
+    if BUTTON_TEXT_ENV:
+        return _sanitize_label(BUTTON_TEXT_ENV)
     choices = [
         "쿠팡에서 최저가 확인하기",
         "지금 혜택/상세 스펙 보기",
         "실사용 후기와 옵션 보기",
         "빠른 배송 가능한 상품 보기",
     ]
+    import random
     return random.choice(choices)
 
-# 2) CTA HTML 생성: primary 여부에 따라 클래스/라벨 결정
 def _cta_html(link: str, primary: bool = True) -> str:
     label = html.escape(_cta_text(primary))
     cls = "btn-cta" if primary else "btn-ghost"
-    return f'<a class="{cls}" href="{html.escape(link)}" target="_blank" rel="sponsored noopener">{label}</a>'
+    # 테마/플러그인 CSS에 덮이지 않도록 인라인 스타일도 함께 적용(이중 안전장치)
+    if primary:
+        inline = ("display:inline-flex;align-items:center;justify-content:center;gap:8px;"
+                  "padding:16px 28px;border-radius:999px;font-weight:900;font-size:1.05rem;"
+                  "text-decoration:none;background:linear-gradient(135deg,#ff6a00,#ee0979);"
+                  "color:#fff;box-shadow:0 10px 26px rgba(238,9,121,.42)")
+    else:
+        inline = ("display:inline-flex;align-items:center;justify-content:center;gap:8px;"
+                  "padding:14px 22px;border-radius:999px;font-weight:700;font-size:1rem;"
+                  "text-decoration:none;background:#fff;color:#0f172a;border:1px solid #d1d5db;"
+                  "box-shadow:0 4px 10px rgba(2,6,23,.08)")
+    return (
+        f'<a class="{cls}" style="{inline}" href="{html.escape(link)}" '
+        f'target="_blank" rel="sponsored noopener" aria-label="{label}">{label}</a>'
+    )
 
-def _inject_mid_cta(body_html: str, cta_html: str) -> str:
-    idx = -1
-    count = 0
-    for m in re.finditer(r"</p>", body_html, flags=re.I):
-        count += 1
-        if count == 2:
-            idx = m.end()
-            break
-    if idx != -1:
-        return body_html[:idx] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[idx:]
-    m2 = re.search(r"<h3[^>]*>", body_html, flags=re.I)
-    if m2:
-        pos = m2.start()
-        return body_html[:pos] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[pos:]
-    return f'<div class="cta">{cta_html}</div>\n' + body_html
-
-# 3) 본문 생성: 중간에는 고스트 버튼, 끝에는 메인 그라디언트 버튼
 def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
     sys_p = "너는 사람스러운 한국어 블로거다. 광고처럼 보이지 않게 직접 써본 것처럼 쓴다."
     usr = (
