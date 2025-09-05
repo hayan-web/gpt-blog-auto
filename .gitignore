@@ -34,3 +34,34 @@ products_seed.cleaned.csv
 .cache/
 .usage/
 
+### >>> gpt-blog generated & cache >>>
+# generated keyword lines
+keywords_general.csv
+keywords_shopping.csv
+golden_*.csv
+products_seed.cleaned.csv
+.cache/
+.usage/
+seed_report.md
+llm.log
+*.log
+*.tmp
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+
+# secrets
+.env
+.env.local
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+### <<< gpt-blog generated & cache <<<
