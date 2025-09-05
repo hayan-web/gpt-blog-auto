@@ -25,6 +25,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Secrets -> .env (리터럴 EOF, 확장/치환 방지)
       - name: Write .env from Secrets (do not commit secrets)
         run: |
           cat > .env << 'EOF'
@@ -75,28 +76,27 @@ jobs:
           LLM_LOG_FILENAME=llm.log
           CACHE_TTL_DEFAULT=86400
           CACHE_MAX_FILES=500
-          CACHE_DISABLE=${{ secrets.CACHE_DISABLE }}
+          CACHE_DISABLE=false
           # ===== Flow switches =====
           KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}   # random | rotate | first
           SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}         # rank | shuffle | rotate
           USE_IMAGE=${{ secrets.USE_IMAGE }}                   # off | hotlink | upload
-          BUTTON_TEXT=                                         # 비우면 랜덤 CTA
+          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}               # 비우면 랜덤 CTA
           # ===== Debug =====
           DRY_RUN=
           EOF
 
-      # ⬇⬇⬇ set -a / source .env 대신: python-dotenv로 안전하게 주입 ⬇⬇⬇
-      - name: Export .env safely to $GITHUB_ENV
+      # .env 내용을 안전하게 GITHUB_ENV에 주입
+      - name: Export .env to GITHUB_ENV (no eval)
         run: |
           python - << 'PY'
           import os
           from dotenv import dotenv_values
-          env = dotenv_values(".env")  # just parse; no execution
+          env = dotenv_values(".env")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
-              for k, v in env.items():
+              for k,v in env.items():
                   if v is None: 
                       continue
-                  # Support any characters by using EOF blocks
                   f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
           PY
 
@@ -108,44 +108,14 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 검색/딥링크는 폴백 사용"
           fi
 
-      # 0) 오늘 키워드 수집/검수/분리(일반·쇼핑) + 골든 생성 (병렬)
-      - name: Update keywords (일반+쇼핑, 자동검수, 병렬)
+      # 0) 오늘 키워드 수집/검수/분리(일반·쇼핑) + 골든 생성
+      - name: Update keywords (일반+쇼핑)
         run: |
           if [ -f update_keywords.py ]; then
             python update_keywords.py --k 10 --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8 || true
           else
             echo "SKIP: update_keywords.py not found"
           fi
-
-      - name: Lifeboat keywords (ensure non-empty)
-        run: |
-          python - << 'PY'
-          import os, datetime
-          def write_once(path, lines, header=None, col=False):
-              if os.path.exists(path):
-                  txt=open(path,'r',encoding='utf-8',errors='ignore').read().strip()
-                  if txt: return
-              if '/' in path:
-                  os.makedirs(os.path.dirname(path), exist_ok=True)
-              if col:
-                  with open(path,'w',encoding='utf-8') as f:
-                      if header: f.write(header+"\n")
-                      for x in lines: f.write(x+"\n")
-              else:
-                  with open(path,'w',encoding='utf-8') as f:
-                      f.write(",".join(lines)+"\n")
-          m = datetime.date.today().month
-          summer_gen = ["여름 건강 수분전략","여름 밤 숙면 체크","무더위 꿀팁","열대야 이기는 법","땀과 컨디션 관리","시원한 집중 루틴","햇빛과 멜라토닌","체온과 생산성"]
-          winter_gen = ["따뜻한 생산성 루틴","한파 컨디션 유지","면역과 수면 리듬","겨울 운동의 핵심","차가운 손발 순환","비타민D와 기분","보온과 호흡","겨울 우울 탈출"]
-          general = summer_gen if m in (6,7,8,9) else winter_gen
-          shopping = ["넥쿨러","휴대용 선풍기","아이스 넥밴드","쿨링 타월","공기청정기","무선 청소기","가습기","전기요"]
-          write_once("keywords_general.csv", general[:10], header="keyword", col=True)
-          write_once("golden_keywords.csv", general[:5], header="keyword", col=True)
-          write_once("keywords_shopping.csv", shopping[:12], header="keyword", col=True)
-          write_once("golden_shopping_keywords.csv", shopping[:5], header="keyword", col=True)
-          if not os.path.exists("keywords.csv"):
-              write_once("keywords.csv", general[:10])
-          PY
 
       - name: Show keyword heads (debug)
         run: |
@@ -154,23 +124,38 @@ jobs:
           echo "== keywords_general.csv (head) ==" && head -n 5 keywords_general.csv || true
           echo "== keywords.csv (line) ==" && ( [ -f keywords.csv ] && head -n 1 keywords.csv || true )
 
+      # 1) 쿠팡 씨앗 빌드 — 실패해도 계속
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
-            python build_products_seed.py || true
+            if [ "${REQUIRE_COUPANG_API}" = "true" ]; then
+              echo "[INFO] REQUIRE_COUPANG_API=true -> try Coupang API"
+              python build_products_seed.py || true
+            else
+              echo "[INFO] REQUIRE_COUPANG_API!=true -> skip API and use search fallback"
+            fi
           else
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      - name: Seed quality check (report + cleaned csv)
+      # 1-1) (NEW) 씨앗 파일 보정: 없으면 플레이스홀더 생성
+      - name: Ensure products_seed.csv exists (placeholder)
         run: |
-          if [ -f seed_quality_check.py ]; then
-            python seed_quality_check.py --strict --write-clean --http-fallback --max-per-keyword 5 --report .cache/seed_report.md || \
-            python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md || true
-          else
-            echo "SKIP: seed_quality_check.py not found"
+          if [ ! -s products_seed.csv ]; then
+            echo "keyword,title,url,image" > products_seed.csv
+            echo "[INFO] created placeholder products_seed.csv"
           fi
 
+      # 2) 씨앗 품질 체크 — 파일 없거나 비어도 통과
+      - name: Seed quality check (report + cleaned csv)
+        run: |
+          if [ -f seed_quality_check.py ] && [ -s products_seed.csv ]; then
+            python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md || true
+          else
+            echo "[INFO] skip seed_quality_check (missing or empty products_seed.csv)"
+          fi
+
+      # 3) 일상글 2건 예약 (10:00 / 17:00 KST)
       - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -179,6 +164,7 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
+      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전
       - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail
@@ -187,11 +173,15 @@ jobs:
           else
             echo "SKIP: affiliate_post.py not found" | tee /tmp/affiliate_out.txt
           fi
+
           echo "---- Affiliate step tail ----"
           tail -n 120 /tmp/affiliate_out.txt || true
+
           if grep -q '"post_id"' /tmp/affiliate_out.txt; then
             echo "[OK] affiliate post created/scheduled. Rotating keywords..."
-            if [ -f rotate_keywords.py ]; then python rotate_keywords.py; fi
+            if [ -f rotate_keywords.py ]; then
+              python rotate_keywords.py || true
+            fi
           else
             echo "[INFO] Affiliate post not created. See [AFFILIATE] lines above for reason."
           fi
