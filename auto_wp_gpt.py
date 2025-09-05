@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 auto_wp_gpt.py — 일상글 2건 예약(10:00/17:00 KST)
-- 후킹형 제목(금칙어 차단)
-- 태그=키워드 1개만
+- 키워드: keywords_general.csv 우선(없으면 keywords.csv)
+- 후킹형 제목(브리핑/정리/알아보기/해야할것 금지)
+- 본문에 코드펜스 제거(```html 등), 태그=키워드 1개
 """
 
 import os, re, json, sys
@@ -22,7 +23,6 @@ WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD") or ""
 WP_TLS_VERIFY = (os.getenv("WP_TLS_VERIFY") or "true").lower() != "false"
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-KEYWORDS_CSV = os.getenv("KEYWORDS_CSV") or "keywords.csv"
 POST_STATUS = (os.getenv("POST_STATUS") or "future").strip()
 
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
@@ -40,15 +40,13 @@ def _bad_title(t:str)->bool:
 
 def hook_title(kw:str)->str:
     sys_p = "너는 한국어 카피라이터다. 클릭을 부르는 짧고 강한 제목만 출력."
-    usr = f"""
-키워드: {kw}
+    usr = f"""키워드: {kw}
 조건:
 - 14~26자
 - 금지어: {", ".join(BANNED_TITLE_PATTERNS)}
 - ~브리핑, ~정리, ~대해 알아보기 류 금지
-- '가이드/리뷰'와 같은 표지어는 피해서 자연스럽게
-- 출력은 제목 1줄
-"""
+- '가이드/리뷰' 같은 표지어 지양
+- 출력은 제목 1줄"""
     for _ in range(3):
         rsp = _oai.chat.completions.create(
             model=OPENAI_MODEL,
@@ -59,24 +57,30 @@ def hook_title(kw:str)->str:
         if not _bad_title(t): return t
     return f"{kw}, 오늘 이거 하나만 기억하세요"
 
+def strip_code_fences(s: str) -> str:
+    s = re.sub(r"```(?:\w+)?", "", s)
+    s = s.replace("```", "")
+    s = s.strip().strip("“”\"'")
+    return s
+
 def gen_body(kw:str)->str:
     sys_p = "너는 짧고 읽기 쉬운 한국어 칼럼니스트다."
-    usr = f"""
-주제: {kw}
+    usr = f"""주제: {kw}
 형식:
 - 오프닝 훅 2~3문장
 - 소제목 2개와 짧은 본문(각 3~4문장), 불릿 1개 섞기
 - 마무리 한 문장(실천 촉구/인사이트)
 금지: '브리핑/정리/알아보기/가이드/AI' 표현
 분량: 700~1000자
-출력: 간단한 HTML(<h3>, <p>, <ul><li>) 포함
-"""
+출력: 간단한 HTML(<h3>, <p>, <ul><li>) 포함, 코드블록 금지"""
     rsp = _oai.chat.completions.create(
         model=OPENAI_MODEL,
         messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
         temperature=0.85, max_tokens=900,
     )
-    return (rsp.choices[0].message.content or "").strip()
+    body = (rsp.choices[0].message.content or "").strip()
+    body = strip_code_fences(body)
+    return body
 
 def _ensure_category(name:str)->int:
     r = requests.get(f"{WP_URL}/wp-json/wp/v2/categories",
@@ -118,12 +122,20 @@ def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str=""
     r.raise_for_status()
     return r.json()
 
-def read_keywords(n:int=2)->List[str]:
-    if not os.path.exists(KEYWORDS_CSV): return ["오늘의 인사이트","작은 성취"]
-    with open(KEYWORDS_CSV,"r",encoding="utf-8") as f:
+def read_keywords_from_line(path:str, n:int)->List[str]:
+    if not os.path.exists(path): return []
+    with open(path,"r",encoding="utf-8") as f:
         arr=[x.strip() for x in f.readline().split(",") if x.strip()]
-    if len(arr)<n: arr += arr[:max(0, n-len(arr))]
     return arr[:n]
+
+def read_keywords(n:int=2)->List[str]:
+    # 일반 키워드 우선
+    k = read_keywords_from_line("keywords_general.csv", n)
+    if len(k) < n:
+        k2 = read_keywords_from_line("keywords.csv", n)
+        k = (k + k2)[:n]
+    if not k: k = ["오늘의 인사이트","작은 성취"]
+    return k
 
 def run_two_posts():
     kws = read_keywords(2)

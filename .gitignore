@@ -16,3 +16,12 @@ keywords.csv
 # === misc local helpers ===
 run.bat
 post_test.py
+
+# generated keyword files
+keywords_general.csv
+keywords_shopping.csv
+golden_*.csv
+products_seed.cleaned.csv
+.cache/
+.usage/
+
