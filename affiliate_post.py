@@ -5,8 +5,9 @@ affiliate_post.py — 쿠팡글 1건 예약(기본 13:00 KST)
 - 본문: 사람스러운 1인칭 리뷰형(1200~1300자) + 인라인 CSS
 - 태그: 키워드 1개만(쿠팡/파트너스/최저가/할인 금지)
 - 딥링크: 키 있으면 API 변환, 없으면 검색 URL 폴백
+- CTA: 본문 중간 1회 + 끝 1회 버튼형(gradient/hover/shadow, 모바일 100%)
 """
-import os, re, csv, json, sys, html, urllib.parse
+import os, re, csv, json, sys, html, urllib.parse, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
@@ -40,11 +41,12 @@ DISCLOSURE_TEXT = os.getenv("DISCLOSURE_TEXT") or \
 DEFAULT_CATEGORY = os.getenv("AFFILIATE_CATEGORY") or os.getenv("DEFAULT_CATEGORY") or "쇼핑"
 FORCE_SINGLE_TAG = True
 
+BUTTON_TEXT_ENV = (os.getenv("BUTTON_TEXT") or "").strip()
+
 KEYWORDS_PRIMARY = ["golden_shopping_keywords.csv", "keywords_shopping.csv", "keywords.csv"]
 PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv"
 USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.2"
 
-# requests 공통 헤더
 REQ_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
 # ===== TIME =====
@@ -198,16 +200,13 @@ def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int
         )
         return (r.choices[0].message.content or "").strip()
     except BadRequestError as e:
-        # Chat 미지원/파라미터 오류 → Responses 사용
         kwargs = dict(model=model, input=f"[시스템]\n{system}\n\n[사용자]\n{user}", max_output_tokens=max_tokens)
         try:
             rr = _client.responses.create(**kwargs, temperature=temperature)
         except BadRequestError as e2:
-            # 일부 모델은 temperature 자체를 지원하지 않음 → 제거 후 재시도
             if "temperature" in str(e2):
                 rr = _client.responses.create(**kwargs)
             else:
-                # 일부 모델은 Chat/Responses 모두 거부 → 안전 모델로 재시도
                 r2 = _client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[{"role":"system","content":system},{"role":"user","content":user}],
@@ -215,7 +214,6 @@ def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int
                     max_tokens=max_tokens,
                 )
                 return (r2.choices[0].message.content or "").strip()
-        # output_text helper 또는 수동 추출
         txt = getattr(rr, "output_text", None)
         if isinstance(txt, str) and txt.strip():
             return txt.strip()
@@ -260,11 +258,65 @@ def _css_block() -> str:
 .post-affil h3{margin:22px 0 10px;font-size:1.15rem;color:#0f172a}
 .post-affil ul{padding-left:22px;margin:10px 0}
 .post-affil li{margin:6px 0}
-.post-affil .cta{text-align:center;margin:24px 0}
-.post-affil .cta a{display:inline-block;padding:10px 18px;border:1px solid #94a3b8;border-radius:10px;text-decoration:none}
+.post-affil .cta{ text-align:center;margin:24px 0 }
+.post-affil .btn-cta{
+  display:inline-flex;align-items:center;gap:8px;justify-content:center;
+  padding:14px 22px;border-radius:999px;font-weight:800;text-decoration:none;
+  background: linear-gradient(135deg,#ff6a00,#ee0979); color:#fff;
+  box-shadow:0 6px 16px rgba(238,9,121,.35); transition:.12s ease;
+}
+.post-affil .btn-cta:hover{ transform:translateY(-1px); box-shadow:0 10px 22px rgba(238,9,121,.45); filter:brightness(1.05) }
+.post-affil .btn-ghost{
+  display:inline-flex;align-items:center;gap:8px;justify-content:center;
+  padding:12px 20px;border-radius:999px;font-weight:700;text-decoration:none;
+  background:#fff;color:#0f172a;border:1px solid #d1d5db; box-shadow:0 2px 6px rgba(2,6,23,.06);
+}
 .post-affil .disc{color:#a21caf;font-size:.92rem;margin:10px 0 18px}
+@media (max-width:640px){
+  .post-affil .btn-cta, .post-affil .btn-ghost{ width:100% }
+}
 </style>
 """
+
+def _cta_text() -> str:
+    if BUTTON_TEXT_ENV:
+        return BUTTON_TEXT_ENV
+    choices = [
+        "쿠팡에서 최저가 확인하기",
+        "지금 혜택/상세 스펙 보기",
+        "실사용 후기와 옵션 보기",
+        "빠른 배송 가능한 상품 보기",
+    ]
+    return random.choice(choices)
+
+def _cta_html(link: str, primary: bool = True) -> str:
+    label = html.escape(_cta_text())
+    cls = "btn-cta" if primary else "btn-ghost"
+    return f'<a class="{cls}" href="{html.escape(link)}" target="_blank" rel="sponsored noopener">{label}</a>'
+
+def _inject_mid_cta(body_html: str, cta_html: str) -> str:
+    """
+    본문 두 번째 </p> 뒤에 CTA 삽입. 실패 시 첫 <h3> 앞 또는 맨 앞에 삽입.
+    """
+    # 두 번째 </p>
+    idx = -1
+    count = 0
+    for m in re.finditer(r"</p>", body_html, flags=re.I):
+        count += 1
+        if count == 2:
+            idx = m.end()
+            break
+    if idx != -1:
+        return body_html[:idx] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[idx:]
+
+    # 첫 <h3> 앞
+    m2 = re.search(r"<h3[^>]*>", body_html, flags=re.I)
+    if m2:
+        pos = m2.start()
+        return body_html[:pos] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[pos:]
+
+    # 맨 앞
+    return f'<div class="cta">{cta_html}</div>\n' + body_html
 
 def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
     sys_p = "너는 사람스러운 한국어 블로거다. 광고처럼 보이지 않게 직접 써본 것처럼 쓴다."
@@ -284,12 +336,21 @@ def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str 
     )
     body = _ask_chat_then_responses(MODEL_BODY, sys_p, usr, max_tokens=1100, temperature=0.85)
     body = _strip_fences(body or "")
+    final_link = deeplink or search_url or _coupang_search_url(kw)
+
+    # CSS + 상단 디스클로저
     parts = [_css_block(), '<div class="post-affil">', f'<p class="disc">{html.escape(DISCLOSURE_TEXT)}</p>']
+
+    # 히어로 이미지
     if img_url:
         parts.append(f'<p><img src="{html.escape(img_url)}" alt="{html.escape(kw)}" loading="lazy"></p>')
-    parts.append(body)
-    final_link = deeplink or search_url or _coupang_search_url(kw)
-    parts.append(f'<p class="cta"><a href="{html.escape(final_link)}" target="_blank" rel="sponsored noopener">쿠팡 최저가 바로가기</a></p>')
+
+    # 본문 중간 CTA(ghost)
+    mid = _inject_mid_cta(body, _cta_html(final_link, primary=False))
+    parts.append(mid)
+
+    # 맨 끝 CTA(gradient primary)
+    parts.append(f'<div class="cta">{_cta_html(final_link, primary=True)}</div>')
     parts.append("</div>")
     return "\n".join(parts)
 
