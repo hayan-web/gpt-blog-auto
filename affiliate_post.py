@@ -2,7 +2,7 @@
 """
 affiliate_post.py — 쿠팡글 1건 예약(기본 13:00 KST)
 - 키워드: golden_shopping_keywords.csv -> keywords_shopping.csv -> keywords.csv -> 계절 폴백
-- 본문: 사람스러운 1인칭 리뷰형(1200~1300자)
+- 본문: 사람스러운 1인칭 리뷰형(1200~1300자) + 인라인 CSS
 - 태그: 키워드 1개만(쿠팡/파트너스/최저가/할인 금지)
 - 딥링크: 키 있으면 API 변환, 없으면 검색 URL 폴백
 """
@@ -15,8 +15,7 @@ import requests
 from dotenv import load_dotenv
 load_dotenv()
 
-from openai import OpenAI
-from openai import BadRequestError
+from openai import OpenAI, BadRequestError
 
 # ===== ENV =====
 WP_URL = (os.getenv("WP_URL") or "").strip().rstrip("/")
@@ -43,7 +42,7 @@ FORCE_SINGLE_TAG = True
 
 KEYWORDS_PRIMARY = ["golden_shopping_keywords.csv", "keywords_shopping.csv", "keywords.csv"]
 PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv"
-USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.1"
+USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.2"
 
 # ===== TIME =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
@@ -62,7 +61,7 @@ def _read_col_csv(path: str) -> List[str]:
         rd = csv.reader(f)
         for i, row in enumerate(rd):
             if not row: continue
-            if i == 0 and (row[0].lower() in ("keyword", "title")):  # 헤더 스킵
+            if i == 0 and (row[0].lower() in ("keyword", "title")):
                 continue
             if row[0].strip(): out.append(row[0].strip())
     return out
@@ -185,7 +184,6 @@ MODEL_BODY  = OPENAI_MODEL_LONG or OPENAI_MODEL or "gpt-4o-mini"
 
 def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int, temperature: float) -> str:
     try:
-        # Chat Completions (대부분 모델)
         r = _client.chat.completions.create(
             model=model,
             messages=[{"role":"system","content":system},{"role":"user","content":user}],
@@ -194,7 +192,6 @@ def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int
         )
         return (r.choices[0].message.content or "").strip()
     except BadRequestError as e:
-        # gpt-4.1 / o4 계열 등 -> Responses API로 자동 폴백
         if "max_tokens" in str(e) or "unsupported_parameter" in str(e):
             rr = _client.responses.create(
                 model=model,
@@ -202,12 +199,10 @@ def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int
                 max_output_tokens=max_tokens,
                 temperature=temperature,
             )
-            # output_text: SDK helper
             try:
                 return rr.output_text.strip()
             except Exception:
-                # 일반적인 extraction
-                if rr.output and len(rr.output)>0 and rr.output[0].content:
+                if getattr(rr, "output", None) and rr.output and rr.output[0].content:
                     return rr.output[0].content[0].text.strip()
                 return ""
         raise
@@ -238,6 +233,20 @@ def _hook_title(product_kw: str) -> str:
 def _strip_fences(s: str) -> str:
     s = re.sub(r"```(?:\w+)?", "", s).replace("```",""); return s.strip()
 
+def _css_block() -> str:
+    return """
+<style>
+.post-affil p{line-height:1.84;margin:0 0 14px;color:#222}
+.post-affil h2{margin:28px 0 12px;font-size:1.45rem;line-height:1.35;border-left:6px solid #3b82f6;padding-left:10px}
+.post-affil h3{margin:22px 0 10px;font-size:1.15rem;color:#0f172a}
+.post-affil ul{padding-left:22px;margin:10px 0}
+.post-affil li{margin:6px 0}
+.post-affil .cta{text-align:center;margin:24px 0}
+.post-affil .cta a{display:inline-block;padding:10px 18px;border:1px solid #94a3b8;border-radius:10px;text-decoration:none}
+.post-affil .disc{color:#a21caf;font-size:.92rem;margin:10px 0 18px}
+</style>
+"""
+
 def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
     sys_p = "너는 사람스러운 한국어 블로거다. 광고처럼 보이지 않게 직접 써본 것처럼 쓴다."
     usr = (
@@ -256,12 +265,13 @@ def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str 
     )
     body = _ask_chat_then_responses(MODEL_BODY, sys_p, usr, max_tokens=1100, temperature=0.85)
     body = _strip_fences(body or "")
-    parts = [f'<p style="color:#b23;">{html.escape(DISCLOSURE_TEXT)}</p>']
+    parts = [_css_block(), '<div class="post-affil">', f'<p class="disc">{html.escape(DISCLOSURE_TEXT)}</p>']
     if img_url:
         parts.append(f'<p><img src="{html.escape(img_url)}" alt="{html.escape(kw)}" loading="lazy"></p>')
     parts.append(body)
     final_link = deeplink or search_url or _coupang_search_url(kw)
-    parts.append(f'<p style="text-align:center;"><a href="{html.escape(final_link)}" target="_blank" rel="sponsored noopener">쿠팡 최저가 바로가기</a></p>')
+    parts.append(f'<p class="cta"><a href="{html.escape(final_link)}" target="_blank" rel="sponsored noopener">쿠팡 최저가 바로가기</a></p>')
+    parts.append("</div>")
     return "\n".join(parts)
 
 # ===== MAIN =====

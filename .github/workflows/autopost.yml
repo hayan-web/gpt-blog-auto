@@ -68,7 +68,7 @@ jobs:
           KEYWORDS_K=10
           BAN_KEYWORDS=${{ secrets.BAN_KEYWORDS }}
           BACKUP_OLD_KEYWORDS=true
-          USER_AGENT=gpt-blog-keywords/1.1
+          USER_AGENT=gpt-blog-keywords/1.2
           # ===== Cache / Logs =====
           USAGE_DIR=.usage
           CACHE_DIR=.cache
@@ -98,20 +98,51 @@ jobs:
       - name: Update keywords (일반+쇼핑, 자동검수, 병렬)
         run: |
           if [ -f update_keywords.py ]; then
-            python update_keywords.py --k 10 --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8
+            python update_keywords.py --k 10 --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8 || true
           else
             echo "SKIP: update_keywords.py not found"
           fi
 
-      # (NEW) 수집된 키워드 헤드 확인 — 빈 경우 바로 진단 가능
+      # 0.1) 키워드 안전 폴백(수집 실패 시라도 비어있지 않도록 보장)
+      - name: Ensure non-empty keyword files (safety fallback)
+        run: |
+          python - << 'PY'
+          import os,random,datetime
+          def write_once(path, lines, header=None, col=False):
+              if os.path.exists(path):
+                  txt=open(path,'r',encoding='utf-8',errors='ignore').read().strip()
+                  if txt: return
+              os.makedirs(os.path.dirname(path), exist_ok=True) if '/' in path else None
+              if col:
+                  with open(path,'w',encoding='utf-8') as f:
+                      if header: f.write(header+"\n")
+                      for x in lines: f.write(x+"\n")
+              else:
+                  with open(path,'w',encoding='utf-8') as f:
+                      f.write(",".join(lines)+"\n")
+          m=datetime.date.today().month
+          summer=["무더위 꿀팁","열대야 이기는 법","시원한 집중 루틴","여름 건강 수분전략",
+                  "땀과 컨디션 관리","여름 밤 숙면 체크","햇빛과 멜라토닌","체온과 생산성"]
+          winter=["따뜻한 생산성 루틴","한파 컨디션 유지","면역과 수면 리듬","겨울 운동의 핵심",
+                  "차가운 손발 순환","비타민D와 기분","보온과 호흡","겨울 우울 탈출"]
+          general = summer if m in (6,7,8,9) else winter
+          shopping = ["넥쿨러","휴대용 선풍기","아이스 넥밴드","쿨링 타월","공기청정기","무선 청소기","가습기","전기요"]
+          random.shuffle(general); random.shuffle(shopping)
+          write_once("keywords_general.csv", general[:10], header="keyword", col=True)
+          write_once("golden_keywords.csv", general[:5], header="keyword", col=True)
+          write_once("keywords_shopping.csv", shopping[:12], header="keyword", col=True)
+          write_once("golden_shopping_keywords.csv", shopping[:5], header="keyword", col=True)
+          if not os.path.exists("keywords.csv"):
+              write_once("keywords.csv", general[:10])
+          PY
+
+      # 디버그: 키워드 파일 헤드 출력
       - name: Show keyword heads (debug)
         run: |
-          echo "== golden_shopping_keywords.csv (head) =="
-          head -n 5 golden_shopping_keywords.csv || true
-          echo "== keywords_shopping.csv (head) =="
-          head -n 5 keywords_shopping.csv || true
-          echo "== keywords.csv (line) =="
-          if [ -f keywords.csv ]; then head -n 1 keywords.csv; fi
+          echo "== golden_shopping_keywords.csv (head) =="; head -n 5 golden_shopping_keywords.csv || true
+          echo "== keywords_shopping.csv (head) =="; head -n 5 keywords_shopping.csv || true
+          echo "== keywords_general.csv (head) =="; head -n 5 keywords_general.csv || true
+          echo "== keywords.csv (line) =="; if [ -f keywords.csv ]; then head -n 1 keywords.csv; fi
 
       # 1) (선택) 쿠팡 씨앗 빌드 — 키 없으면 다음 단계에서 폴백 처리
       - name: Build products_seed (from Coupang API)
@@ -132,7 +163,7 @@ jobs:
             echo "SKIP: seed_quality_check.py not found"
           fi
 
-      # 3) 일상글 2건 예약 (10:00 / 17:00 KST) — auto_wp_gpt.py가 keywords_general.csv 우선 사용
+      # 3) 일상글 2건 예약 (10:00 / 17:00 KST)
       - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -141,7 +172,7 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전 (실패해도 워크플로 지속)
+      # 4) 쿠팡글 1건 예약 (13:00 KST) + 키워드 회전
       - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail
@@ -150,15 +181,11 @@ jobs:
           else
             echo "SKIP: affiliate_post.py not found" | tee /tmp/affiliate_out.txt
           fi
-
           echo "---- Affiliate step tail ----"
           tail -n 120 /tmp/affiliate_out.txt || true
-
           if grep -q '"post_id"' /tmp/affiliate_out.txt; then
             echo "[OK] affiliate post created/scheduled. Rotating keywords..."
-            if [ -f rotate_keywords.py ]; then
-              python rotate_keywords.py
-            fi
+            if [ -f rotate_keywords.py ]; then python rotate_keywords.py; fi
           else
             echo "[INFO] Affiliate post not created. See [AFFILIATE] lines above for reason."
           fi

@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
-- 키워드: keywords_general.csv 우선 사용. 없으면 keywords.csv에서 '쇼핑스멜' 강력 차단 후 사용
+- 키워드: keywords_general.csv 우선. 없으면 keywords.csv에서 '쇼핑스멜' 강력 차단 후 사용
 - 제목: 후킹형(브리핑/정리/알아보기/해야할 것 금지, 14~26자)
-- 본문: 예시 글 스타일(정의/배경/메커니즘/연구/사례/적용/정리), 간단 표/불릿 포함
+- 본문: 정보형 칼럼 스타일 + 인라인 CSS(표/불릿 포함)
 - 톤: 사람스러운 정보형(광고/구매/할인/최저가/쿠팡 등 쇼핑 표현 금지)
 - 태그: 키워드 1개만
 """
-
-import os, re, json, sys, random
+import os, re, json, sys
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List
@@ -16,8 +15,7 @@ import requests
 from dotenv import load_dotenv
 load_dotenv()
 
-# OpenAI 1.x
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 _oai = OpenAI()
 
 # ===== ENV =====
@@ -49,7 +47,7 @@ SHOPPING_WORDS = set("""
 def is_shopping_like(kw: str) -> bool:
     k = kw or ""
     if any(w in k for w in SHOPPING_WORDS): return True
-    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}", k): return True   # 모델/형번
+    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}", k): return True
     if re.search(r"(구매|판매|가격|최저가|할인|특가|딜|프로모션|쿠폰|배송)", k): return True
     return False
 
@@ -68,7 +66,7 @@ def _ensure_category(name:str)->int:
     r.raise_for_status()
     return int(r.json()["id"])
 
-def _ensure_tag(tag:str)->int:
+def _ensure_tag(tag:str)->int|None:
     t = (tag or "").strip()
     if not t: return None
     r = requests.get(f"{WP_URL}/wp-json/wp/v2/tags",
@@ -108,22 +106,44 @@ def _read_line(path:str)->List[str]:
     return arr
 
 def pick_daily_keywords(n:int=2)->List[str]:
-    # 1) 일반 전용 라인 최우선
     arr = _read_line("keywords_general.csv")
-    # 2) 없으면 keywords.csv에서 쇼핑스멜 제거 후 사용
     if not arr:
         base = _read_line("keywords.csv")
         arr = [k for k in base if not is_shopping_like(k)]
-    # 3) 그래도 부족하면 안전한 기본
     if len(arr) < n:
         arr += ["오늘의 작은 통찰", "생각이 자라는 순간", "일상을 바꾸는 관찰"]
-    # 중복 제거 후 상위 n
     seen=set(); out=[]
     for k in arr:
         if k not in seen and not is_shopping_like(k):
             seen.add(k); out.append(k)
         if len(out)>=n: break
     return out[:n]
+
+# ===== OpenAI helper (Chat→Responses 폴백) =====
+def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int, temperature: float) -> str:
+    try:
+        r = _oai.chat.completions.create(
+            model=model,
+            messages=[{"role":"system","content":system},{"role":"user","content":user}],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return (r.choices[0].message.content or "").strip()
+    except BadRequestError as e:
+        if "max_tokens" in str(e) or "unsupported_parameter" in str(e):
+            rr = _oai.responses.create(
+                model=model,
+                input=f"[시스템]\n{system}\n\n[사용자]\n{user}",
+                max_output_tokens=max_tokens,
+                temperature=temperature,
+            )
+            try:
+                return rr.output_text.strip()
+            except Exception:
+                if getattr(rr, "output", None) and rr.output and rr.output[0].content:
+                    return rr.output[0].content[0].text.strip()
+                return ""
+        raise
 
 # ===== TITLE / BODY =====
 BANNED_TITLE_PATTERNS = ["브리핑","정리","알아보기","대해 알아보기","에 대해 알아보기","해야 할 것","해야할 것","해야할것"]
@@ -144,25 +164,30 @@ def hook_title(kw:str)->str:
 - '리뷰/가이드/사용기' 표지어 지양
 - 출력은 제목 1줄"""
     for _ in range(3):
-        rsp = _oai.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
-            temperature=0.9, max_tokens=60,
-        )
-        t = (rsp.choices[0].message.content or "").strip().replace("\n"," ")
+        t = _ask_chat_then_responses(OPENAI_MODEL, sys_p, usr, max_tokens=60, temperature=0.9)
+        t = (t or "").strip().replace("\n"," ")
         if not _bad_title(t): return t
     return f"{kw}, 오늘 시야가 넓어지는 순간"
 
 def strip_code_fences(s: str) -> str:
-    s = re.sub(r"```(?:\w+)?", "", s)
-    s = s.replace("```", "")
-    s = s.strip().strip("“”\"'")
+    s = re.sub(r"```(?:\w+)?", "", s).replace("```", "").strip().strip("“”\"'")
     return s
 
+def _css_block()->str:
+    return """
+<style>
+.post-info p{line-height:1.86;margin:0 0 14px;color:#222}
+.post-info h2{margin:28px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
+.post-info h3{margin:22px 0 10px;font-size:1.12rem;color:#0f172a}
+.post-info ul{padding-left:22px;margin:10px 0}
+.post-info li{margin:6px 0}
+.post-info table{border-collapse:collapse;width:100%;margin:16px 0}
+.post-info thead th{background:#f1f5f9}
+.post-info th,.post-info td{border:1px solid #e2e8f0;padding:8px 10px;text-align:left}
+</style>
+"""
+
 def gen_body_info(kw:str)->str:
-    """
-    예시 글처럼 정보 구조화. 쇼핑 표현 금지, 1000~1300자 목표.
-    """
     sys_p = "너는 사람스러운 한국어 칼럼니스트다. 광고/구매 표현 없이 지식형 글을 쓴다."
     usr = f"""주제: {kw}
 스타일: 정의 → 배경/원리 → 실제 영향/사례 → 관련 연구/수치(개념적) → 비교/표 1개 → 적용 팁 → 정리
@@ -175,13 +200,8 @@ def gen_body_info(kw:str)->str:
 - 'AI/작성' 같은 메타표현 금지
 - 분량: 1000~1300자 (한국어 기준)
 - 출력: 순수 HTML만(<p>, <h2>, <h3>, <ul>, <li>, <table>, <thead>, <tbody>, <tr>, <th>, <td>)"""
-    rsp = _oai.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
-        temperature=0.8, max_tokens=950,
-    )
-    body = (rsp.choices[0].message.content or "").strip()
-    return strip_code_fences(body)
+    body = _ask_chat_then_responses(OPENAI_MODEL, sys_p, usr, max_tokens=950, temperature=0.8)
+    return _css_block() + '\n<div class="post-info">\n' + strip_code_fences(body) + "\n</div>"
 
 # ===== RUNNERS =====
 def run_two_posts():
