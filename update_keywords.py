@@ -1,47 +1,50 @@
 # -*- coding: utf-8 -*-
 """
-update_keywords.py — 선별형 키워드 파이프라인 (일상/쇼핑 분리, 자동검수, 병렬)
+update_keywords.py
+- 뉴스/검색 API를 활용해 '일상용'과 '쇼핑용' 키워드를 분리 수집하고 자동 검수/정제하여 저장
+- 출력 파일:
+    1) keywords.csv                  : 일상용 최종 1줄(K개, 기본 10개)  ← auto_wp_gpt.py에서 사용
+    2) keywords_general.csv          : 일상용 후보 라인(K개)
+    3) keywords_shopping.csv         : 쇼핑용 후보 라인(shop_k개)
+    4) golden_keywords.csv           : 일상 황금 키워드(gold개, header=keyword)
+    5) golden_shopping_keywords.csv  : 쇼핑 황금 키워드(shop_gold개, header=keyword)
 
-출력 파일:
-  # 일반(일상글용)
-  - keywords.csv                  ← 첫 줄에 오늘의 10개(기존 호환)
-  - keywords_general.csv          ← 전체 상위 k(한 줄)
-  - golden_keywords.csv           ← 황금키워드 g개 (keyword,score)
-  - candidates_general.csv        ← 후보 상세 (keyword,score,freq,volume,commerce_score)
-  - review_general.csv            ← 검수표(approve 컬럼 포함)
+- 호출 예:
+    python update_keywords.py --k 10 --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8
 
-  # 쇼핑(쿠팡글용)
-  - shopping_keywords.csv         ← 쇼핑용 상위 k(한 줄)
-  - golden_shopping_keywords.csv  ← 쇼핑 황금키워드 g개 (keyword,score)
-  - candidates_shopping.csv       ← 후보 상세
-  - review_shopping.csv           ← 검수표(approve 컬럼 포함)
-
-사용:
-  python update_keywords.py --k 10 --gold 3 --shop-k 12 --shop-gold 3 --review auto --parallel 8
-
-ENV(.env):
-  NEWSAPI_KEY(선택), NAVER_CLIENT_ID/SECRET(선택), USER_AGENT,
-  KEYWORDS_K, BAN_KEYWORDS (쉼표구분)
+- 환경변수(.env):
+    NEWSAPI_KEY
+    NAVER_CLIENT_ID, NAVER_CLIENT_SECRET  (없어도 동작)
+    KEYWORDS_K=10
+    BAN_KEYWORDS="금칙어1,금칙어2,..."     (옵션)
+    USER_AGENT="gpt-blog-keywords/1.1"    (옵션)
 """
 
-import os, re, csv, json, time
+import os
+import re
+import csv
+import json
+import time
 import math
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
-from collections import Counter
+import argparse
+import random
+import string
+import logging
+from typing import List, Dict, Tuple
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
 # ---------- ENV ----------
+USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-keywords/1.1"
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY") or ""
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID") or ""
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET") or ""
-USER_AGENT = os.getenv("USER_AGENT") or "keywords-bot/1.1"
-OUT_TOPK = int(os.getenv("KEYWORDS_K") or "10")
-BAN_KEYWORDS_ENV = [t.strip() for t in (os.getenv("BAN_KEYWORDS") or "").split(",") if t.strip()]
+DEFAULT_K = int(os.getenv("KEYWORDS_K") or "10")
 
+# 금칙어(ENV) + 기본 금칙어를 합집합으로 구성 (이전 TypeError 원인 수정!)
+BAN_KEYWORDS_ENV = [t.strip() for t in (os.getenv("BAN_KEYWORDS") or "").split(",") if t.strip()]
 DEFAULT_BANS_EXTRA = [
     x.strip() for x in """
 사망,사고,화재,폭행,성폭력,성범죄,강간,혐의,검찰,기소,징역,피해자,피습,테러,총격,전쟁,참사,
@@ -51,317 +54,292 @@ DEFAULT_BANS_EXTRA = [
 ]
 DEFAULT_BANS = set(BAN_KEYWORDS_ENV) | set(DEFAULT_BANS_EXTRA)
 
-HEADERS = {"User-Agent": USER_AGENT}
-SESSION = requests.Session()
+# 쇼핑 감지 단어/휴리스틱
+SHOPPING_WORDS = set("""
+추천 리뷰 후기 가격 최저가 세일 특가 쇼핑 쿠폰 할인 핫딜 핫딜템 언박싱 스펙 사용법 베스트
+가전 노트북 스마트폰 냉장고 세탁기 건조기 에어컨 공기청정기 이어폰 헤드폰 카메라 렌즈 TV 모니터 키보드 마우스 의자 책상 침대 매트리스
+에어프라이어 로봇청소기 무선청소기 가습기 제습기 식기세척기 빔프로젝터 유모차 카시트 분유 기저귀 골프 캠핑 텐트 배터리 보조배터리
+가방 지갑 신발 후드 점퍼 패딩 스니커즈 러닝화 선크림 헤어드라이어 면도기 전동칫솔 워치 태블릿 케이스 케이블 충전기 허브 SSD HDD
+""".split())
 
-# ---------- 유틸 ----------
-def _norm(s: str) -> str:
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = s.replace("&quot;", " ").replace("&amp;","&").replace("&nbsp;"," ")
-    s = re.sub(r"[“”\"\'‘’·•…—–\-\–\—\_~`:+=<>|/\\\\]", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+GENERAL_TITLE_BANS = set(["브리핑", "정리", "알아보기", "대해 알아보기", "해야 할 것", "해야할 것", "해야할것"])
 
-def _is_hangul_token(tok: str) -> bool:
-    if not (2 <= len(tok) <= 15): return False
-    if re.search(r"[^\w가-힣]", tok): return False
-    if re.fullmatch(r"\d+", tok): return False
-    return True
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+}
 
-def _bad_phrase(s: str) -> bool:
-    if any(b in s for b in DEFAULT_BANS): return True
-    if re.search(r"\b\d{1,2}\s*월\b", s): return True
-    return not (2 <= len(s) <= 30)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+log = logging.getLogger("kw")
 
-def _z(x, mean, std): return 0 if std == 0 else (x - mean) / std
-def _uniq(s: str) -> str: return re.sub(r"\s+", "", s)
 
-# ---------- 원천 수집 (병렬) ----------
-def _fetch_news_page(params: Dict) -> List[str]:
+# ---------- HTTP ----------
+def http_get_json(url: str, params: dict = None, headers: dict = None, timeout: int = 10):
+    h = dict(HEADERS)
+    if headers:
+        h.update(headers)
     try:
-        r = SESSION.get("https://newsapi.org/v2/everything",
-                        params=params, headers={"X-Api-Key": NEWSAPI_KEY, **HEADERS}, timeout=12)
-        if r.status_code != 200: return []
-        arts = (r.json() or {}).get("articles") or []
-        out = []
-        for a in arts:
-            t = _norm((a.get("title") or "") + " " + (a.get("description") or ""))
-            if t: out.append(t)
-        return out
+        r = requests.get(url, params=params or {}, headers=h, timeout=timeout)
+        if r.status_code != 200:
+            return None
+        return r.json()
     except Exception:
+        return None
+
+
+# ---------- Fetchers ----------
+def fetch_newsapi_top(days: int = 3, page_size: int = 100) -> List[Dict]:
+    """NewsAPI top-headlines + everything 조합 (ko/kr). 키 없으면 빈 리스트."""
+    if not NEWSAPI_KEY:
         return []
+    out = []
+    # top-headlines
+    url_th = "https://newsapi.org/v2/top-headlines"
+    for country in ["kr"]:
+        data = http_get_json(url_th, params={"country": country, "pageSize": page_size, "apiKey": NEWSAPI_KEY})
+        if data and data.get("status") == "ok":
+            for a in data.get("articles", []):
+                out.append({"title": a.get("title") or "", "desc": a.get("description") or ""})
+    # everything 최근 N일
+    url_all = "https://newsapi.org/v2/everything"
+    q_list = ["한국", "이슈", "핫", "업데이트", "리뷰", "추천"]
+    for q in q_list:
+        data = http_get_json(url_all, params={
+            "q": q,
+            "language": "ko",
+            "sortBy": "publishedAt",
+            "pageSize": 50,
+            "apiKey": NEWSAPI_KEY,
+        })
+        if data and data.get("status") == "ok":
+            for a in data.get("articles", []):
+                out.append({"title": a.get("title") or "", "desc": a.get("description") or ""})
+        time.sleep(0.2)
+    return out
 
-def fetch_news_candidates(days:int=3, limit:int=300, parallel:int=6) -> List[str]:
-    if not NEWSAPI_KEY: return []
-    to = datetime.utcnow()
-    frm = to - timedelta(days=days)
-    base = dict(language="ko",
-                from_=frm.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                to=to.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                sortBy="publishedAt",
-                pageSize=100,
-                q="*")
-    pages = [1,2,3]
-    jobs = []
-    out: List[str] = []
-    with ThreadPoolExecutor(max_workers=parallel) as ex:
-        for p in pages:
-            params = dict(base); params["page"] = p
-            # requests는 'from' 예약어 이슈 → alias from_ 사용, 실제 전송 키 조정
-            params["from"] = params.pop("from_")
-            jobs.append(ex.submit(_fetch_news_page, params))
-        for fut in as_completed(jobs):
-            out.extend(fut.result())
-    return out[:limit]
 
-# ---------- NAVER 데이터랩 (병렬 배치) ----------
-def naver_datalab_volumes(keywords: List[str], days:int=30, parallel:int=6) -> Dict[str, float]:
-    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET): return {}
-    end = datetime.now().date()
-    start = end - timedelta(days=days)
+def fetch_naver_news_sample() -> List[Dict]:
+    """NAVER 검색 API(뉴스)를 가볍게 조회하여 타이틀 수집. 키 없으면 빈 리스트."""
+    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET):
+        return []
     headers = {
         "X-Naver-Client-Id": NAVER_CLIENT_ID,
         "X-Naver-Client-Secret": NAVER_CLIENT_SECRET,
-        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": USER_AGENT,
     }
-    url = "https://openapi.naver.com/v1/datalab/search"
-
-    def _batch(req_group: List[str]) -> Dict[str, float]:
-        payload = {
-            "startDate": start.strftime("%Y-%m-%d"),
-            "endDate": end.strftime("%Y-%m-%d"),
-            "timeUnit": "date",
-            "keywordGroups": [{"groupName": kw, "keywords": [kw]} for kw in req_group]
-        }
-        try:
-            r = SESSION.post(url, headers=headers, data=json.dumps(payload), timeout=12)
-            if r.status_code != 200: return {}
-            js = r.json()
-            res = {}
-            for item in js.get("results", []):
-                kw = item.get("title")
-                ratio = sum(p.get("ratio", 0.0) for p in item.get("data", []))
-                res[kw] = float(ratio)
-            return res
-        except Exception:
-            return {}
-
-    out: Dict[str, float] = {}
-    batch = 5
-    with ThreadPoolExecutor(max_workers=parallel) as ex:
-        futs = []
-        for i in range(0, len(keywords), batch):
-            futs.append(ex.submit(_batch, keywords[i:i+batch]))
-        for fut in as_completed(futs):
-            out.update(fut.result())
+    base = "https://openapi.naver.com/v1/search/news.json"
+    out = []
+    for q in ["이슈", "핫", "주목", "리뷰", "추천"]:
+        data = http_get_json(base, params={"query": q, "display": 30, "sort": "sim"}, headers=headers)
+        if not data:
+            continue
+        for item in data.get("items", []):
+            out.append({"title": item.get("title") or "", "desc": item.get("description") or ""})
+        time.sleep(0.15)
     return out
 
-# ---------- 후보 생성 ----------
-def extract_candidates(lines: List[str]) -> Counter:
-    tok_cnt = Counter(); phrase_cnt = Counter()
-    stop = set("그리고 그러나 하지만 또한 대한 등에 관련 발표 계획 추진 검토 이번 최대 최소 올해 내년 위해 위한 대해서".split())
-    for line in lines:
-        clean = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", line)
-        toks = [t for t in clean.split() if _is_hangul_token(t) and t not in stop]
-        for t in toks: tok_cnt[t] += 1
-        for n in (2,3):
-            for i in range(len(toks)-n+1):
-                ph = " ".join(toks[i:i+n])
-                if _bad_phrase(ph): continue
-                phrase_cnt[ph] += 1
-    cand = Counter(); cand.update(tok_cnt); cand.update(phrase_cnt)
+
+# ---------- Text utils ----------
+RE_HTML_TAG = re.compile(r"<[^>]+>")
+RE_BRACKETS = re.compile(r"[\[\(【\(].*?[\]\)】\)]")
+RE_SPACES = re.compile(r"\s+")
+
+def clean_title(s: str) -> str:
+    s = s or ""
+    s = RE_HTML_TAG.sub("", s)
+    s = s.replace("&quot;", "\"").replace("&apos;", "'").replace("&amp;", "&")
+    s = RE_BRACKETS.sub(" ", s)
+    s = re.sub(r"[\|\-–—:_/·•]+", " ", s)
+    s = s.replace("…", " ").replace("·", " ").replace("▲", " ").replace("▶", " ")
+    s = s.translate(str.maketrans("", "", string.punctuation))
+    s = RE_SPACES.sub(" ", s).strip()
+    return s
+
+
+def best_segment_from_title(title: str) -> str:
+    """제목을 분리기호로 나누고, 한글/숫자/영문 혼합이 가장 자연스러운 부분을 선택."""
+    title = clean_title(title)
+    if not title:
+        return ""
+    parts = re.split(r"\s{2,}| - | – | — | : | \| ", title)
+    parts = [p.strip() for p in parts if p.strip()]
+    if not parts:
+        parts = [title]
+    # 길이 6~24자 사이를 우선, 그 외에는 가장 긴 파트
+    scored = []
+    for p in parts:
+        L = len(p)
+        score = -abs(L - 16)  # 16자 근접 선호
+        # 의미없는 단어 과다 포함 감점
+        if any(b in p for b in DEFAULT_BANS): score -= 5
+        scored.append((score, p))
+    scored.sort(reverse=True)
+    return scored[0][1][:40]
+
+
+def is_bad_keyword(kw: str) -> bool:
+    if not kw: return True
+    if kw in DEFAULT_BANS: return True
+    if any(b in kw for b in DEFAULT_BANS): return True
+    if len(kw) <= 2: return True
+    if re.fullmatch(r"[가-힣]{1,2}", kw): return True
+    if re.search(r"(사진|영상|보기|클릭|기사|신문|보도|단독|속보)", kw): return True
+    return False
+
+
+def is_shopping_like(kw: str) -> bool:
+    if any(t in kw for t in SHOPPING_WORDS): return True
+    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}", kw): return True  # 모델/형번
+    if re.search(r"(추천|리뷰|최저가|세일|특가|할인|구매|가격)", kw): return True
+    # '제품/기기/가전' 류
+    if re.search(r"(청소기|공기청정기|에어컨|제습기|가습기|전자레인지|인덕션|렌즈|키보드|마우스|모니터|의자|침대|매트리스|가전)", kw):
+        return True
+    return False
+
+
+def info_score(kw: str) -> float:
+    """일상용 점수(정보성/일반성)."""
+    s = 0.0
+    L = len(kw)
+    s += min(L, 22) / 22.0
+    s += 0.4 if re.search(r"[가-힣]{2,}", kw) else 0.0
+    s += -0.9 if is_shopping_like(kw) else 0.0
+    s += -0.6 if any(b in kw for b in GENERAL_TITLE_BANS) else 0.0
+    return s
+
+
+def shop_score(kw: str) -> float:
+    """쇼핑용 점수(상품성/구매연관)."""
+    s = 0.0
+    L = len(kw)
+    s += 0.8 if is_shopping_like(kw) else 0.0
+    s += min(L, 18) / 18.0
+    return s
+
+
+def uniq_order(seq: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for s in seq:
+        if not s or s in seen: continue
+        seen.add(s); out.append(s)
+    return out
+
+
+# ---------- Pipeline ----------
+def collect_candidates(days: int = 3, parallel: int = 6) -> List[str]:
+    """여러 소스에서 제목을 모아 문구 후보를 뽑는다."""
+    tasks = []
+    titles: List[str] = []
+
+    with ThreadPoolExecutor(max_workers=max(2, parallel)) as ex:
+        tasks.append(ex.submit(fetch_newsapi_top, days))
+        tasks.append(ex.submit(fetch_naver_news_sample))
+        for fut in as_completed(tasks):
+            try:
+                data = fut.result() or []
+                for it in data:
+                    t = it.get("title") or ""
+                    d = it.get("desc") or ""
+                    if t: titles.append(t)
+                    if d: titles.append(d)
+            except Exception:
+                pass
+
+    # 타이틀 → 분절 → 후보
+    cand = []
+    for t in titles:
+        seg = best_segment_from_title(t)
+        if seg:
+            cand.append(seg)
     return cand
 
-# ---------- 상업성 점수 ----------
-COMMERCE_TERMS = set("""
-추천 리뷰 후기 가이드 비교 가격 최저가 세일 특가 쇼핑 쿠폰 할인 핫딜 언박싱 구성 스펙 사용법 꿀팁 베스트
-가전 노트북 스마트폰 냉장고 세탁기 에어컨 공기청정기 이어폰 헤드폰 카메라 렌즈 TV 모니터 키보드 마우스 의자 책상 침대 매트리스
-화장품 향수 가방 신발 운동화 골프 캠핑 유모차 카시트 분유 기저귀 로봇청소기 에어프라이어 가습기 식기세척기 빔프로젝터
-""".split())
 
-def commerce_score(kw: str) -> float:
-    toks = set(kw.split())
-    hit = len(toks & COMMERCE_TERMS)
-    if re.search(r"[A-Za-z].*\d|\d.*[A-Za-z]", kw):  # 모델명류
-        hit += 1
-    length_bonus = 0.5 if (1 < len(kw.split()) <= 3) else 0.0
-    return hit + length_bonus
-
-# ---------- 공통 파이프라인 ----------
-def _score_and_rank(candidates: List[Tuple[str,int]], vol_map: Dict[str,float],
-                    w_freq: float, w_vol: float, w_com: float,
-                    drop_if_bad_commerce: bool=False) -> List[Tuple[str,float,Dict]]:
-    if not candidates: return []
-    freqs = [f for _,f in candidates]
-    f_mean = sum(freqs)/len(freqs)
-    f_std  = (sum((x - f_mean)**2 for x in freqs)/max(1,len(freqs)-1))**0.5
-    vols = [vol_map.get(kw,0.0) for kw,_ in candidates]
-    v_mean = sum(vols)/len(vols) if vols else 0.0
-    v_std  = (sum((x - v_mean)**2 for x in vols)/max(1,len(vols)-1))**0.5 if len(vols)>1 else 0.0
-
-    rows = []
-    for kw, freq in candidates:
-        if _bad_phrase(kw): continue
-        fz = _z(freq, f_mean, f_std)
-        v_raw = vol_map.get(kw,0.0)
-        vz = _z(v_raw, v_mean, v_std) if v_std!=0 else (1.0 if v_raw>0 else 0.0)
-        cz = commerce_score(kw)
-        if drop_if_bad_commerce and cz <= 0.5:  # 쇼핑 모드에서 약한 키워드 버림
+def split_general_shopping(cands: List[str]) -> Tuple[List[str], List[str]]:
+    general, shopping = [], []
+    for kw in cands:
+        kw = kw.strip()
+        if is_bad_keyword(kw):
             continue
-        score = w_freq*fz + w_vol*vz + w_com*cz
-        rows.append((kw, score, {"freq":freq, "vscore":v_raw, "cscore":cz}))
-    # 유사어 중복 제거
-    best = {}
-    for kw, sc, meta in sorted(rows, key=lambda x: x[1], reverse=True):
-        k = _uniq(kw)
-        if k not in best: best[k] = (kw, sc, meta)
-    return list(best.values())
+        if is_shopping_like(kw):
+            shopping.append(kw)
+        else:
+            general.append(kw)
+    return uniq_order(general), uniq_order(shopping)
 
-def _write_line_csv(path: str, keywords: List[str]):
+
+def rank_keywords(cands: List[str], score_fn, topn: int) -> List[str]:
+    # 빈도/길이/스코어 혼합
+    freq = Counter(cands)
+    scored = []
+    for kw, f in freq.items():
+        s = score_fn(kw) + min(f, 5) * 0.25
+        scored.append((s, kw))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [kw for _, kw in scored[:topn]]
+
+
+def write_line_csv(path: str, arr: List[str]) -> None:
+    # 쉼표로 이어 한 줄
     with open(path, "w", encoding="utf-8") as f:
-        f.write(",".join(keywords))
+        f.write(",".join(arr))
 
-def _write_candidates(path: str, ranked: List[Tuple[str,float,Dict]]):
-    with open(path,"w",encoding="utf-8",newline="") as f:
-        w=csv.writer(f); w.writerow(["keyword","score","freq","volume","commerce_score"])
-        for kw, sc, meta in ranked:
-            w.writerow([kw, f"{sc:.4f}", meta.get("freq",0), meta.get("vscore",0), meta.get("cscore",0)])
 
-def _write_review(path: str, ranked: List[Tuple[str,float,Dict]], mode:str, top:int,
-                  auto_freq:int=2, auto_cscore:float=1.0, auto_take:int=30):
-    """
-    review CSV: keyword,score,freq,volume,commerce_score,approve
-    - auto: 상위 auto_take 안에서 freq>=auto_freq & cscore>=auto_cscore -> approve=1
-    - manual: approve=0 (사용자가 체크)
-    """
-    rows = []
-    for i,(kw, sc, meta) in enumerate(ranked[:max(top*5, auto_take)]):
-        approve = 1 if (mode=="auto" and meta.get("freq",0)>=auto_freq and meta.get("cscore",0)>=auto_cscore) else 0
-        rows.append([kw, f"{sc:.4f}", meta.get("freq",0), meta.get("vscore",0), meta.get("cscore",0), approve])
-    with open(path,"w",encoding="utf-8",newline="") as f:
-        w=csv.writer(f); w.writerow(["keyword","score","freq","volume","commerce_score","approve"])
-        w.writerows(rows)
+def write_column_csv(path: str, arr: List[str]) -> None:
+    # header=keyword 1열 CSV
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["keyword"])
+        for k in arr:
+            w.writerow([k])
 
-def _read_approved(path:str) -> List[str]:
-    if not os.path.exists(path): return []
-    out=[]
-    with open(path,"r",encoding="utf-8") as f:
-        r=csv.DictReader(f)
-        for row in r:
-            try:
-                if str(row.get("approve","0")).strip() in ("1","true","TRUE","yes","Y"):
-                    out.append((row.get("keyword","").strip(), float(row.get("score","0") or 0)))
-            except Exception:
-                continue
-    out = [kw for kw,_ in sorted(out, key=lambda x: x[1], reverse=True)]
-    return out
-
-# ---------- 메인 ----------
-def pipeline(mode:str, k:int, g:int, days:int, min_volume:float, parallel:int) -> Tuple[List[str], List[Tuple[str,float,Dict]], List[Tuple[str,float]]]:
-    """
-    mode: 'general' or 'shopping'
-    """
-    # 0) 수집
-    lines = fetch_news_candidates(days=days, limit=300, parallel=parallel)
-    cand_cnt = extract_candidates(lines)
-
-    # 1) 초기 후보
-    prelim = []
-    for kw, freq in cand_cnt.most_common(500):
-        if _bad_phrase(kw): continue
-        # 일반: 너무 짧은 단독 토큰 제거
-        if mode=="general" and re.fullmatch(r"[가-힣]{1,2}", kw): continue
-        prelim.append((kw, freq))
-    if not prelim:
-        fallback = ["가전 추천","노트북 추천","스마트폰 추천","카메라 렌즈","무선 이어폰","게이밍 의자","모니터 27인치","에어프라이어","로봇청소기","골프 거리측정기"]
-        ranked = [(w, 1.0, {"freq":1,"vscore":0,"cscore":1}) for w in fallback]
-        tops  = [w for w,_,_ in ranked[:k]]
-        golden= [(tops[0],1.0)]
-        return tops, ranked, golden
-
-    # 2) 보조 지표(검색량)
-    vol_map = naver_datalab_volumes([kw for kw,_ in prelim[:80]], days=max(14, days*5), parallel=parallel)
-
-    # 3) 가중치(모드별)
-    if mode=="general":
-        ranked = _score_and_rank(prelim, vol_map, w_freq=0.5, w_vol=0.3, w_com=0.2, drop_if_bad_commerce=False)
-    else:  # shopping
-        ranked = _score_and_rank(prelim, vol_map, w_freq=0.25, w_vol=0.25, w_com=0.50, drop_if_bad_commerce=True)
-
-    # 4) 탑/골든
-    topk = [kw for kw,_,_ in ranked[:k]]
-    # 골든: 상위 30 내에서 상업성/검색량을 조금 더 본다
-    rg = sorted(ranked[:max(30, g*8)], key=lambda x: (0.35*x[1] + 0.65*(x[2].get("cscore",0) + (1 if x[2].get("vscore",0)>=min_volume else 0))), reverse=True)
-    golden = []
-    for kw, sc, meta in rg:
-        if min_volume>0 and meta.get("vscore",0)<min_volume: continue
-        golden.append((kw, sc))
-        if len(golden)>=g: break
-    if not golden and topk:
-        golden=[(topk[0], 0.0)]
-    return topk, ranked, golden
 
 def main():
-    import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--k", type=int, default=OUT_TOPK, help="일반(top-k)")
-    ap.add_argument("--gold", type=int, default=3, help="일반 황금 개수")
-    ap.add_argument("--shop-k", type=int, default=12, help="쇼핑(top-k)")
-    ap.add_argument("--shop-gold", type=int, default=3, help="쇼핑 황금 개수")
-    ap.add_argument("--days", type=int, default=3)
-    ap.add_argument("--min-volume", type=float, default=0.0)
-    ap.add_argument("--review", choices=["auto","manual","hybrid"], default="auto",
-                    help="auto=자동승인, manual=승인표만 생성, hybrid=승인표의 approve=1 우선, 없으면 자동")
-    ap.add_argument("--parallel", type=int, default=6)
+    ap.add_argument("--k", type=int, default=DEFAULT_K, help="일상 라인 크기 (keywords.csv / keywords_general.csv)")
+    ap.add_argument("--gold", type=int, default=5, help="일상 황금 키워드 개수")
+    ap.add_argument("--shop-k", type=int, default=12, help="쇼핑 라인 크기 (keywords_shopping.csv)")
+    ap.add_argument("--shop-gold", type=int, default=5, help="쇼핑 황금 키워드 개수")
+    ap.add_argument("--days", type=int, default=3, help="최근 N일 가중")
+    ap.add_argument("--parallel", type=int, default=6, help="병렬 요청 수")
+    ap.add_argument("--min-volume", type=int, default=0)  # 호환용 더미 옵션
+    ap.add_argument("--review", default="auto")           # 호환용 더미 옵션
     args = ap.parse_args()
 
-    os.makedirs(".cache", exist_ok=True)
+    # 1) 후보 수집
+    cands = collect_candidates(days=args.days, parallel=args.parallel)
 
-    # GENERAL
-    g_top, g_ranked, g_golden = pipeline("general", args.k, args.gold, args.days, args.min_volume, args.parallel)
-    # REVIEW 처리
-    _write_candidates("candidates_general.csv", g_ranked)
-    _write_review("review_general.csv", g_ranked, "auto" if args.review=="auto" else "manual",
-                  top=args.k, auto_freq=2, auto_cscore=0.8, auto_take=40)
-    approved_g = _read_approved("review_general.csv") if args.review in ("manual","hybrid") else []
-    if args.review=="manual" and approved_g:
-        g_top = approved_g[:args.k]
-        g_golden = [(approved_g[0], 0.0)]
-    elif args.review=="hybrid" and approved_g:
-        g_top = approved_g[:args.k]
-        g_golden = [(approved_g[0], 0.0)]
+    # 2) 일반 vs 쇼핑 분리 + 검수
+    general_cands, shopping_cands = split_general_shopping(cands)
 
-    _write_line_csv("keywords.csv", g_top)
-    _write_line_csv("keywords_general.csv", g_top)
-    with open("golden_keywords.csv","w",encoding="utf-8",newline="") as f:
-        w=csv.writer(f); w.writerow(["keyword","score"])
-        for kw,sc in g_golden: w.writerow([kw, f"{sc:.4f}"])
+    # 3) 랭킹
+    general_top = rank_keywords(general_cands, info_score, max(args.k, 10))
+    shopping_top = rank_keywords(shopping_cands, shop_score, max(args.shop_k, 8))
 
-    print(f"[GENERAL] top{len(g_top)} -> keywords.csv")
-    print(f"[GENERAL] golden={len(g_golden)} -> golden_keywords.csv")
+    # 4) 황금 키워드(열 형태 CSV)
+    golden_general = rank_keywords(general_cands, info_score, args.gold)
+    golden_shopping = rank_keywords(shopping_cands, shop_score, args.shop_gold)
 
-    # SHOPPING
-    s_top, s_ranked, s_golden = pipeline("shopping", args.shop_k, args.shop_gold, args.days, args.min_volume, args.parallel)
-    _write_candidates("candidates_shopping.csv", s_ranked)
-    _write_review("review_shopping.csv", s_ranked, "auto" if args.review=="auto" else "manual",
-                  top=args.shop_k, auto_freq=2, auto_cscore=1.2, auto_take=50)
-    approved_s = _read_approved("review_shopping.csv") if args.review in ("manual","hybrid") else []
-    if args.review=="manual" and approved_s:
-        s_top = approved_s[:args.shop_k]
-        s_golden = [(approved_s[0], 0.0)]
-    elif args.review=="hybrid" and approved_s:
-        s_top = approved_s[:args.shop_k]
-        s_golden = [(approved_s[0], 0.0)]
+    # 5) 파일 저장
+    # 일상(라인) — auto_wp_gpt.py가 읽음
+    write_line_csv("keywords.csv", general_top[:args.k])
+    write_line_csv("keywords_general.csv", general_top[:args.k])
+    # 쇼핑(라인) — 참조용
+    write_line_csv("keywords_shopping.csv", shopping_top[:args.shop_k])
+    # 황금(열)
+    write_column_csv("golden_keywords.csv", golden_general)
+    write_column_csv("golden_shopping_keywords.csv", golden_shopping)
 
-    _write_line_csv("shopping_keywords.csv", s_top)
-    with open("golden_shopping_keywords.csv","w",encoding="utf-8",newline="") as f:
-        w=csv.writer(f); w.writerow(["keyword","score"])
-        for kw,sc in s_golden: w.writerow([kw, f"{sc:.4f}"])
+    # 6) 로그
+    preview_g = " ".join(general_top[:args.k][:10])
+    preview_s = " ".join(shopping_top[:min(10, len(shopping_top))])
+    log.info("[GENERAL] %d collected → %d ranked → write %d", len(general_cands), len(general_top), args.k)
+    log.info("[SHOPPING] %d collected → %d ranked → write %d", len(shopping_cands), len(shopping_top), args.shop_k)
+    print("[OK] wrote ONLY today's {} keywords (file truncated):\n{}".format(args.k, ", ".join(general_top[:args.k][:10])))
+    print("[OK] wrote ONLY today's {} shopping keywords (file truncated):\n{}".format(args.shop_k, ", ".join(shopping_top[:min(10, len(shopping_top))])))
 
-    print(f"[SHOPPING] top{len(s_top)} -> shopping_keywords.csv")
-    print(f"[SHOPPING] golden={len(s_golden)} -> golden_shopping_keywords.csv")
-    print("[SAMPLE: general]", ", ".join(g_top[:10]))
-    print("[SAMPLE: shopping]", ", ".join(s_top[:10]))
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
