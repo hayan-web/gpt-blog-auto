@@ -56,7 +56,7 @@ jobs:
           DEFAULT_TAGS=
           AFFILIATE_CATEGORY=쇼핑
           AFFILIATE_TAGS=
-          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
+          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.
           # ===== Ads =====
           AD_METHOD=${{ secrets.AD_METHOD }}
           AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
@@ -85,18 +85,17 @@ jobs:
           DRY_RUN=
           EOF
 
-      # YAML 파서 안전: run 블록 내부에서만 secrets 참조
-      - name: Preflight: show Coupang secrets status
+      # ✅ Preflight: run 블록에서만 secrets 사용 (YAML 파싱 오류 방지)
+      - name: Preflight (Coupang keys present?)
+        shell: bash
         run: |
-          COUPANG_ACCESS_KEY="${{ secrets.COUPANG_ACCESS_KEY }}"
-          COUPANG_SECRET_KEY="${{ secrets.COUPANG_SECRET_KEY }}"
-          if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
+          if [ -n "${{ secrets.COUPANG_ACCESS_KEY }}" ] && [ -n "${{ secrets.COUPANG_SECRET_KEY }}" ]; then
             echo "[OK] Coupang keys are set."
           else
-            echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY are empty. Affiliate seed will be skipped (fallback will be used)."
+            echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 검색/딥링크는 폴백 사용"
           fi
 
-      # 0) 오늘 키워드 수집/검수/분리(일반·쇼핑) + '황금' 생성 (병렬)
+      # 0) 오늘 키워드 수집/검수/분리(일반·쇼핑) + 골든 생성 (병렬)
       - name: Update keywords (일반+쇼핑, 자동검수, 병렬)
         run: |
           if [ -f update_keywords.py ]; then
@@ -105,7 +104,7 @@ jobs:
             echo "SKIP: update_keywords.py not found"
           fi
 
-      # 1) (선택) 쿠팡 씨앗 빌드 — 키 없으면 아래 단계에서 폴백 경로 사용
+      # 1) (선택) 쿠팡 씨앗 빌드 — 키 없으면 다음 단계에서 폴백 처리
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
