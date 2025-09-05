@@ -56,7 +56,7 @@ jobs:
           DEFAULT_TAGS=
           AFFILIATE_CATEGORY=쇼핑
           AFFILIATE_TAGS=
-          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.
+          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공받습니다.
           # ===== Ads =====
           AD_METHOD=${{ secrets.AD_METHOD }}
           AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
@@ -85,9 +85,8 @@ jobs:
           DRY_RUN=
           EOF
 
-      # ✅ Preflight: run 블록에서만 secrets 사용 (YAML 파싱 오류 방지)
+      # Preflight: run 블록에서만 secrets 사용 (YAML 파싱 오류 방지)
       - name: Preflight (Coupang keys present?)
-        shell: bash
         run: |
           if [ -n "${{ secrets.COUPANG_ACCESS_KEY }}" ] && [ -n "${{ secrets.COUPANG_SECRET_KEY }}" ]; then
             echo "[OK] Coupang keys are set."
@@ -103,6 +102,16 @@ jobs:
           else
             echo "SKIP: update_keywords.py not found"
           fi
+
+      # (NEW) 수집된 키워드 헤드 확인 — 빈 경우 바로 진단 가능
+      - name: Show keyword heads (debug)
+        run: |
+          echo "== golden_shopping_keywords.csv (head) =="
+          head -n 5 golden_shopping_keywords.csv || true
+          echo "== keywords_shopping.csv (head) =="
+          head -n 5 keywords_shopping.csv || true
+          echo "== keywords.csv (line) =="
+          if [ -f keywords.csv ]; then head -n 1 keywords.csv; fi
 
       # 1) (선택) 쿠팡 씨앗 빌드 — 키 없으면 다음 단계에서 폴백 처리
       - name: Build products_seed (from Coupang API)
