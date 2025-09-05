@@ -25,3 +25,12 @@ products_seed.cleaned.csv
 .cache/
 .usage/
 
+
+# generated keyword files
+keywords_general.csv
+keywords_shopping.csv
+golden_*.csv
+products_seed.cleaned.csv
+.cache/
+.usage/
+
