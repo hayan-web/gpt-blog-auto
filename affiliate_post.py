@@ -62,16 +62,20 @@ def _to_gmt_at_kst(hhmm: str) -> str:
 
 # NEW: 해당 UTC 시각 주변에 예약글이 있는지 검사
 def _wp_has_future_at(when_gmt_dt: datetime) -> bool:
-    after = (when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    before = (when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    r = requests.get(
-        f"{WP_URL}/wp-json/wp/v2/posts",
-        params={"status": "future", "after": after, "before": before, "per_page": 5},
-        headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
-        verify=WP_TLS_VERIFY, timeout=15,
-    )
-    r.raise_for_status()
-    return len(r.json()) > 0
+    try:
+        after = (when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        before = (when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r = requests.get(
+            f"{WP_URL}/wp-json/wp/v2/posts",
+            params={"status": "future", "after": after, "before": before, "per_page": 5},
+            headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
+            verify=WP_TLS_VERIFY, timeout=15,
+        )
+        r.raise_for_status()
+        return len(r.json()) > 0
+    except Exception as e:
+        print(f"[AFFILIATE] WARN: future slot check failed: {e}")
+        return False
 
 # NEW: 예약 충돌 시 '다음날 같은 시각'으로 1회만 이월
 def _slot_or_next_day(hhmm: str) -> str:
@@ -306,15 +310,12 @@ def _css_block() -> str:
 """
 
 def _sanitize_label(s: str) -> str:
-    # 환경변수에 '# 코멘트' 같이 들어온 경우 제거
     import re
     return re.sub(r'^[#\s]+', '', (s or '')).strip()
 
 def _cta_text(primary: bool) -> str:
-    # 마지막 큰 버튼은 항상 고정 문구
     if primary:
-        return "제품 보러가기"
-    # 중간(ghost) 버튼은 환경변수 우선 → 없으면 랜덤
+        return "제품 보러가기"  # 메인 버튼은 고정
     if BUTTON_TEXT_ENV:
         return _sanitize_label(BUTTON_TEXT_ENV)
     choices = [
@@ -323,7 +324,6 @@ def _cta_text(primary: bool) -> str:
         "실사용 후기와 옵션 보기",
         "빠른 배송 가능한 상품 보기",
     ]
-    import random
     return random.choice(choices)
 
 def _cta_html(link: str, primary: bool = True) -> str:
@@ -344,6 +344,27 @@ def _cta_html(link: str, primary: bool = True) -> str:
         f'<a class="{cls}" style="{inline}" href="{html.escape(link)}" '
         f'target="_blank" rel="sponsored noopener" aria-label="{label}">{label}</a>'
     )
+
+def _inject_mid_cta(body_html: str, cta_html: str) -> str:
+    """
+    본문 두 번째 </p> 뒤에 CTA 삽입. 실패 시 첫 <h3> 앞 또는 맨 앞에 삽입.
+    """
+    idx = -1
+    count = 0
+    for m in re.finditer(r"</p>", body_html, flags=re.I):
+        count += 1
+        if count == 2:
+            idx = m.end()
+            break
+    if idx != -1:
+        return body_html[:idx] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[idx:]
+
+    m2 = re.search(r"<h3[^>]*>", body_html, flags=re.I)
+    if m2:
+        pos = m2.start()
+        return body_html[:pos] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[pos:]
+
+    return f'<div class="cta">{cta_html}</div>\n' + body_html
 
 def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
     sys_p = "너는 사람스러운 한국어 블로거다. 광고처럼 보이지 않게 직접 써본 것처럼 쓴다."
@@ -370,7 +391,7 @@ def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str 
     if img_url:
         parts.append(f'<p><img src="{html.escape(img_url)}" alt="{html.escape(kw)}" loading="lazy"></p>')
 
-    # 중간 CTA: 고스트(랜덤 라벨)
+    # 중간 CTA: 고스트(랜덤/환경값 라벨)
     mid = _inject_mid_cta(body, _cta_html(final_link, primary=False))
     parts.append(mid)
 
