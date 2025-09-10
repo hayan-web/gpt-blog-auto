@@ -494,7 +494,7 @@ def run_once():
     kw = pick_affiliate_keyword()
     url = resolve_product_url(kw)
     when_gmt = _slot_affiliate()
-    title = build_title(kw)
+    title = hook_aff_title(product_name=kw, keyword=kw)
     body = render_affiliate_html(kw, url, image="", category_name=DEFAULT_CATEGORY)
     res = post_wp(title, body, when_gmt, category=DEFAULT_CATEGORY, tag=kw)
     link = res.get("link")
