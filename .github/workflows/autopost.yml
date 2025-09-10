@@ -3,13 +3,20 @@ name: run
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *"  # 매일 09:30 KST
+    - cron: "30 0 * * *"  # 매일 09:30 KST (UTC 기준 00:30)
+
+# 동시 실행 방지: 수동/스케줄이 겹쳐도 한 번만 수행
+concurrency:
+  group: autopost
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -171,6 +178,8 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # 혹시 모를 원격 갱신 반영(충돌 최소화)
+          git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
           git add -f golden_shopping_keywords.csv keywords_shopping.csv || true
           git add -f .usage/used_shopping.txt .usage/used_general.txt .usage/.gitkeep || true
           if git diff --cached --quiet; then
