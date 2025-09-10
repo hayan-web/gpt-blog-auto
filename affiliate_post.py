@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 import os, re, csv, json, sys, html, urllib.parse, random
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 import requests
 from dotenv import load_dotenv
@@ -18,8 +18,9 @@ WP_TLS_VERIFY = (os.getenv("WP_TLS_VERIFY") or "true").lower() != "false"
 POST_STATUS = (os.getenv("POST_STATUS") or "future").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or ""
-OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-OPENAI_MODEL_LONG = os.getenv("OPENAI_MODEL_LONG") or OPENAI_MODEL
+# 모델명이 비었을 때 대비 (기본값)
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+OPENAI_MODEL_LONG = (os.getenv("OPENAI_MODEL_LONG") or OPENAI_MODEL).strip()
 
 COUPANG_ACCESS_KEY = os.getenv("COUPANG_ACCESS_KEY") or ""
 COUPANG_SECRET_KEY = os.getenv("COUPANG_SECRET_KEY") or ""
@@ -29,28 +30,26 @@ COUPANG_SUBID_PREFIX = os.getenv("COUPANG_SUBID_PREFIX") or "auto"
 AFFILIATE_TIME_KST = os.getenv("AFFILIATE_TIME_KST") or "13:00"
 DISCLOSURE_TEXT = os.getenv("DISCLOSURE_TEXT") or "이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다."
 DEFAULT_CATEGORY = os.getenv("AFFILIATE_CATEGORY") or os.getenv("DEFAULT_CATEGORY") or "쇼핑"
-
 FORCE_SINGLE_TAG = True
-BUTTON_TEXT_ENV = (os.getenv("BUTTON_TEXT") or "").strip()
 
+BUTTON_TEXT_ENV = (os.getenv("BUTTON_TEXT") or "").strip()
 KEYWORDS_PRIMARY = ["golden_shopping_keywords.csv", "keywords_shopping.csv", "keywords.csv"]
 PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv"
-USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.4"
+USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.3"
 USAGE_DIR = os.getenv("USAGE_DIR") or ".usage"
 USED_FILE = os.path.join(USAGE_DIR, "used_shopping.txt")
 
-# 새 옵션들
-AFF_USED_BLOCK_DAYS = int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")
-NO_REPEAT_TODAY = str(os.getenv("NO_REPEAT_TODAY") or "1").lower() in ("1","true","yes","y","on")
-BAN_KEYWORDS_RAW = (os.getenv("BAN_KEYWORDS") or "").strip()
-BAN_KEYWORDS = [s.strip() for s in BAN_KEYWORDS_RAW.split(",") if s.strip()]
-AFF_FALLBACK_KEYWORDS_RAW = (os.getenv("AFF_FALLBACK_KEYWORDS") or "").strip()
-AFF_FALLBACK_KEYWORDS = [s.strip() for s in AFF_FALLBACK_KEYWORDS_RAW.split(",") if s.strip()]
+# 추가 가드 ENV
+AFF_USED_BLOCK_DAYS = int(os.getenv("AFF_USED_BLOCK_DAYS") or 30)
+NO_REPEAT_TODAY = (os.getenv("NO_REPEAT_TODAY") or "1").lower() not in ("0","false","off","no")
+BAN_KEYWORDS_ENV = (os.getenv("BAN_KEYWORDS") or "").strip()
+AFF_FALLBACK_KEYWORDS_ENV = (os.getenv("AFF_FALLBACK_KEYWORDS") or "").strip()
 
 REQ_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 _client = OpenAI(api_key=OPENAI_API_KEY)
 
-def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
+def _now_kst(): 
+    return datetime.now(ZoneInfo("Asia/Seoul"))
 
 # ===== CSV helpers =====
 def _read_col_csv(path: str) -> List[str]:
@@ -95,36 +94,51 @@ def _rotate_csvs_on_success(kw: str):
         print("[ROTATE] nothing removed (maybe already rotated)")
 
 # ===== Used-keyword log =====
-def _ensure_usage(): os.makedirs(USAGE_DIR, exist_ok=True)
+def _ensure_usage(): 
+    os.makedirs(USAGE_DIR, exist_ok=True)
 
-def _read_usage_history() -> Tuple[Dict[str,date], Dict[str,int], set]:
-    """
-    return (last_used_date_by_kw, used_count_by_kw, used_today_set)
-    """
+def _load_used_set(days:int=30)->set:
     _ensure_usage()
-    last: Dict[str,date] = {}
-    cnt: Dict[str,int] = {}
-    used_today=set()
-    if not os.path.exists(USED_FILE):
-        return last, cnt, used_today
-    today_utc = datetime.utcnow().date()
+    if not os.path.exists(USED_FILE): return set()
+    cutoff = datetime.utcnow().date() - timedelta(days=days)
+    s=set()
     with open(USED_FILE,"r",encoding="utf-8",errors="ignore") as f:
         for ln in f:
             ln=ln.strip()
             if not ln: continue
             try:
                 d_str, kw = ln.split("\t",1)
-                d = datetime.strptime(d_str,"%Y-%m-%d").date()
+                d=datetime.strptime(d_str,"%Y-%m-%d").date()
+                if d>=cutoff: s.add(kw.strip())
             except Exception:
-                # 비정상 라인도 오늘로 취급해 중복 방지
-                d, kw = today_utc, ln
-            kw=kw.strip()
-            cnt[kw]=cnt.get(kw,0)+1
-            if kw not in last or d>last[kw]:
-                last[kw]=d
-            if d==today_utc:
-                used_today.add(kw)
-    return last, cnt, used_today
+                s.add(ln)
+    return s
+
+def _load_used_list()->List[tuple]:
+    """[(date, keyword)] 오름차순으로 반환. 파싱 실패 줄은 today(UTC) 처리"""
+    _ensure_usage()
+    out=[]
+    if not os.path.exists(USED_FILE): 
+        return out
+    with open(USED_FILE,"r",encoding="utf-8",errors="ignore") as f:
+        for ln in f:
+            ln=ln.strip()
+            if not ln: continue
+            try:
+                d_str, kw = ln.split("\t",1)
+                d=datetime.strptime(d_str,"%Y-%m-%d").date()
+            except Exception:
+                d=datetime.utcnow().date(); kw=ln
+            out.append((d, kw.strip()))
+    return out
+
+def _last_used_map(days:int=365)->Dict[str, datetime.date]:
+    """키워드별 마지막 사용일 맵"""
+    cutoff = datetime.utcnow().date() - timedelta(days=days)
+    m={}
+    for d,kw in _load_used_list():
+        if d>=cutoff: m[kw]=d
+    return m
 
 def _mark_used(kw:str):
     _ensure_usage()
@@ -152,7 +166,21 @@ def _slot_or_next_day(hhmm:str)->str:
         return (tgt+timedelta(days=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     return tgt_utc.strftime("%Y-%m-%dT%H:%M:%S")
 
-# ===== Fallbacks =====
+# ===== Picker helpers =====
+def _parse_list_env(v:str)->List[str]:
+    return [x.strip() for x in re.split(r"[,\n/|]", v or "") if x.strip()]
+
+BAN_KEYWORDS = set(_parse_list_env(BAN_KEYWORDS_ENV))
+AFF_FALLBACK_KEYWORDS = _parse_list_env(AFF_FALLBACK_KEYWORDS_ENV)
+
+def _apply_ban(pool:List[str])->List[str]:
+    if not BAN_KEYWORDS: 
+        return pool
+    banned=[k for k in pool if any(b in k for b in BAN_KEYWORDS)]
+    if banned:
+        print(f"[BAN] removed: {banned}")
+    return [k for k in pool if not any(b in k for b in BAN_KEYWORDS)]
+
 def _seasonal_fallback()->str:
     m=_now_kst().month
     summer=["넥쿨러","휴대용 선풍기","냉감 패드","아이스 넥밴드","쿨링 타월","쿨링 토퍼"]
@@ -161,82 +189,64 @@ def _seasonal_fallback()->str:
     pool = summer if m in (6,7,8,9) else winter if m in (12,1,2) else swing
     return random.choice(pool)
 
-def _apply_ban(pool: List[str]) -> List[str]:
-    if not BAN_KEYWORDS:
-        return pool
-    lowers=[(kw, kw.lower()) for kw in pool]
-    bans=[b.lower() for b in BAN_KEYWORDS]
-    def ok(kw_low:str)->bool:
-        return not any(b in kw_low for b in bans)
-    filtered=[kw for kw,low in lowers if ok(low)]
-    if len(filtered)<len(pool):
-        removed=set(pool)-set(filtered)
-        print(f"[BAN] removed by BAN_KEYWORDS={BAN_KEYWORDS}: {sorted(removed)}")
-    return filtered
-
-# ===== Picking keyword (NO_REPEAT_TODAY + LRU + 30d soft block) =====
-def _pick_keyword()->Optional[str]:
-    last, cnt, used_today = _read_usage_history()
+# ===== Picking keyword (오늘 금지 + 30일 회피 + LRU + 폴백) =====
+def _pick_keyword()->str:
+    used_30d = _load_used_set(AFF_USED_BLOCK_DAYS)
+    used_today = {kw for d,kw in _load_used_list() if d==datetime.utcnow().date()}
     print(f"[USAGE] NO_REPEAT_TODAY={NO_REPEAT_TODAY}, AFF_USED_BLOCK_DAYS={AFF_USED_BLOCK_DAYS}")
-    if BAN_KEYWORDS:
-        print(f"[USAGE] BAN_KEYWORDS={BAN_KEYWORDS}")
 
-    # union from CSVs
-    pool=[]
+    # 1) 원본 풀 구성(골든/쇼핑/라인)
     a=_read_col_csv("golden_shopping_keywords.csv")
     b=_read_col_csv("keywords_shopping.csv")
     c=_read_line_csv("keywords.csv")
-    for arr in (a,b,c):
-        for k in arr:
-            if k and k not in pool:
-                pool.append(k)
+    pool = []
+    seen=set()
+    for src in (a+b+c):
+        k=src.strip()
+        if k and k not in seen:
+            seen.add(k); pool.append(k)
+    if not pool:
+        print("[AFFILIATE] WARN: no shopping keywords from CSVs")
 
+    # 2) 금지어 제거
     pool = _apply_ban(pool)
 
-    if not pool:
-        fb = AFF_FALLBACK_KEYWORDS[:] if AFF_FALLBACK_KEYWORDS else []
-        if not fb:
-            fb = [_seasonal_fallback()]
-        fb = _apply_ban(fb)
-        if not fb:
-            return None
-        print(f"[AFFILIATE] WARN: no CSV keywords -> fallback to {fb[0]}")
-        return fb[0]
-
-    # today filter
-    if NO_REPEAT_TODAY:
-        pool_today=[k for k in pool if k in used_today]
+    # 3) 오늘 쓴 것 제외
+    if NO_REPEAT_TODAY and pool:
+        removed=[k for k in pool if k in used_today]
+        if removed:
+            print(f"[FILTER] removed (used today): {removed}")
         pool=[k for k in pool if k not in used_today]
-        if pool_today:
-            print(f"[FILTER] removed (used today): {pool_today}")
-    # build scored list
-    today = datetime.utcnow().date()
-    def days_since(kw:str)->int:
-        d=last.get(kw)
-        if not d: return 10**6  # never used → 가장 우선
-        return (today - d).days
 
-    # 1) never used
-    never=[k for k in pool if k not in last]
-    if never:
-        pick=random.choice(never) if len(never)>1 else never[0]
-        print(f"[AFFILIATE] pick never-used -> '{pick}'")
+    # 4) 30일 소프트블록 우선(가능하면 미사용 우선)
+    if pool:
+        unused_30d=[k for k in pool if k not in used_30d]
+        if unused_30d:
+            pick=random.choice(unused_30d)
+            print(f"[AFFILIATE] pick '{pick}' (unused in {AFF_USED_BLOCK_DAYS}d)")
+            return pick
+
+        # 전부 30일 내 사용됐으면 LRU(가장 오래된 사용일)
+        last_map=_last_used_map(365)
+        pool_sorted=sorted(pool, key=lambda k: last_map.get(k, datetime(1970,1,1).date()))
+        if pool_sorted:
+            pick=pool_sorted[0]
+            print(f"[AFFILIATE] all used < {AFF_USED_BLOCK_DAYS}d; pick LRU -> '{pick}'")
+            return pick
+
+    # 5) 풀 비었을 때 폴백
+    fb = AFF_FALLBACK_KEYWORDS[:] if AFF_FALLBACK_KEYWORDS else []
+    if not fb:
+        fb = [ _seasonal_fallback() ]
+    fb = _apply_ban(fb)
+    if fb:
+        pick=random.choice(fb)
+        print(f"[AFFILIATE] fallback -> '{pick}'")
         return pick
 
-    # 2) not used in AFF_USED_BLOCK_DAYS
-    ok_soft=[k for k in pool if days_since(k) >= AFF_USED_BLOCK_DAYS]
-    if ok_soft:
-        # LRU among ok_soft
-        ok_soft.sort(key=lambda k:(days_since(k), cnt.get(k,0)))
-        pick=ok_soft[0]
-        print(f"[AFFILIATE] pick unused >= {AFF_USED_BLOCK_DAYS}d (LRU) -> '{pick}'")
-        return pick
-
-    # 3) all are recent (< AFF_USED_BLOCK_DAYS) -> strict LRU
-    pool.sort(key=lambda k:(days_since(k), cnt.get(k,0)))
-    pick=pool[0]
-    print(f"[AFFILIATE] all candidates used < {AFF_USED_BLOCK_DAYS}d; pick least-recently-used -> '{pick}'")
-    return pick
+    # 6) 최후의 보루
+    print("[AFFILIATE] FATAL: no candidates left even after fallback; using '무선 청소기'")
+    return "무선 청소기"
 
 # ===== Tag util =====
 def _clean_hashtag_token(s:str)->str:
@@ -287,6 +297,7 @@ def _gen_review_html(kw, deeplink, img_url="", search_url="")->str:
          "- 도입 2~3문장\n- <h2>/<h3> 소제목\n- 불릿 4~6개(과장 금지)\n"
          "- '가격/가성비' 섹션\n- '장단점' 섹션\n- '이런 분께 추천' 섹션\n- 1200~1300자\n"
          "- HTML만 (<p>,<h2>,<h3>,<ul>,<li>,<a>,...)")
+    body=""
     try:
         r=_client.chat.completions.create(
             model=OPENAI_MODEL_LONG or OPENAI_MODEL,
@@ -296,12 +307,18 @@ def _gen_review_html(kw, deeplink, img_url="", search_url="")->str:
         body=(r.choices[0].message.content or "").strip()
     except BadRequestError:
         body=""
+    except Exception as e:
+        print(f"[OPENAI][WARN] {type(e).__name__}: {e}")
+        body=""
     body=re.sub(r"```(?:\w+)?","",body).replace("```","").strip()
-    final=deeplink or search_url or _coupang_search_url(kw)
-    # 버튼 텍스트 커스터마이즈
-    btn1 = BUTTON_TEXT_ENV or "쿠팡에서 최저가 확인하기"
-    btn2 = "제품 보러가기"
+    if not body:
+        # API 장애/모델 미설정 시 최소 포맷 폴백
+        body=(f"<p>{html.escape(kw)}에 대해 직접 사용해 보며 느낀 점을 간단히 정리합니다.</p>"
+              f"<h2>특징</h2><ul><li>핵심 기능 위주로 실사용에 집중</li>"
+              f"<li>장점과 아쉬운 점을 균형 있게 정리</li></ul>"
+              f"<h2>가격/가성비</h2><p>가격 비교가 필요하면 아래 버튼으로 확인하세요.</p>")
 
+    final=deeplink or search_url or _coupang_search_url(kw)
     css=(
     '<style>.post-affil p{line-height:1.84;margin:0 0 14px;color:#222}'
     '.post-affil h2{margin:28px 0 12px;font-size:1.45rem;line-height:1.35;border-left:6px solid #3b82f6;padding-left:10px}'
@@ -312,8 +329,8 @@ def _gen_review_html(kw, deeplink, img_url="", search_url="")->str:
     '.post-affil .btn-ghost{display:inline-flex;align-items:center;gap:8px;justify-content:center;padding:14px 22px;border-radius:999px;font-weight:700;font-size:1rem;text-decoration:none;background:#fff;color:#0f172a;border:1px solid #d1d5db;box-shadow:0 4px 10px rgba(2,6,23,.08)}'
     '@media (max-width:640px){ .post-affil .btn-cta,.post-affil .btn-ghost{width:100%}}</style>'
     )
-    cta1=f'<a class="btn-ghost" href="{html.escape(final)}" target="_blank" rel="sponsored noopener">{html.escape(btn1)}</a>'
-    cta2=f'<a class="btn-cta" href="{html.escape(final)}" target="_blank" rel="sponsored noopener">{html.escape(btn2)}</a>'
+    cta1=f'<a class="btn-ghost" href="{html.escape(final)}" target="_blank" rel="sponsored noopener">쿠팡에서 최저가 확인하기</a>'
+    cta2=f'<a class="btn-cta" href="{html.escape(final)}" target="_blank" rel="sponsored noopener">제품 보러가기</a>'
     return f'{css}<div class="post-affil"><p class="disc">{html.escape(DISCLOSURE_TEXT)}</p>{body}<div class="cta">{cta1}</div><div class="cta">{cta2}</div></div>'
 
 # ===== Main =====
@@ -321,19 +338,9 @@ def main():
     if not (WP_URL and WP_USER and WP_APP_PASSWORD):
         raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
     if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY 필요")
+        print("[OPENAI][WARN] OPENAI_API_KEY 미설정 - 본문은 간단 폴백 문장으로 생성될 수 있습니다.")
 
     kw=_pick_keyword()
-    if not kw:
-        print("[AFFILIATE] SKIP: no candidate keyword after filters (BAN/NO_REPEAT_TODAY/empty pool)")
-        return
-
-    # 오늘 중복 방어: 혹시라도 race condition으로 사용됐다면 스킵
-    _, _, used_today = _read_usage_history()
-    if NO_REPEAT_TODAY and kw in used_today:
-        print(f"[AFFILIATE] SKIP: '{kw}' was already used today (post not created).")
-        return
-
     title=f"{kw} 제대로 써보고 알게 된 포인트"
     when_gmt=_slot_or_next_day(AFFILIATE_TIME_KST)
     html_body=_gen_review_html(kw, _coupang_search_url(kw))
@@ -341,8 +348,7 @@ def main():
     res=_post_wp(title, html_body, when_gmt, DEFAULT_CATEGORY, [kw])
     if res.get("id"):
         _mark_used(kw)
-        # CSV에 있을 경우 제거(없으면 no-op)
-        _rotate_csvs_on_success(kw)
+        _rotate_csvs_on_success(kw)   # 안전망: 스크립트에서도 즉시 제거
 
     print(json.dumps({
         "post_id": res.get("id"),

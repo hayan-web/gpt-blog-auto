@@ -2,20 +2,20 @@ name: run
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "0 4 * * *" # KST 13:00에 맞추고 싶으면 주석 해제(UTC+9 → 04:00 UTC)
+  schedule:
+    # - cron: "0 3 * * *"  # (UTC) 필요 시 활성화
 
 jobs:
   run:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          fetch-tags: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -27,7 +27,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Write .env from secrets
+      - name: Write .env from secrets/vars
         run: |
           cat > .env << 'EOF'
           # ===== WordPress =====
@@ -39,18 +39,18 @@ jobs:
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL=${{ vars.OPENAI_MODEL }}
           OPENAI_MODEL_LONG=${{ vars.OPENAI_MODEL_LONG }}
-          MAX_TOKENS_BODY=${{ vars.MAX_TOKENS_BODY || '900' }}
+          MAX_TOKENS_BODY=${{ vars.MAX_TOKENS_BODY || 900 }}
           # ===== Coupang Partners =====
           COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
           COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
           COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
           COUPANG_SUBID_PREFIX=${{ vars.COUPANG_SUBID_PREFIX || 'auto' }}
-          REQUIRE_COUPANG_API=${{ vars.REQUIRE_COUPANG_API || '1' }}
+          REQUIRE_COUPANG_API=${{ vars.REQUIRE_COUPANG_API || 1 }}
           AFFILIATE_TIME_KST=${{ vars.AFFILIATE_TIME_KST || '13:00' }}
           # ===== Posting / Taxonomy =====
           POST_STATUS=${{ vars.POST_STATUS || 'future' }}
           KEYWORDS_CSV=${{ vars.KEYWORDS_CSV || 'keywords.csv' }}
-          ALLOW_CREATE_TERMS=${{ vars.ALLOW_CREATE_TERMS || '1' }}
+          ALLOW_CREATE_TERMS=${{ vars.ALLOW_CREATE_TERMS || 1 }}
           EXISTING_CATEGORIES=${{ vars.EXISTING_CATEGORIES || '뉴스,비공개,쇼핑,전체글,게시글,정보,취미' }}
           # ===== Affiliate Content =====
           PRODUCTS_SEED_CSV=${{ vars.PRODUCTS_SEED_CSV || 'products_seed.csv' }}
@@ -67,9 +67,9 @@ jobs:
           NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
           NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
-          KEYWORDS_K=${{ vars.KEYWORDS_K || '10' }}
+          KEYWORDS_K=${{ vars.KEYWORDS_K || 10 }}
           BAN_KEYWORDS=${{ vars.BAN_KEYWORDS }}
-          BACKUP_OLD_KEYWORDS=${{ vars.BACKUP_OLD_KEYWORDS || '1' }}
+          BACKUP_OLD_KEYWORDS=${{ vars.BACKUP_OLD_KEYWORDS || 1 }}
           USER_AGENT=${{ vars.USER_AGENT || 'gpt-blog-keywords/1.2' }}
           # ===== Cache / Logs =====
           USAGE_DIR=.usage
@@ -77,16 +77,17 @@ jobs:
           LLM_LOG_FILENAME=llm.log
           CACHE_TTL_DEFAULT=86400
           CACHE_MAX_FILES=500
-          CACHE_DISABLE=${{ vars.CACHE_DISABLE || '0' }}
+          CACHE_DISABLE=${{ vars.CACHE_DISABLE || 0 }}
           # ===== Switches =====
           KEYWORD_PICK_MODE=${{ vars.KEYWORD_PICK_MODE }}
           SEED_PICK_MODE=${{ vars.SEED_PICK_MODE }}
           USE_IMAGE=${{ vars.USE_IMAGE }}
           BUTTON_TEXT=${{ vars.BUTTON_TEXT }}
-          # ===== Persist & Affiliate picker guards =====
+          # ===== Picker guards & fallbacks =====
           PERSIST_USAGE=1
-          AFF_USED_BLOCK_DAYS=${{ vars.AFF_USED_BLOCK_DAYS || '30' }}
+          AFF_USED_BLOCK_DAYS=${{ vars.AFF_USED_BLOCK_DAYS || 30 }}
           NO_REPEAT_TODAY=1
+          AFF_FALLBACK_KEYWORDS=${{ vars.AFF_FALLBACK_KEYWORDS }}
           EOF
 
       - name: Export .env to GITHUB_ENV
@@ -112,7 +113,8 @@ jobs:
       - name: Update keywords (general & shopping)
         run: |
           if [ -f update_keywords.py ]; then
-            python update_keywords.py --k ${KEYWORDS_K} --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8 || true
+            # 모집폭 확대: 쇼핑 키워드가 2개만 생성되는 현상 완화
+            python update_keywords.py --k ${KEYWORDS_K} --gold 5 --shop-k 20 --shop-gold 8 --days 7 --parallel 8 || true
           else
             echo "SKIP: update_keywords.py not found"
           fi
