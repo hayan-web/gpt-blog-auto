@@ -30,28 +30,90 @@ USED_FILE=os.path.join(USAGE_DIR,"used_general.txt")
 REQ_HEADERS={"User-Agent":USER_AGENT,"Accept":"application/json"}
 
 # ===== TIME =====
-def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
-def _to_gmt_at_kst_time(h:int,m:int=0)->str:
+def _now_kst(): 
+    return datetime.now(ZoneInfo("Asia/Seoul"))
+
+def _wp_has_future_at(when_gmt_dt: datetime, window_min: int = 7) -> bool:
+    """
+    타깃 시각(UTC) 주변에 예약글이 이미 있는지 견고하게 확인.
+    1) ±15분 범위를 WP가 필터링
+    2) 없으면 ±2시간 재조회 후 직접 시각 비교(±window_min)
+    """
+    base_url = f"{WP_URL}/wp-json/wp/v2/posts"
+    auth = (WP_USER, WP_APP_PASSWORD)
+
+    after = (when_gmt_dt - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S")
+    before = (when_gmt_dt + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S")
+    items = []
+    try:
+        r = requests.get(
+            base_url,
+            params={"status":"future","after":after,"before":before,"per_page":50,"orderby":"date","order":"asc"},
+            headers=REQ_HEADERS, auth=auth, verify=WP_TLS_VERIFY, timeout=15
+        ); r.raise_for_status()
+        items = r.json()
+    except Exception as e:
+        print(f"[WP][WARN] future list 1st query failed: {type(e).__name__}: {e}")
+
+    if not items:
+        after2 = (when_gmt_dt - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+        before2 = (when_gmt_dt + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
+        try:
+            r2 = requests.get(
+                base_url,
+                params={"status":"future","after":after2,"before":before2,"per_page":100,"orderby":"date","order":"asc"},
+                headers=REQ_HEADERS, auth=auth, verify=WP_TLS_VERIFY, timeout=15
+            ); r2.raise_for_status()
+            items = r2.json()
+        except Exception as e:
+            print(f"[WP][WARN] future list 2nd query failed: {type(e).__name__}: {e}")
+            items = []
+
+    win = timedelta(minutes=window_min)
+    tgt = when_gmt_dt.astimezone(timezone.utc)
+    for it in items:
+        d_gmt = it.get("date_gmt") or ""
+        d_loc = it.get("date") or ""
+        cand = None
+        try:
+            if d_gmt:
+                cand = datetime.fromisoformat(d_gmt.replace("Z", "+00:00"))
+            elif d_loc:
+                cand = datetime.fromisoformat(d_loc.replace("Z", "+00:00"))
+        except Exception:
+            cand = None
+        if not cand:
+            continue
+        if cand.tzinfo is None:
+            cand = cand.replace(tzinfo=timezone.utc)
+        else:
+            cand = cand.astimezone(timezone.utc)
+        if abs(cand - tgt) <= win:
+            return True
+    return False
+
+def _slot_or_next_day(h:int, m:int=0)->str:
+    """
+    - 오늘 KST의 (h:m)을 타깃으로:
+      1) 과거면 +1일
+      2) 그 슬롯에 예약글 있으면 +1일 (필요 시 한 번 더 +1일)
+    - 반환: UTC ISO8601
+    """
     now=_now_kst()
     tgt=now.replace(hour=h,minute=m,second=0,microsecond=0)
-    if tgt<=now: tgt+=timedelta(days=1)
-    return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-
-def _wp_has_future_at(when_gmt_dt: datetime)->bool:
-    after=(when_gmt_dt-timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    before=(when_gmt_dt+timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    r=requests.get(f"{WP_URL}/wp-json/wp/v2/posts",
-        params={"status":"future","after":after,"before":before,"per_page":5},
-        auth=(WP_USER,WP_APP_PASSWORD),verify=WP_TLS_VERIFY,timeout=15,headers=REQ_HEADERS)
-    r.raise_for_status(); return len(r.json())>0
-
-def _slot_or_next_day(h:int,m:int=0)->str:
-    now=_now_kst()
-    tgt=now.replace(hour=h,minute=m,second=0,microsecond=0)
-    if tgt<=now: tgt+=timedelta(days=1)
+    if tgt<=now:
+        tgt+=timedelta(days=1)
     utc=tgt.astimezone(timezone.utc)
-    if _wp_has_future_at(utc):
-        return (tgt+timedelta(days=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+    if _wp_has_future_at(utc, window_min=7):
+        print(f"[SLOT] {h:02d}:{m:02d} KST already taken -> roll to next day")
+        tgt = tgt + timedelta(days=1)
+        utc = tgt.astimezone(timezone.utc)
+        if _wp_has_future_at(utc, window_min=7):
+            print(f"[SLOT][WARN] next day also taken -> add another day")
+            tgt = tgt + timedelta(days=1)
+            utc = tgt.astimezone(timezone.utc)
+
     return utc.strftime("%Y-%m-%dT%H:%M:%S")
 
 # ===== SHOPPING FILTER =====
@@ -227,12 +289,12 @@ def gen_body_info(kw:str)->str:
 # ===== WP =====
 def _ensure_term(kind:str, name:str)->int:
     r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}", params={"search":name,"per_page":50},
-                   auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
+                   auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
     r.raise_for_status()
     for it in r.json():
         if (it.get("name") or "").strip()==name: return int(it["id"])
     r=requests.post(f"{WP_URL}/wp-json/wp/v2/{kind}", json={"name":name},
-                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
+                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
     r.raise_for_status(); return int(r.json()["id"])
 
 def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str="")->dict:
@@ -241,12 +303,13 @@ def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str=""
     if tag:
         try:
             tid=_ensure_term("tags", tag); tag_ids=[tid]
-        except Exception: pass
+        except Exception: 
+            pass
     payload={"title":title,"content":html,"status":POST_STATUS,
              "categories":[cat_id],"tags":tag_ids,
              "comment_status":"closed","ping_status":"closed","date_gmt":when_gmt}
     r=requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
-                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
+                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
     r.raise_for_status(); return r.json()
 
 # ===== RUNNERS =====
