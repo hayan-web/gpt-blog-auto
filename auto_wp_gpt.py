@@ -5,7 +5,7 @@ auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
 - 후킹형 제목(HTML 엔티티/태그 제거 후 정규화), 정보형 본문(+CSS), 쇼핑 단어 금지
 - 최근 30일 사용 키워드 회피 + 성공 시 사용 기록(.usage/used_general.txt)
 - 성공 후 소스 CSV에서 해당 키워드 즉시 제거(폐기)
-- WP 예약 슬롯 충돌 시 다음날로 이월(최대 2일 재시도)
+- WP 예약 슬롯 충돌 시 다음날로 이월(최대 7일 재시도)  ← 패치
 """
 import os, re, sys, csv, html
 from datetime import datetime, timedelta, timezone
@@ -41,62 +41,53 @@ REQ_HEADERS={
 def _now_kst():
     return datetime.now(ZoneInfo("Asia/Seoul"))
 
-def _wp_has_future_at(when_gmt_dt: datetime, window_min: int = 7) -> bool:
+# --- 패치: after/before 사용 안 하고, date_gmt(UTC) 직접 비교 ---
+def _wp_future_exists_around(when_gmt_dt: datetime, tol_min: int = 2) -> bool:
     """
-    타깃 시각(UTC) 주변에 예약글이 이미 있는지 견고하게 확인.
-    1) ±15분 범위를 WP가 필터링
-    2) 없으면 ±2시간 재조회 후 직접 시각 비교(±window_min)
+    워드프레스 예약글(status=future)을 넉넉히 조회한 뒤,
+    UTC date_gmt를 기준으로 ±tol_min 분 내 충돌 여부 판단.
+    타임존 혼선을 피하기 위해 after/before 파라미터는 사용하지 않는다.
     """
-    base_url = f"{WP_URL}/wp-json/wp/v2/posts"
-    auth = (WP_USER, WP_APP_PASSWORD)
-
-    after = (when_gmt_dt - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S")
-    before = (when_gmt_dt + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%S")
-    items = []
+    url = f"{WP_URL}/wp-json/wp/v2/posts"
     try:
         r = requests.get(
-            base_url,
-            params={"status":"future","after":after,"before":before,"per_page":50,"orderby":"date","order":"asc","context":"edit"},
-            headers=REQ_HEADERS, auth=auth, verify=WP_TLS_VERIFY, timeout=15
-        ); r.raise_for_status()
+            url,
+            params={
+                "status": "future",
+                "per_page": 100,
+                "orderby": "date",
+                "order": "asc",
+                "context": "edit",
+            },
+            headers=REQ_HEADERS,
+            auth=(WP_USER, WP_APP_PASSWORD),
+            verify=WP_TLS_VERIFY,
+            timeout=20,
+        )
+        r.raise_for_status()
         items = r.json()
     except Exception as e:
-        print(f"[WP][WARN] future list 1st query failed: {type(e).__name__}: {e}")
+        print(f"[WP][WARN] future list fetch failed: {type(e).__name__}: {e}")
+        # 조회 실패면 보수적으로 '충돌 없음' 처리 (예약을 막지 않음)
+        return False
 
-    if not items:
-        after2 = (when_gmt_dt - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
-        before2 = (when_gmt_dt + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%S")
-        try:
-            r2 = requests.get(
-                base_url,
-                params={"status":"future","after":after2,"before":before2,"per_page":100,"orderby":"date","order":"asc","context":"edit"},
-                headers=REQ_HEADERS, auth=auth, verify=WP_TLS_VERIFY, timeout=15
-            ); r2.raise_for_status()
-            items = r2.json()
-        except Exception as e:
-            print(f"[WP][WARN] future list 2nd query failed: {type(e).__name__}: {e}")
-            items = []
-
-    win = timedelta(minutes=window_min)
     tgt = when_gmt_dt.astimezone(timezone.utc)
+    delta = timedelta(minutes=max(1, int(tol_min)))
+    lo, hi = tgt - delta, tgt + delta
+
     for it in items:
-        d_gmt = (it.get("date_gmt") or "").strip()
-        d_loc = (it.get("date") or "").strip()
-        cand = None
-        try:
-            if d_gmt:
-                cand = datetime.fromisoformat(d_gmt.replace("Z","+00:00"))
-            elif d_loc:
-                cand = datetime.fromisoformat(d_loc.replace("Z","+00:00"))
-        except Exception:
-            cand = None
-        if not cand: 
+        dstr = (it.get("date_gmt") or "").strip()  # "YYYY-MM-DDTHH:MM:SS"
+        if not dstr:
             continue
-        if cand.tzinfo is None:
-            cand = cand.replace(tzinfo=timezone.utc)
-        else:
-            cand = cand.astimezone(timezone.utc)
-        if abs(cand - tgt) <= win:
+        try:
+            dt = datetime.fromisoformat(dstr.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+        if lo <= dt <= hi:
             return True
     return False
 
@@ -104,25 +95,25 @@ def _slot_or_next_day(h:int, m:int=0)->str:
     """
     - 오늘 KST의 (h:m)을 타깃:
       1) 과거면 +1일
-      2) 그 슬롯에 예약글 있으면 +1일 (필요 시 한 번 더 +1일)
+      2) 동일 슬롯에 예약글 있으면 하루씩 밀기(최대 7일)
     - 반환: UTC ISO8601 (YYYY-MM-DDTHH:MM:SS)
     """
     now=_now_kst()
-    tgt=now.replace(hour=h,minute=m,second=0,microsecond=0)
-    if tgt<=now:
-        tgt+=timedelta(days=1)
-    utc=tgt.astimezone(timezone.utc)
+    target_kst = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    if target_kst <= now:
+        target_kst += timedelta(days=1)
 
-    if _wp_has_future_at(utc, window_min=7):
-        print(f"[SLOT] {h:02d}:{m:02d} KST taken -> +1d")
-        tgt = tgt + timedelta(days=1)
-        utc = tgt.astimezone(timezone.utc)
-        if _wp_has_future_at(utc, window_min=7):
-            print(f"[SLOT][WARN] next day also taken -> +1d")
-            tgt = tgt + timedelta(days=1)
-            utc = tgt.astimezone(timezone.utc)
+    for _ in range(7):
+        when_gmt_dt = target_kst.astimezone(timezone.utc)
+        if _wp_future_exists_around(when_gmt_dt, tol_min=2):
+            print(f"[SLOT] conflict at {when_gmt_dt.strftime('%Y-%m-%dT%H:%M:%S')}Z -> +1d")
+            target_kst += timedelta(days=1)
+            continue
+        break
 
-    return utc.strftime("%Y-%m-%dT%H:%M:%S")
+    final = target_kst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    print(f"[SLOT] scheduled UTC = {final}")
+    return final
 
 # ===== SHOPPING FILTER =====
 SHOPPING_WORDS=set("추천 리뷰 후기 가격 최저가 세일 특가 쇼핑 쿠폰 할인 핫딜 언박싱 스펙 구매 배송".split())
@@ -219,7 +210,7 @@ def pick_daily_keywords(n:int=2)->List[str]:
             out.append(k)
             if len(out)>=n: break
         if len(out)>=n: break
-    # 3) 부족하면 안전한 기본 키워드(폴백) — 제목/본문에 노출되는 표현은 아님
+    # 3) 부족하면 안전한 기본 키워드(폴백)
     i=0
     bases=["오늘의 작은 통찰","생각이 자라는 순간","일상을 바꾸는 관찰","시야가 넓어지는 한 줄"]
     while len(out)<n:
@@ -256,21 +247,13 @@ def _bad_title(t:str)->bool:
     return any(p in t for p in BANNED_TITLE) or not (14<=len(t)<=26)
 
 def _normalize_title(raw:str)->str:
-    # 1) HTML 엔티티 해제
     s=html.unescape(raw or "")
-    # 2) 태그 제거
     s=re.sub(r"<[^>]+>","",s)
-    # 3) 따옴표 엔티티/잔여 제거
     s=s.replace("&039;","'").replace("&quot;","\"")
-    # 4) 공백 정리
     s=re.sub(r"\s+"," ",s).strip(" \"'“”‘’")
     return s
 
 def hook_title(kw:str)->str:
-    """
-    후킹형 짧은 제목 생성 + 엔티티/태그 제거 + 길이 검증.
-    실패 시 안전한 기본형으로 폴백.
-    """
     sys_p="너는 한국어 카피라이터다. 클릭을 부르는 짧고 강한 제목만 출력."
     usr=f"""키워드: {kw}
 조건:
@@ -295,7 +278,6 @@ def strip_code_fences(s:str)->str:
     return re.sub(r"```(?:\w+)?","",s).replace("```","").strip().strip("“”\"'")
 
 def _css_block()->str:
-    # 테마와 충돌 없는 경량 CSS (필요시 클래스명만 사용)
     return """
 <style>
 .post-info p{line-height:1.86;margin:0 0 14px;color:#222}
@@ -311,7 +293,6 @@ def _css_block()->str:
 
 def gen_body_info(kw:str)->str:
     if _oai.api_key is None:
-        # 키 없이도 안정 출력(간단 HTML)
         html_body=f"""
 {_css_block()}
 <div class="post-info">
@@ -364,8 +345,8 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str="정보", tag:s
         except Exception:
             pass
     payload={
-        "title": title,                 # 제목은 순수 텍스트(HTML/엔티티 금지)
-        "content": html_body,           # 본문은 HTML
+        "title": title,
+        "content": html_body,
         "status": POST_STATUS,
         "categories": [cat_id],
         "tags": tag_ids,
@@ -382,7 +363,7 @@ def run_two_posts():
     kws=pick_daily_keywords(2)
     times=[(10,0),(17,0)]
     for idx,(kw,(h,m)) in enumerate(zip(kws,times)):
-        title=hook_title(kw)                          # ← 제목 정규화 포함
+        title=hook_title(kw)
         html_body=gen_body_info(kw)
         link=post_wp(title, html_body, _slot_or_next_day(h,m), category="정보", tag=kw).get("link")
         print(f"[OK] scheduled ({idx}) '{title}' -> {link}")
