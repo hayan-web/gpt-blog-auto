@@ -9,6 +9,10 @@ concurrency:
   group: autopost
   cancel-in-progress: true
 
+# 커밋/푸시가 필요한 경우를 대비해 write 권한 부여
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -95,7 +99,7 @@ jobs:
           env = dotenv_values(".env")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               for k,v in env.items():
-                  if v is None: 
+                  if v is None:
                       continue
                   f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
           PY
@@ -123,7 +127,7 @@ jobs:
           echo "== keywords_general.csv (head) ==" && head -n 5 keywords_general.csv || true
           echo "== keywords.csv (line) ==" && ( [ -f keywords.csv ] && head -n 1 keywords.csv || true )
 
-      # ---------- FIX 1: Truthy 체크로 API 호출 ----------
+      # === 제품 시드 ===
       - name: Build products_seed (from Coupang API)
         run: |
           if [ -f build_products_seed.py ]; then
@@ -139,7 +143,6 @@ jobs:
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      # ---------- FIX 2: 기대 헤더로 플레이스홀더 생성 ----------
       - name: Ensure products_seed.csv exists (placeholder with expected headers)
         run: |
           if [ ! -s products_seed.csv ]; then
@@ -147,7 +150,6 @@ jobs:
             echo "[INFO] created placeholder products_seed.csv (expected headers)"
           fi
 
-      # ---------- FIX 3: 데이터 없으면 품질체크 스킵 ----------
       - name: Seed quality check (report + cleaned csv)
         run: |
           if [ -f seed_quality_check.py ] && [ -s products_seed.csv ]; then
@@ -160,6 +162,13 @@ jobs:
             echo "[INFO] skip seed_quality_check (missing or empty products_seed.csv)"
           fi
 
+      # === 로그/회피를 위한 사용폴더 보장 ===
+      - name: Ensure .usage exists
+        run: |
+          mkdir -p .usage
+          [ -f .usage/.gitkeep ] || touch .usage/.gitkeep
+
+      # === 일반글 2건 ===
       - name: Schedule 2 daily posts (10:00 / 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -168,6 +177,7 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
+      # === 쿠팡글 1건 + 회전 ===
       - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
         run: |
           set -o pipefail
@@ -178,7 +188,9 @@ jobs:
           fi
 
           echo "---- Affiliate step tail ----"
-          tail -n 120 /tmp/affiliate_out.txt || true
+          tail -n 200 /tmp/affiliate_out.txt || true
+          echo "---- used_shopping tail ----"
+          tail -n 20 .usage/used_shopping.txt || true
 
           if grep -q '"post_id"' /tmp/affiliate_out.txt; then
             echo "[OK] affiliate post created/scheduled. Rotating keywords..."
@@ -188,3 +200,13 @@ jobs:
           else
             echo "[INFO] Affiliate post not created. See [AFFILIATE] lines above for reason."
           fi
+
+      # === (선택) 사용 키워드 로그를 레포에 보존 ===
+      - name: Persist used keywords (optional)
+        if: ${{ secrets.PERSIST_USAGE == '1' }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .usage/used_shopping.txt .usage/.gitkeep || true
+          git diff --cached --quiet || git commit -m "chore(usage): persist used keywords log"
+          git push
