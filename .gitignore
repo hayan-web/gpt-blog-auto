@@ -65,3 +65,12 @@ Thumbs.db
 .idea/
 .vscode/
 ### <<< gpt-blog generated & cache <<<
+
+# allow keyword rotation outputs
+!golden_shopping_keywords.csv
+!keywords_shopping.csv
+
+# allow usage log
+!.usage/
+!.usage/.gitkeep
+!.usage/used_shopping.txt
