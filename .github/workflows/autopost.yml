@@ -2,21 +2,19 @@ name: Daily 3 Posts (auto keywords + 2 daily + 1 affiliate + rotate)
 
 on:
   schedule:
-    - cron: "5 0 * * *"   # 매일 09:05 KST (UTC 00:05)
+    - cron: "5 0 * * *"   # KST 09:05 (UTC 00:05)
   workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 concurrency:
   group: autopost
   cancel-in-progress: true
 
-# 커밋/푸시가 필요한 경우를 대비해 write 권한 부여
-permissions:
-  contents: write
-
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -29,8 +27,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Secrets -> .env (리터럴 EOF)
-      - name: Write .env from Secrets (do not commit secrets)
+      # ===== Secrets -> .env (파일로만 쓰고 커밋하지 않음)
+      - name: Write .env from Secrets
         run: |
           cat > .env << 'EOF'
           # ===== WordPress =====
@@ -81,16 +79,16 @@ jobs:
           CACHE_TTL_DEFAULT=86400
           CACHE_MAX_FILES=500
           CACHE_DISABLE=false
-          # ===== Flow switches =====
+          # ===== Switches =====
           KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}
           SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}
           USE_IMAGE=${{ secrets.USE_IMAGE }}
           BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}
-          # ===== Debug =====
-          DRY_RUN=
+          # ===== Persist (항상 커밋하도록 기본값 1)
+          PERSIST_USAGE=1
           EOF
 
-      # .env -> GITHUB_ENV (no eval)
+      # .env를 GITHUB_ENV로 복사(쉘 확장 없이 안전)
       - name: Export .env to GITHUB_ENV
         run: |
           python - << 'PY'
@@ -99,12 +97,11 @@ jobs:
           env = dotenv_values(".env")
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               for k,v in env.items():
-                  if v is None:
-                      continue
+                  if v is None: continue
                   f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
           PY
 
-      - name: Preflight (Coupang keys present?)
+      - name: Preflight
         run: |
           if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
             echo "[OK] Coupang keys are set."
@@ -112,7 +109,7 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 검색/딥링크는 폴백 사용"
           fi
 
-      - name: Update keywords (일반+쇼핑)
+      - name: Update keywords (일반 + 쇼핑)
         run: |
           if [ -f update_keywords.py ]; then
             python update_keywords.py --k 10 --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8 || true
@@ -120,56 +117,39 @@ jobs:
             echo "SKIP: update_keywords.py not found"
           fi
 
-      - name: Show keyword heads (debug)
+      - name: Show keyword heads
         run: |
-          echo "== golden_shopping_keywords.csv (head) ==" && head -n 5 golden_shopping_keywords.csv || true
-          echo "== keywords_shopping.csv (head) ==" && head -n 5 keywords_shopping.csv || true
-          echo "== keywords_general.csv (head) ==" && head -n 5 keywords_general.csv || true
-          echo "== keywords.csv (line) ==" && ( [ -f keywords.csv ] && head -n 1 keywords.csv || true )
+          echo "== golden_shopping_keywords.csv ==" && head -n 5 golden_shopping_keywords.csv || true
+          echo "== keywords_shopping.csv ==" && head -n 5 keywords_shopping.csv || true
+          echo "== keywords_general.csv ==" && head -n 5 keywords_general.csv || true
 
-      # === 제품 시드 ===
-      - name: Build products_seed (from Coupang API)
+      - name: Build products_seed (Coupang API if allowed)
         run: |
           if [ -f build_products_seed.py ]; then
             v="${REQUIRE_COUPANG_API:-false}"
             v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
             if [[ "$v" =~ ^(true|1|yes|y|on)$ ]]; then
-              echo "[INFO] REQUIRE_COUPANG_API=$v -> try Coupang API"
               python build_products_seed.py || true
             else
-              echo "[INFO] REQUIRE_COUPANG_API=$v -> skip API and use search fallback"
+              echo "[INFO] skip Coupang API"
             fi
           else
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      - name: Ensure products_seed.csv exists (placeholder with expected headers)
+      - name: Ensure products_seed.csv exists
         run: |
           if [ ! -s products_seed.csv ]; then
             echo "product_name,raw_url,pros,cons,keyword,title,url,image" > products_seed.csv
-            echo "[INFO] created placeholder products_seed.csv (expected headers)"
           fi
 
-      - name: Seed quality check (report + cleaned csv)
-        run: |
-          if [ -f seed_quality_check.py ] && [ -s products_seed.csv ]; then
-            if [ "$(wc -l < products_seed.csv)" -gt 1 ]; then
-              python seed_quality_check.py --write-clean --no-network --max-per-keyword 5 --report .cache/seed_report.md || true
-            else
-              echo "[INFO] skip seed_quality_check: only header (no rows)"
-            fi
-          else
-            echo "[INFO] skip seed_quality_check (missing or empty products_seed.csv)"
-          fi
-
-      # === 로그/회피를 위한 사용폴더 보장 ===
       - name: Ensure .usage exists
         run: |
           mkdir -p .usage
           [ -f .usage/.gitkeep ] || touch .usage/.gitkeep
 
-      # === 일반글 2건 ===
-      - name: Schedule 2 daily posts (10:00 / 17:00 KST)
+      # ===== 일반글 2건
+      - name: Schedule 2 daily posts
         run: |
           if [ -f auto_wp_gpt.py ]; then
             python auto_wp_gpt.py --mode=two-posts
@@ -177,43 +157,63 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      # === 쿠팡글 1건 + 회전 ===
-      - name: Schedule 1 affiliate post (13:00 KST) and rotate keywords
+      # ===== 쿠팡글 1건
+      - name: Schedule 1 affiliate post
         run: |
           set -o pipefail
-          if [ -f affiliate_post.py ]; then
-            python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt || true
-          else
-            echo "SKIP: affiliate_post.py not found" | tee /tmp/affiliate_out.txt
-          fi
-
-          echo "---- Affiliate step tail ----"
+          python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt || true
+          echo "---- Affiliate tail ----"
           tail -n 200 /tmp/affiliate_out.txt || true
           echo "---- used_shopping tail ----"
           tail -n 20 .usage/used_shopping.txt || true
 
-          if grep -q '"post_id"' /tmp/affiliate_out.txt; then
-            echo "[OK] affiliate post created/scheduled. Rotating keywords..."
-            if [ -f rotate_keywords.py ]; then
-              python rotate_keywords.py || true
-            fi
-          else
-            echo "[INFO] Affiliate post not created. See [AFFILIATE] lines above for reason."
-          fi
-
-      # === (선택) 사용 키워드 로그를 레포에 보존 ===
-      - name: Persist used keywords (optional)
+      # ===== 핵심: 방금 사용한 키워드를 CSV에서 즉시 제거
+      - name: Rotate out just-used shopping keyword from CSVs
         run: |
-          if [ "${{ secrets.PERSIST_USAGE }}" = "1" ]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add .usage/used_shopping.txt .usage/.gitkeep || true
-            if git diff --cached --quiet; then
-              echo "[INFO] nothing to commit"
-            else
-              git commit -m "chore(usage): persist used keywords log"
-              git push
-            fi
+          python - << 'PY'
+          import os, csv, sys
+          used = ".usage/used_shopping.txt"
+          if not os.path.exists(used):
+              print("[rotate] used_shopping.txt not found"); sys.exit(0)
+          with open(used, encoding="utf-8") as f:
+              lines=[ln.strip() for ln in f if ln.strip()]
+          if not lines:
+              print("[rotate] no lines"); sys.exit(0)
+          last_kw = lines[-1].split("\t",1)[-1].strip()
+          def drop(fn):
+              if not os.path.exists(fn): return False
+              rows=[]; changed=False
+              with open(fn, encoding="utf-8") as f:
+                  rd=csv.reader(f)
+                  for i,row in enumerate(rd):
+                      if not row: continue
+                      if i==0 and row[0].lower()=="keyword":
+                          rows.append(row); continue
+                      if row[0].strip()!=last_kw:
+                          rows.append(row)
+                      else:
+                          changed=True
+              if changed:
+                  with open(fn,"w",encoding="utf-8",newline="") as f:
+                      csv.writer(f).writerows(rows)
+              print(f"[ROTATE] {fn}: {'removed' if changed else 'no-op'} -> '{last_kw}'")
+              return changed
+          a=drop("golden_shopping_keywords.csv")
+          b=drop("keywords_shopping.csv")
+          if not (a or b):
+              print("[ROTATE] nothing removed (maybe already rotated)")
+          PY
+
+      # ===== 변경된 CSV와 사용로그를 강제 커밋/푸시
+      - name: Commit & push rotated CSVs (+usage log)
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add golden_shopping_keywords.csv keywords_shopping.csv
+          git add -f .usage/used_shopping.txt .usage/.gitkeep
+          if git diff --cached --quiet; then
+            echo "[INFO] nothing to commit"
           else
-            echo "[INFO] PERSIST_USAGE != 1 -> skip persisting used keywords"
+            git commit -m "chore(keywords): rotate used shopping keyword & persist usage log"
+            git push
           fi
