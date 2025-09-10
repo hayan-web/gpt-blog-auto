@@ -1,2 +1,198 @@
 ﻿# ↑↓↓ 이 줄 지우지 말고, 바로 아래 줄부터 YAML이 시작해야 합니다.
+name: run
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 0 * * *"  # 09:30 KST daily
+
+concurrency:
+  group: autopost
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          fetch-tags: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write .env from secrets/vars
+        run: |
+          cat > .env << 'EOF'
+          # ===== WordPress =====
+          WP_URL=${{ secrets.WP_URL }}
+          WP_USER=${{ secrets.WP_USER }}
+          WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
+          WP_TLS_VERIFY=${{ secrets.WP_TLS_VERIFY }}
+          # ===== OpenAI =====
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL=${{ vars.OPENAI_MODEL }}
+          OPENAI_MODEL_LONG=${{ vars.OPENAI_MODEL_LONG }}
+          MAX_TOKENS_BODY=${{ vars.MAX_TOKENS_BODY || 900 }}
+          # ===== Coupang Partners =====
+          COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
+          COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
+          COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
+          COUPANG_SUBID_PREFIX=${{ vars.COUPANG_SUBID_PREFIX || 'auto' }}
+          REQUIRE_COUPANG_API=${{ vars.REQUIRE_COUPANG_API || 1 }}
+          AFFILIATE_TIME_KST=${{ vars.AFFILIATE_TIME_KST || '13:00' }}
+          AFFILIATE_TIMES_KST=${{ vars.AFFILIATE_TIMES_KST || '12:00,16:00,18:00' }}
+          # ===== Posting / Taxonomy =====
+          POST_STATUS=${{ vars.POST_STATUS || 'future' }}
+          KEYWORDS_CSV=${{ vars.KEYWORDS_CSV || 'keywords.csv' }}
+          ALLOW_CREATE_TERMS=${{ vars.ALLOW_CREATE_TERMS || 1 }}
+          EXISTING_CATEGORIES=${{ vars.EXISTING_CATEGORIES || '뉴스,비공개,쇼핑,전체글,게시글,정보,취미' }}
+          # ===== Affiliate Content =====
+          PRODUCTS_SEED_CSV=${{ vars.PRODUCTS_SEED_CSV || 'products_seed.csv' }}
+          DEFAULT_CATEGORY=${{ vars.DEFAULT_CATEGORY || '정보' }}
+          DEFAULT_TAGS=${{ vars.DEFAULT_TAGS }}
+          AFFILIATE_CATEGORY=${{ vars.AFFILIATE_CATEGORY || '쇼핑' }}
+          AFFILIATE_TAGS=${{ vars.AFFILIATE_TAGS }}
+          DISCLOSURE_TEXT=${{ vars.DISCLOSURE_TEXT || '이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.' }}
+          # ===== Ads =====
+          AD_METHOD=${{ vars.AD_METHOD }}
+          AD_SHORTCODE=${{ vars.AD_SHORTCODE }}
+          AD_INSERT_MIDDLE=${{ vars.AD_INSERT_MIDDLE }}
+          # ===== Keywords Auto Update =====
+          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
+          KEYWORDS_K=${{ vars.KEYWORDS_K || 10 }}
+          BAN_KEYWORDS=${{ vars.BAN_KEYWORDS }}
+          BACKUP_OLD_KEYWORDS=${{ vars.BACKUP_OLD_KEYWORDS || 1 }}
+          USER_AGENT=${{ vars.USER_AGENT || 'gpt-blog-keywords/1.2' }}
+          # ===== Cache / Logs =====
+          USAGE_DIR=.usage
+          CACHE_DIR=.cache
+          LLM_LOG_FILENAME=llm.log
+          CACHE_TTL_DEFAULT=86400
+          CACHE_MAX_FILES=500
+          CACHE_DISABLE=${{ vars.CACHE_DISABLE || 0 }}
+          # ===== Switches =====
+          KEYWORD_PICK_MODE=${{ vars.KEYWORD_PICK_MODE }}
+          SEED_PICK_MODE=${{ vars.SEED_PICK_MODE }}
+          USE_IMAGE=${{ vars.USE_IMAGE }}
+          BUTTON_TEXT=${{ vars.BUTTON_TEXT }}
+          # ===== Picker guards & fallbacks =====
+          PERSIST_USAGE=1
+          AFF_USED_BLOCK_DAYS=${{ vars.AFF_USED_BLOCK_DAYS || 30 }}
+          NO_REPEAT_TODAY=1
+          AFF_FALLBACK_KEYWORDS=${{ vars.AFF_FALLBACK_KEYWORDS }}
+          EOF
+
+      - name: Export .env to GITHUB_ENV
+        run: |
+          python - << 'PY'
+          import os
+          from dotenv import dotenv_values
+          env = dotenv_values(".env")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              for k,v in env.items():
+                  if v is None: continue
+                  f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
+          PY
+
+      - name: Check Coupang keys
+        run: |
+          if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
+            echo "[OK] Coupang keys are set."
+          else
+            echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> using fallback (no API deep-links)"
+          fi
+
+      - name: Update keywords (general & shopping)
+        run: |
+          if [ -f update_keywords.py ]; then
+            python update_keywords.py --k 30 --gold 12 --shop-k 30 --shop-gold 12 --days 7 --parallel 8 || true
+          else
+            echo "SKIP: update_keywords.py not found"
+          fi
+
+      - name: Show heads
+        run: |
+          echo "== golden_shopping_keywords.csv ==" && head -n 5 golden_shopping_keywords.csv || true
+          echo "== keywords_shopping.csv ==" && head -n 5 keywords_shopping.csv || true
+          echo "== keywords_general.csv ==" && head -n 5 keywords_general.csv || true
+
+      - name: Build products seed (optional)
+        run: |
+          if [ -f build_products_seed.py ]; then
+            v="${REQUIRE_COUPANG_API:-1}"
+            v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$v" =~ ^(1|true|yes|y|on)$ ]]; then
+              python build_products_seed.py || true
+            else
+              echo "[INFO] skip Coupang API"
+            fi
+          else
+            echo "SKIP: build_products_seed.py not found"
+          fi
+
+      - name: Ensure products_seed.csv header
+        run: |
+          if [ ! -s "${PRODUCTS_SEED_CSV}" ]; then
+            echo "product_name,raw_url,pros,cons,keyword,title,url,image" > "${PRODUCTS_SEED_CSV}"
+          fi
+
+      - name: Ensure usage dir
+        run: |
+          mkdir -p .usage
+          [ -f .usage/.gitkeep ] || touch .usage/.gitkeep
+
+      - name: Post two general articles
+        run: |
+          if [ -f auto_wp_gpt.py ]; then
+            python auto_wp_gpt.py --mode=two-posts
+          else
+            echo "SKIP: auto_wp_gpt.py not found"
+          fi
+
+      - name: Affiliate posts at 12/16/18 KST
+        run: |
+          set -o pipefail
+          if [ -f affiliate_post.py ]; then
+            AFFILIATE_TIME_KST=12:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
+            AFFILIATE_TIME_KST=16:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
+            AFFILIATE_TIME_KST=18:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
+          else
+            echo "SKIP: affiliate_post.py not found"
+          fi
+          echo "---- Affiliate tail ----"
+          tail -n 200 /tmp/affiliate_out.txt || true
+          echo "---- used_shopping tail ----"
+          tail -n 50 .usage/used_shopping.txt || true
+
+      - name: Persist rotated keywords & usage logs
+        if: env.PERSIST_USAGE == '1'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
+          git add -f golden_shopping_keywords.csv keywords_shopping.csv || true
+          git add -f .usage/used_shopping.txt .usage/used_general.txt .usage/.gitkeep || true
+          if git diff --cached --quiet; then
+            echo "[INFO] nothing to commit"
+          else
+            git commit -m "chore: rotate keywords & persist usage logs (auto)"
+            git push
+          fi
+
 # (방금 위 코드블록 전체를 여기 사이에 그대로 붙여넣기)
