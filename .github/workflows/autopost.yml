@@ -1,57 +1,52 @@
-name: Daily 3 Posts (auto keywords + 2 daily + 1 affiliate + rotate)
+name: run
 
 on:
-  schedule:
-    - cron: "5 0 * * *"   # KST 09:05 (UTC 00:05)
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
-
-concurrency:
-  group: autopost
-  cancel-in-progress: true
+  workflow_dispatch:
 
 jobs:
   run:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    runs-on: ubuntu-24.04
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ===== Secrets -> .env (파일로만 쓰고 커밋하지 않음)
-      - name: Write .env from Secrets
+      - name: Write .env
         run: |
           cat > .env << 'EOF'
           # ===== WordPress =====
-          WP_URL=${{ secrets.WP_URL }}
-          WP_USER=${{ secrets.WP_USER }}
-          WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
-          WP_TLS_VERIFY=${{ secrets.WP_TLS_VERIFY }}
+          WP_URL=***
+          WP_USER=***
+          WP_APP_PASSWORD=***
+          WP_TLS_VERIFY=***
           # ===== OpenAI =====
-          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL=${{ secrets.OPENAI_MODEL }}
-          OPENAI_MODEL_LONG=${{ secrets.OPENAI_MODEL_LONG }}
+          OPENAI_API_KEY=***
+          OPENAI_MODEL=***
+          OPENAI_MODEL_LONG=***
           MAX_TOKENS_BODY=900
           # ===== Coupang Partners =====
-          COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
-          COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
-          COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
-          COUPANG_SUBID_PREFIX=${{ secrets.COUPANG_SUBID_PREFIX }}
-          REQUIRE_COUPANG_API=${{ secrets.REQUIRE_COUPANG_API }}
-          AFFILIATE_TIME_KST=${{ secrets.AFFILIATE_TIME_KST }}
+          COUPANG_ACCESS_KEY=***
+          COUPANG_SECRET_KEY=***
+          COUPANG_CHANNEL_ID=***
+          COUPANG_SUBID_PREFIX=***
+          REQUIRE_COUPANG_API=***
+          AFFILIATE_TIME_KST=***
           # ===== Posting / Taxonomy =====
           POST_STATUS=future
           KEYWORDS_CSV=keywords.csv
-          ALLOW_CREATE_TERMS=${{ secrets.ALLOW_CREATE_TERMS }}
+          ALLOW_CREATE_TERMS=***
           EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
           # ===== Affiliate Content =====
           PRODUCTS_SEED_CSV=products_seed.csv
@@ -61,16 +56,16 @@ jobs:
           AFFILIATE_TAGS=
           DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.
           # ===== Ads =====
-          AD_METHOD=${{ secrets.AD_METHOD }}
-          AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
-          AD_INSERT_MIDDLE=${{ secrets.AD_INSERT_MIDDLE }}
+          AD_METHOD=***
+          AD_SHORTCODE=***
+          AD_INSERT_MIDDLE=***
           # ===== Keywords Auto Update =====
-          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
-          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
-          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
+          NEWSAPI_KEY=***
+          NAVER_CLIENT_ID=***
+          NAVER_CLIENT_SECRET=***
           KEYWORDS_K=10
-          BAN_KEYWORDS=${{ secrets.BAN_KEYWORDS }}
-          BACKUP_OLD_KEYWORDS=true
+          BAN_KEYWORDS=
+          BACKUP_OLD_KEYWORDS=***
           USER_AGENT=gpt-blog-keywords/1.2
           # ===== Cache / Logs =====
           USAGE_DIR=.usage
@@ -78,18 +73,18 @@ jobs:
           LLM_LOG_FILENAME=llm.log
           CACHE_TTL_DEFAULT=86400
           CACHE_MAX_FILES=500
-          CACHE_DISABLE=false
+          CACHE_DISABLE=***
           # ===== Switches =====
-          KEYWORD_PICK_MODE=${{ secrets.KEYWORD_PICK_MODE }}
-          SEED_PICK_MODE=${{ secrets.SEED_PICK_MODE }}
-          USE_IMAGE=${{ secrets.USE_IMAGE }}
-          BUTTON_TEXT=${{ secrets.BUTTON_TEXT }}
-          # ===== Persist (항상 커밋하도록 기본값 1)
+          KEYWORD_PICK_MODE=***
+          SEED_PICK_MODE=***
+          USE_IMAGE=***
+          BUTTON_TEXT=***
+          # ===== Persist / Filters =====
           PERSIST_USAGE=1
+          AFF_USED_BLOCK_DAYS=30
           EOF
 
-      # .env를 GITHUB_ENV로 복사(쉘 확장 없이 안전)
-      - name: Export .env to GITHUB_ENV
+      - name: Export .env -> GITHUB_ENV
         run: |
           python - << 'PY'
           import os
@@ -101,7 +96,7 @@ jobs:
                   f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
           PY
 
-      - name: Preflight
+      - name: Validate Coupang keys
         run: |
           if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
             echo "[OK] Coupang keys are set."
@@ -109,26 +104,81 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 검색/딥링크는 폴백 사용"
           fi
 
-      - name: Update keywords (일반 + 쇼핑)
+      - name: Update keywords (news & shopping)
         run: |
           if [ -f update_keywords.py ]; then
-            python update_keywords.py --k 10 --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8 || true
+            python update_keywords.py --k ${KEYWORDS_K:-10} --gold 5 --shop-k 12 --shop-gold 5 --days 3 --parallel 8 || true
           else
             echo "SKIP: update_keywords.py not found"
           fi
 
-      - name: Show keyword heads
+      - name: Deprioritize recently used shopping keywords (30d; avoid same-day)
         run: |
-          echo "== golden_shopping_keywords.csv ==" && head -n 5 golden_shopping_keywords.csv || true
-          echo "== keywords_shopping.csv ==" && head -n 5 keywords_shopping.csv || true
-          echo "== keywords_general.csv ==" && head -n 5 keywords_general.csv || true
+          python - << 'PY'
+          import csv, os, datetime as dt
+          def load_list(path):
+              if not os.path.exists(path): return []
+              with open(path, encoding='utf-8-sig') as f:
+                  rd=csv.reader(f)
+                  rows=[r[0].strip() for r in rd if r]
+              return [r for r in rows[1:] if r] if rows and rows[0].lower()=="keyword" else rows
+          def write_list(path, items):
+              with open(path,'w',encoding='utf-8',newline='') as f:
+                  wr=csv.writer(f); wr.writerow(['keyword'])
+                  for it in items: wr.writerow([it])
+          used_file=os.environ.get('USAGE_DIR','.usage')+'/used_shopping.txt'
+          today=dt.date.today()
+          last={}
+          used_today=set()
+          if os.path.exists(used_file):
+              with open(used_file, encoding='utf-8') as f:
+                  for ln in f:
+                      ln=ln.strip()
+                      if not ln: continue
+                      try:
+                          d_s, kw = ln.split('\t',1)
+                          d=dt.date.fromisoformat(d_s[:10])
+                      except Exception:
+                          continue
+                      last[kw]=max(last.get(kw, dt.date(1970,1,1)), d)
+                      if d==today: used_today.add(kw)
+          BLOCK=int(os.environ.get('AFF_USED_BLOCK_DAYS','30'))
+          def score(kw): return (today - last.get(kw, dt.date(1970,1,1))).days
+          def process(fn):
+              if not os.path.exists(fn): return
+              items=load_list(fn)
+              if not items: return
+              # unique
+              seen=set(); items=[x for x in items if not (x in seen or seen.add(x))]
+              # drop same-day
+              base=[k for k in items if k not in used_today]
+              if not base: base=items[:]
+              fresh=[k for k in base if score(k)>=BLOCK]
+              stale=[k for k in base if score(k)< BLOCK]
+              fresh.sort(key=score, reverse=True)
+              stale.sort(key=score, reverse=True)
+              new=fresh+stale
+              if new!=items:
+                  write_list(fn,new)
+                  print(f"[POSTPROCESS] {fn} ->")
+                  for k in new[:10]: print("  -",k)
+              else:
+                  print(f"[POSTPROCESS] {fn}: no change")
+          for fn in ("golden_shopping_keywords.csv","keywords_shopping.csv"):
+              process(fn)
+          PY
 
-      - name: Build products_seed (Coupang API if allowed)
+      - name: Show tops
+        run: |
+          for f in golden_shopping_keywords.csv keywords_shopping.csv keywords_general.csv; do
+            [ -f "$f" ] && (echo "== $f =="; head -n 12 "$f") || true
+          done
+
+      - name: Build products seed (if required)
         run: |
           if [ -f build_products_seed.py ]; then
-            v="${REQUIRE_COUPANG_API:-false}"
-            v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
-            if [[ "$v" =~ ^(true|1|yes|y|on)$ ]]; then
+            v="${REQUIRE_COUPANG_API:-0}"; v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
+            if [[ "$v" =~ ^(1|true|yes|y|on)$ ]]; then
               python build_products_seed.py || true
             else
               echo "[INFO] skip Coupang API"
@@ -137,28 +187,24 @@ jobs:
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      - name: Ensure products_seed.csv exists
+      - name: Ensure products_seed.csv
         run: |
-          if [ ! -s products_seed.csv ]; then
-            echo "product_name,raw_url,pros,cons,keyword,title,url,image" > products_seed.csv
-          fi
+          [ -s products_seed.csv ] || echo "product_name,raw_url,pros,cons,keyword,title,url,image" > products_seed.csv
 
-      - name: Ensure .usage exists
+      - name: Ensure usage dir
         run: |
           mkdir -p .usage
           [ -f .usage/.gitkeep ] || touch .usage/.gitkeep
 
-      # ===== 일반글 2건
-      - name: Schedule 2 daily posts
+      - name: Two general posts
         run: |
-          if [ -f auto_wp_gpt.py ]; then
-            python auto_wp_gpt.py --mode=two-posts
+          if [ -f ***gpt.py ]; then
+            python ***gpt.py --mode=two-posts
           else
-            echo "SKIP: auto_wp_gpt.py not found"
+            echo "SKIP: ***gpt.py not found"
           fi
 
-      # ===== 쿠팡글 1건
-      - name: Schedule 1 affiliate post
+      - name: Affiliate post
         run: |
           set -o pipefail
           python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt || true
@@ -167,18 +213,15 @@ jobs:
           echo "---- used_shopping tail ----"
           tail -n 20 .usage/used_shopping.txt || true
 
-      # ===== 핵심: 방금 사용한 키워드를 CSV에서 즉시 제거
-      - name: Rotate out just-used shopping keyword from CSVs
+      - name: Rotate chosen keyword out (idempotent safety)
         run: |
           python - << 'PY'
-          import os, csv, sys
+          import os, csv
           used = ".usage/used_shopping.txt"
-          if not os.path.exists(used):
-              print("[rotate] used_shopping.txt not found"); sys.exit(0)
+          if not os.path.exists(used): raise SystemExit(0)
           with open(used, encoding="utf-8") as f:
               lines=[ln.strip() for ln in f if ln.strip()]
-          if not lines:
-              print("[rotate] no lines"); sys.exit(0)
+          if not lines: raise SystemExit(0)
           last_kw = lines[-1].split("\t",1)[-1].strip()
           def drop(fn):
               if not os.path.exists(fn): return False
@@ -187,25 +230,19 @@ jobs:
                   rd=csv.reader(f)
                   for i,row in enumerate(rd):
                       if not row: continue
-                      if i==0 and row[0].lower()=="keyword":
-                          rows.append(row); continue
-                      if row[0].strip()!=last_kw:
-                          rows.append(row)
-                      else:
-                          changed=True
+                      if i==0 and row[0].lower()=="keyword": rows.append(row); continue
+                      if row[0].strip()!=last_kw: rows.append(row)
+                      else: changed=True
               if changed:
                   with open(fn,"w",encoding="utf-8",newline="") as f:
                       csv.writer(f).writerows(rows)
               print(f"[ROTATE] {fn}: {'removed' if changed else 'no-op'} -> '{last_kw}'")
-              return changed
-          a=drop("golden_shopping_keywords.csv")
-          b=drop("keywords_shopping.csv")
-          if not (a or b):
-              print("[ROTATE] nothing removed (maybe already rotated)")
+          for fn in golden_shopping_keywords.csv, keywords_shopping.csv:
+              drop(fn)
           PY
 
-      # ===== 변경된 CSV와 사용로그를 강제 커밋/푸시
-      - name: Commit & push rotated CSVs (+usage log)
+      - name: Commit keyword order & usage (force even if ignored)
+        if: env.PERSIST_USAGE == '1'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -214,6 +251,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "[INFO] nothing to commit"
           else
-            git commit -m "chore(keywords): rotate used shopping keyword & persist usage log"
+            git commit -m "chore(keywords): reorder by recency, rotate used & persist usage log"
             git push
           fi
