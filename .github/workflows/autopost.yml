@@ -2,8 +2,8 @@ name: run
 
 on:
   workflow_dispatch:
-  schedule:
-    # - cron: "0 3 * * *"  # (UTC) 필요 시 활성화
+  # schedule:
+  #   - cron: "0 3 * * *"  # (UTC) 필요 시 활성화
 
 jobs:
   run:
@@ -113,7 +113,6 @@ jobs:
       - name: Update keywords (general & shopping)
         run: |
           if [ -f update_keywords.py ]; then
-            # 모집폭 확대: 쇼핑 키워드가 2개만 생성되는 현상 완화
             python update_keywords.py --k ${KEYWORDS_K} --gold 5 --shop-k 20 --shop-gold 8 --days 7 --parallel 8 || true
           else
             echo "SKIP: update_keywords.py not found"
