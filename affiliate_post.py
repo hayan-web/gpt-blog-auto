@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-affiliate_post.py — Coupang Partners 글 자동 포스팅 (상단 고지문/CTA x2, 하단 CTA x2, 템플릿 고정)
-- 상단 고지문(굵게/강조) + 상단 CTA 2개 + 카테고리 이동 버튼 + 내부광고(상단)
-- 본문 섹션: 고려요소 → 주요 특징 → 가격/가성비 → (내부광고) → 장단점 → 이런 분께 추천
-- 하단 CTA 2개 + 카테고리 이동 버튼
+affiliate_post.py — Coupang Partners 글 자동 포스팅
+- 상단 고지문(굵게/강조)
+- 상단 CTA 2개 + 카테고리 버튼 + 내부광고(상단)
+- 본문 섹션: 고려요소 → 주요 특징 → 가격/가성비 → 장단점 → 이런 분께 추천
+- 중간 CTA 2개 + 카테고리 버튼 + 내부광고(중간)
+- 하단 CTA 2개 + 카테고리 버튼
 - URL 없을 때 쿠팡 검색 페이지 폴백
-- 골든키워드 회전/사용로그/예약 충돌 회피(기존 유지)
+- 골든키워드 회전/사용로그/예약 충돌 회피
+- 스케줄: --mode=aff-1(기본, 단일 시간) / --mode=aff-3(12:00,16:00,18:00 KST 3개 예약)
 """
-import os, re, csv, json, html
+import os, re, csv, json, html, argparse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List
+from urllib.parse import quote, quote_plus
 import requests
 from dotenv import load_dotenv
-from urllib.parse import quote  # 카테고리 폴백 URL용
 load_dotenv()
 
 # ===== ENV =====
@@ -32,8 +35,28 @@ BUTTON_TEXT=(os.getenv("BUTTON_TEXT") or "쿠팡에서 최저가 확인하기").
 BUTTON2_TEXT=(os.getenv("BUTTON2_TEXT") or "제품 보러가기").strip()
 BUTTON2_URL=(os.getenv("BUTTON2_URL") or "").strip()
 
+# 광고 스니펫 (AD_SHORTCODE 있으면 그걸 우선 사용)
+AD_SHORTCODE=(os.getenv("AD_SHORTCODE") or "").strip()
+AD_HTML_DEFAULT = """
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7409421510734308"
+     crossorigin="anonymous"></script>
+<!-- 25.06.03 -->
+<ins class="adsbygoogle"
+     style="display:block"
+     data-ad-client="ca-pub-7409421510734308"
+     data-ad-slot="9228101213"
+     data-ad-format="auto"
+     data-full-width-responsive="true"></ins>
+<script>
+     (adsbygoogle = window.adsbygoogle || []).push({});
+</script>
+""".strip()
+
 USE_IMAGE=((os.getenv("USE_IMAGE") or "").strip().lower() in ("1","true","y","yes","on"))
+# 단일 시간 모드(aff-1) 기본값
 AFFILIATE_TIME_KST=(os.getenv("AFFILIATE_TIME_KST") or "13:00").strip()
+# 3개 시간 모드(aff-3) 기본값 (쉼표로 전달 가능: "12:00,16:00,18:00")
+AFFILIATE_TIMES_KST=(os.getenv("AFFILIATE_TIMES_KST") or "12:00,16:00,18:00").strip()
 
 USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.8"
 USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
@@ -43,7 +66,6 @@ NO_REPEAT_TODAY=(os.getenv("NO_REPEAT_TODAY") or "1").lower() in ("1","true","y"
 AFF_USED_BLOCK_DAYS=int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")
 
 PRODUCTS_SEED_CSV=(os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv")
-FALLBACK_KWS=os.getenv("AFF_FALLBACK_KEYWORDS") or "휴대용 선풍기, 제습기, 무선 청소기"
 
 REQ_HEADERS={
     "User-Agent": USER_AGENT,
@@ -81,12 +103,12 @@ def _wp_future_exists_around(when_gmt_dt: datetime, tol_min: int = 2) -> bool:
             return True
     return False
 
-def _slot_affiliate()->str:
-    hh, mm = [int(x) for x in (AFFILIATE_TIME_KST.split(":")+["0"])[:2]]
+def _calc_slot_for_time_str(kst_hhmm:str)->str:
+    hh, mm = [int(x) for x in (kst_hhmm.split(":")+["0"])[:2]]
     now = _now_kst()
     tgt = now.replace(hour=hh,minute=mm,second=0,microsecond=0)
     if tgt <= now: tgt += timedelta(days=1)
-    for _ in range(7):
+    for _ in range(10):
         utc = tgt.astimezone(timezone.utc)
         if _wp_future_exists_around(utc, tol_min=2):
             print(f"[SLOT] conflict at {utc.strftime('%Y-%m-%dT%H:%M:%S')}Z -> push +1d")
@@ -95,6 +117,14 @@ def _slot_affiliate()->str:
     final = tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     print(f"[SLOT] scheduled UTC = {final}")
     return final
+
+def _calc_slots_for_list(kst_list:List[str])->List[str]:
+    out=[]
+    for t in kst_list:
+        t=t.strip()
+        if not t: continue
+        out.append(_calc_slot_for_time_str(t))
+    return out
 
 # ===== USED LOG =====
 def _ensure_usage_dir(): os.makedirs(USAGE_DIR, exist_ok=True)
@@ -156,14 +186,9 @@ def pick_affiliate_keyword()->str:
     shop=_read_col_csv("keywords_shopping.csv")
     pool=[k for k in gold+shop if k and (k not in used_block)]
     if NO_REPEAT_TODAY:
-        removed=[k for k in pool if k in used_today]
-        if removed: print(f"[FILTER] removed (used today): {removed[:8]}")
         pool=[k for k in pool if k not in used_today]
     if pool: return pool[0].strip()
-    fb=[x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
-    if fb:
-        print(f"[AFFILIATE] fallback -> '{fb[0]}'")
-        return fb[0]
+    # 안전 폴백
     return "휴대용 선풍기"
 
 def resolve_product_url(keyword:str)->str:
@@ -182,7 +207,6 @@ def resolve_product_url(keyword:str)->str:
         except Exception as e:
             print(f"[SEED][WARN] read error: {e}")
     # 2) 안전 폴백: 쿠팡 검색
-    from urllib.parse import quote_plus
     return f"https://www.coupang.com/np/search?q={quote_plus(keyword)}"
 
 # ===== WP =====
@@ -196,31 +220,26 @@ def _ensure_term(kind:str, name:str)->int:
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
     r.raise_for_status(); return int(r.json()["id"])
 
-def _category_url_for(name:str)->str:
-    """카테고리 링크를 WP API에서 찾고, 실패 시 /category/<이름>/ 로 폴백."""
+def _category_url_from_term_id(term_id:int, fallback_name:str)->str:
+    # 가능한 경우 WordPress가 주는 링크 사용
     try:
-        r = requests.get(
-            f"{WP_URL}/wp-json/wp/v2/categories",
-            params={"search": name, "per_page": 50, "context":"view"},
-            headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=12
-        )
+        r=requests.get(f"{WP_URL}/wp-json/wp/v2/categories/{term_id}",
+                       params={"context":"view"},
+                       auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
         r.raise_for_status()
-        items = r.json()
-        # 완전 일치 우선
-        for it in items:
-            if (it.get("name") or "").strip() == name:
-                link = (it.get("link") or "").strip()
-                if link: return link
-        # 아무거나 있으면 첫번째
-        if items and (items[0].get("link") or "").strip():
-            return items[0]["link"].strip()
-    except Exception as e:
-        print(f"[CAT][WARN] fallback category url for '{name}': {type(e).__name__}: {e}")
-    # 폴백: 인코딩 포함
-    return f"{WP_URL}/category/{quote(name)}/"
+        js=r.json()
+        if isinstance(js, dict):
+            if js.get("link"): return js["link"]
+            if js.get("slug"): return f"{WP_URL}/category/{quote(js['slug'])}/"
+    except Exception:
+        pass
+    # 폴백: 한글 name을 인코딩해서 구성
+    return f"{WP_URL}/category/{quote((fallback_name or '').strip())}/"
 
 def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict:
     cat_id=_ensure_term("categories", category or DEFAULT_CATEGORY)
+    cat_url=_category_url_from_term_id(cat_id, category or DEFAULT_CATEGORY)
+    print(f"[CTA] category='{category or DEFAULT_CATEGORY}', category_url={cat_url}")
     tag_ids=[]
     if tag:
         try:
@@ -239,7 +258,11 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict
     }
     r=requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
-    r.raise_for_status(); return r.json()
+    r.raise_for_status()
+    out=r.json()
+    # 카테고리 링크는 본문 렌더 전에 알아야 하므로, 호출자에서 미리 받아 사용하도록 설계했음.
+    out["_category_url"]=cat_url
+    return out
 
 # ===== TEMPLATE =====
 def _css_block()->str:
@@ -247,14 +270,14 @@ def _css_block()->str:
 <style>
 .aff-wrap{font-family:inherit}
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #ef4444;background:#fff1f2;color:#991b1b;font-weight:700;border-radius:10px}
-.aff-cta{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 14px}
+.aff-cta{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 22px}
 .aff-cta a{display:inline-block;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700}
 .aff-cta a.btn-primary{background:#2563eb;color:#fff}
 .aff-cta a.btn-primary:hover{opacity:.95}
 .aff-cta a.btn-secondary{background:#fff;color:#2563eb;border:2px solid #2563eb}
 .aff-cta a.btn-secondary:hover{background:#eff6ff}
-.aff-cta a.btn-tertiary{background:#0f172a;color:#fff;border:0}
-.aff-cta a.btn-tertiary:hover{opacity:.92}
+.aff-cta a.btn-category{background:#111827;color:#fff}
+.aff-cta a.btn-category:hover{opacity:.95}
 .aff-section h2{margin:28px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
 .aff-section h3{margin:18px 0 10px;font-size:1.12rem}
 .aff-section p{line-height:1.9;margin:0 0 14px;color:#222}
@@ -264,68 +287,49 @@ def _css_block()->str:
 .aff-table th,.aff-table td{border:1px solid #e2e8f0;padding:10px;text-align:left}
 .aff-table thead th{background:#f1f5f9}
 .aff-note{font-style:italic;color:#334155;margin-top:6px}
-.aff-ad{margin:12px 0 22px}
+.aff-ad{margin:18px 0}
 </style>
 """.strip()
 
-def _adsense_block()->str:
-    # 내부광고(애드센스): 요청하신 코드 그대로 삽입
-    return """
-<div class="aff-ad">
-<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7409421510734308"
-     crossorigin="anonymous"></script>
-<!-- 25.06.03 -->
-<ins class="adsbygoogle"
-     style="display:block"
-     data-ad-client="ca-pub-7409421510734308"
-     data-ad-slot="9228101213"
-     data-ad-format="auto"
-     data-full-width-responsive="true"></ins>
-<script>
-     (adsbygoogle = window.adsbygoogle || []).push({});
-</script>
-</div>
-""".strip()
-
-def _cta_html(url_main:str, url_alt:str, category_url:str, category_name:str)->str:
+def _cta_html(url_main:str, url_alt:str, category_url:str)->str:
     btn1 = html.escape(BUTTON_TEXT or "쿠팡에서 최저가 확인하기")
     btn2 = html.escape(BUTTON2_TEXT or "제품 보러가기")
-    btn3 = html.escape(f"{category_name} 글 모아보기")
     u1 = html.escape(url_main or "#")
-    u2 = html.escape(url_alt or url_main or "#")
-    uc = html.escape(category_url or "#")
+    u2 = html.escape((url_alt or url_main) or "#")
+    ucat = html.escape(category_url or "#")
     return f"""
   <div class="aff-cta">
     <a class="btn-primary" href="{u1}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn1}">{btn1}</a>
     <a class="btn-secondary" href="{u2}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn2}">{btn2}</a>
-    <a class="btn-tertiary" href="{uc}" aria-label="{btn3}">{btn3}</a>
+    <a class="btn-category" href="{ucat}" target="_blank" rel="noopener" aria-label="카테고리로 이동">카테고리로 이동</a>
   </div>
 """.rstrip()
 
-def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str="쇼핑")->str:
+def _ad_html()->str:
+    return f'<div class="aff-ad">{"<br/>".join([AD_SHORTCODE or AD_HTML_DEFAULT])}</div>'
+
+def render_affiliate_html(keyword:str, url:str, category_url:str, image:str="")->str:
     disc = html.escape(DISCLOSURE_TEXT)
     kw_esc = html.escape(keyword)
     url_alt = BUTTON2_URL if BUTTON2_URL else url
-    category_url = _category_url_for(category_name)
 
     img_html = ""
     if image and USE_IMAGE:
         img_html = f'<figure style="margin:0 0 18px"><img src="{html.escape(image)}" alt="{kw_esc}" loading="lazy" decoding="async" style="max-width:100%;height:auto;border-radius:12px"></figure>'
 
-    # 상단: 고지문 → 내부광고 → CTA(2+카테고리)
-    top_block = f"""
-  <p class="aff-disclosure"><strong>{disc}</strong></p>
-  {_adsense_block()}
-  {_cta_html(url, url_alt, category_url, category_name)}
-  {img_html}
-""".rstrip()
-
-    mid_ads = _adsense_block()
+    top_cta = _cta_html(url, url_alt, category_url)
+    mid_cta = _cta_html(url, url_alt, category_url)
+    bot_cta = _cta_html(url, url_alt, category_url)
 
     return f"""
 {_css_block()}
 <div class="aff-wrap aff-section">
-  {top_block}
+  <p class="aff-disclosure"><strong>{disc}</strong></p>
+
+  {top_cta}
+  {_ad_html()}
+
+  {img_html}
 
   <h2>{kw_esc} 선택 시 고려해야 할 요소</h2>
   <p>{kw_esc}를(을) 선택할 때는 용도·공간·소음·관리 편의·예산의 균형을 먼저 잡아야 합니다. 이하 1분 체크리스트로 빠르게 감만 잡고 상세 섹션에서 구체화하세요.</p>
@@ -356,7 +360,8 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
   </table>
   <p class="aff-note">* 시즌 아이템은 타이밍이 가성비를 좌우합니다.</p>
 
-  {mid_ads}
+  {mid_cta}
+  {_ad_html()}
 
   <h2>장단점</h2>
   <h3>장점</h3>
@@ -378,7 +383,7 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
     <li>선물/비상용 등 무난한 선택지를 찾는 분</li>
   </ul>
 
-  {_cta_html(url, url_alt, category_url, category_name)}
+  {bot_cta}
 </div>
 """.strip()
 
@@ -398,23 +403,52 @@ def rotate_sources(kw:str):
     if not changed:
         print("[ROTATE] nothing removed (maybe already rotated)")
 
-def run_once():
-    print(f"[USAGE] NO_REPEAT_TODAY={NO_REPEAT_TODAY}, AFF_USED_BLOCK_DAYS={AFF_USED_BLOCK_DAYS}")
+def _post_once_for_slot(slot_utc:str):
     kw = pick_affiliate_keyword()
     url = resolve_product_url(kw)
-    when_gmt = _slot_affiliate()
     title = build_title(kw)
-    body = render_affiliate_html(kw, url, image="", category_name=DEFAULT_CATEGORY)
-    res = post_wp(title, body, when_gmt, category=DEFAULT_CATEGORY, tag=kw)
+    # 미리 카테고리 링크를 구하려면 term id가 필요 → post_wp 내부에서 구해서 반환에 넣어둠
+    body = render_affiliate_html(kw, url, category_url=f"{WP_URL}/category/{quote(DEFAULT_CATEGORY)}/")
+    # 실제 포스팅하면서 정확한 카테고리 URL을 취득
+    res = post_wp(title, body, slot_utc, category=DEFAULT_CATEGORY, tag=kw)
     link = res.get("link")
-    print(json.dumps({"post_id":res.get("id") or res.get("post") or 0, "link": link, "status":res.get("status"), "date_gmt":res.get("date_gmt"), "title": title, "keyword": kw}, ensure_ascii=False))
+    print(json.dumps({
+        "post_id": res.get("id") or res.get("post") or 0,
+        "link": link,
+        "status": res.get("status"),
+        "date_gmt": res.get("date_gmt"),
+        "title": title,
+        "keyword": kw
+    }, ensure_ascii=False))
     _mark_used(kw)
     rotate_sources(kw)
+
+def run_mode_aff1():
+    slot=_calc_slot_for_time_str(AFFILIATE_TIME_KST)
+    _post_once_for_slot(slot)
+
+def run_mode_aff3():
+    raw = [s.strip() for s in AFFILIATE_TIMES_KST.split(",") if s.strip()]
+    times = raw if raw else ["12:00","16:00","18:00"]
+    slots=_calc_slots_for_list(times)
+    for s in slots:
+        _post_once_for_slot(s)
 
 def main():
     if not (WP_URL and WP_USER and WP_APP_PASSWORD):
         raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
-    run_once()
+
+    parser=argparse.ArgumentParser()
+    parser.add_argument("--mode", default="aff-1", choices=["aff-1","aff-3"],
+                        help="aff-1: 단일 시간(AFFILIATE_TIME_KST), aff-3: 12/16/18 KST(또는 AFFILIATE_TIMES_KST)")
+    args=parser.parse_args()
+
+    print(f"[USAGE] NO_REPEAT_TODAY={NO_REPEAT_TODAY}, AFF_USED_BLOCK_DAYS={AFF_USED_BLOCK_DAYS}")
+
+    if args.mode=="aff-3":
+        run_mode_aff3()
+    else:
+        run_mode_aff1()
 
 if __name__=="__main__":
     main()
