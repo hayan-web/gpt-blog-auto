@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 affiliate_post.py — Coupang Partners 글 자동 포스팅 (상단 고지문/CTA x2, 하단 CTA x2, 템플릿 고정)
-- 상단 고지문(굵게/강조) + 상단 CTA 2개
-- 본문 섹션: 고려요소 → 주요 특징 → 가격/가성비 → 장단점 → 이런 분께 추천
-- 하단 CTA 2개
+- 상단 고지문(굵게/강조) + 상단 CTA 2개 + 카테고리 이동 버튼 + 내부광고(상단)
+- 본문 섹션: 고려요소 → 주요 특징 → 가격/가성비 → (내부광고) → 장단점 → 이런 분께 추천
+- 하단 CTA 2개 + 카테고리 이동 버튼
 - URL 없을 때 쿠팡 검색 페이지 폴백
 - 골든키워드 회전/사용로그/예약 충돌 회피(기존 유지)
 """
@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from typing import List
 import requests
 from dotenv import load_dotenv
+from urllib.parse import quote  # 카테고리 폴백 URL용
 load_dotenv()
 
 # ===== ENV =====
@@ -34,7 +35,7 @@ BUTTON2_URL=(os.getenv("BUTTON2_URL") or "").strip()
 USE_IMAGE=((os.getenv("USE_IMAGE") or "").strip().lower() in ("1","true","y","yes","on"))
 AFFILIATE_TIME_KST=(os.getenv("AFFILIATE_TIME_KST") or "13:00").strip()
 
-USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.7"
+USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.8"
 USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
 USED_FILE=os.path.join(USAGE_DIR,"used_shopping.txt")
 
@@ -195,6 +196,29 @@ def _ensure_term(kind:str, name:str)->int:
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
     r.raise_for_status(); return int(r.json()["id"])
 
+def _category_url_for(name:str)->str:
+    """카테고리 링크를 WP API에서 찾고, 실패 시 /category/<이름>/ 로 폴백."""
+    try:
+        r = requests.get(
+            f"{WP_URL}/wp-json/wp/v2/categories",
+            params={"search": name, "per_page": 50, "context":"view"},
+            headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=12
+        )
+        r.raise_for_status()
+        items = r.json()
+        # 완전 일치 우선
+        for it in items:
+            if (it.get("name") or "").strip() == name:
+                link = (it.get("link") or "").strip()
+                if link: return link
+        # 아무거나 있으면 첫번째
+        if items and (items[0].get("link") or "").strip():
+            return items[0]["link"].strip()
+    except Exception as e:
+        print(f"[CAT][WARN] fallback category url for '{name}': {type(e).__name__}: {e}")
+    # 폴백: 인코딩 포함
+    return f"{WP_URL}/category/{quote(name)}/"
+
 def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict:
     cat_id=_ensure_term("categories", category or DEFAULT_CATEGORY)
     tag_ids=[]
@@ -223,12 +247,14 @@ def _css_block()->str:
 <style>
 .aff-wrap{font-family:inherit}
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #ef4444;background:#fff1f2;color:#991b1b;font-weight:700;border-radius:10px}
-.aff-cta{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 22px}
+.aff-cta{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 14px}
 .aff-cta a{display:inline-block;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700}
 .aff-cta a.btn-primary{background:#2563eb;color:#fff}
 .aff-cta a.btn-primary:hover{opacity:.95}
 .aff-cta a.btn-secondary{background:#fff;color:#2563eb;border:2px solid #2563eb}
 .aff-cta a.btn-secondary:hover{background:#eff6ff}
+.aff-cta a.btn-tertiary{background:#0f172a;color:#fff;border:0}
+.aff-cta a.btn-tertiary:hover{opacity:.92}
 .aff-section h2{margin:28px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
 .aff-section h3{margin:18px 0 10px;font-size:1.12rem}
 .aff-section p{line-height:1.9;margin:0 0 14px;color:#222}
@@ -238,38 +264,68 @@ def _css_block()->str:
 .aff-table th,.aff-table td{border:1px solid #e2e8f0;padding:10px;text-align:left}
 .aff-table thead th{background:#f1f5f9}
 .aff-note{font-style:italic;color:#334155;margin-top:6px}
+.aff-ad{margin:12px 0 22px}
 </style>
 """.strip()
 
-def _cta_html(url_main:str, url_alt:str)->str:
+def _adsense_block()->str:
+    # 내부광고(애드센스): 요청하신 코드 그대로 삽입
+    return """
+<div class="aff-ad">
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7409421510734308"
+     crossorigin="anonymous"></script>
+<!-- 25.06.03 -->
+<ins class="adsbygoogle"
+     style="display:block"
+     data-ad-client="ca-pub-7409421510734308"
+     data-ad-slot="9228101213"
+     data-ad-format="auto"
+     data-full-width-responsive="true"></ins>
+<script>
+     (adsbygoogle = window.adsbygoogle || []).push({});
+</script>
+</div>
+""".strip()
+
+def _cta_html(url_main:str, url_alt:str, category_url:str, category_name:str)->str:
     btn1 = html.escape(BUTTON_TEXT or "쿠팡에서 최저가 확인하기")
     btn2 = html.escape(BUTTON2_TEXT or "제품 보러가기")
+    btn3 = html.escape(f"{category_name} 글 모아보기")
     u1 = html.escape(url_main or "#")
     u2 = html.escape(url_alt or url_main or "#")
+    uc = html.escape(category_url or "#")
     return f"""
   <div class="aff-cta">
     <a class="btn-primary" href="{u1}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn1}">{btn1}</a>
     <a class="btn-secondary" href="{u2}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn2}">{btn2}</a>
+    <a class="btn-tertiary" href="{uc}" aria-label="{btn3}">{btn3}</a>
   </div>
 """.rstrip()
 
-def render_affiliate_html(keyword:str, url:str, image:str="")->str:
+def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str="쇼핑")->str:
     disc = html.escape(DISCLOSURE_TEXT)
     kw_esc = html.escape(keyword)
     url_alt = BUTTON2_URL if BUTTON2_URL else url
+    category_url = _category_url_for(category_name)
 
     img_html = ""
     if image and USE_IMAGE:
         img_html = f'<figure style="margin:0 0 18px"><img src="{html.escape(image)}" alt="{kw_esc}" loading="lazy" decoding="async" style="max-width:100%;height:auto;border-radius:12px"></figure>'
 
+    # 상단: 고지문 → 내부광고 → CTA(2+카테고리)
+    top_block = f"""
+  <p class="aff-disclosure"><strong>{disc}</strong></p>
+  {_adsense_block()}
+  {_cta_html(url, url_alt, category_url, category_name)}
+  {img_html}
+""".rstrip()
+
+    mid_ads = _adsense_block()
+
     return f"""
 {_css_block()}
 <div class="aff-wrap aff-section">
-  <p class="aff-disclosure"><strong>{disc}</strong></p>
-
-  {_cta_html(url, url_alt)}
-
-  {img_html}
+  {top_block}
 
   <h2>{kw_esc} 선택 시 고려해야 할 요소</h2>
   <p>{kw_esc}를(을) 선택할 때는 용도·공간·소음·관리 편의·예산의 균형을 먼저 잡아야 합니다. 이하 1분 체크리스트로 빠르게 감만 잡고 상세 섹션에서 구체화하세요.</p>
@@ -300,6 +356,8 @@ def render_affiliate_html(keyword:str, url:str, image:str="")->str:
   </table>
   <p class="aff-note">* 시즌 아이템은 타이밍이 가성비를 좌우합니다.</p>
 
+  {mid_ads}
+
   <h2>장단점</h2>
   <h3>장점</h3>
   <ul>
@@ -320,7 +378,7 @@ def render_affiliate_html(keyword:str, url:str, image:str="")->str:
     <li>선물/비상용 등 무난한 선택지를 찾는 분</li>
   </ul>
 
-  {_cta_html(url, url_alt)}
+  {_cta_html(url, url_alt, category_url, category_name)}
 </div>
 """.strip()
 
@@ -346,7 +404,7 @@ def run_once():
     url = resolve_product_url(kw)
     when_gmt = _slot_affiliate()
     title = build_title(kw)
-    body = render_affiliate_html(kw, url)
+    body = render_affiliate_html(kw, url, image="", category_name=DEFAULT_CATEGORY)
     res = post_wp(title, body, when_gmt, category=DEFAULT_CATEGORY, tag=kw)
     link = res.get("link")
     print(json.dumps({"post_id":res.get("id") or res.get("post") or 0, "link": link, "status":res.get("status"), "date_gmt":res.get("date_gmt"), "title": title, "keyword": kw}, ensure_ascii=False))
