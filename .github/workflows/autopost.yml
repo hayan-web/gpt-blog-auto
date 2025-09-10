@@ -2,8 +2,8 @@ name: run
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: "0 3 * * *"  # (UTC) 필요 시 활성화
+  schedule:
+    - cron: "30 0 * * *"  # 매일 09:30 KST
 
 jobs:
   run:
