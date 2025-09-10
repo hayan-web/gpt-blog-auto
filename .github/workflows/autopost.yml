@@ -159,7 +159,7 @@ jobs:
       - name: Post 5 general articles (KST 09/11/14/17/20)
         run: |
           if [ -f auto_wp_gpt.py ]; then
-            python auto_wp_gpt.py --mode=general-5
+                        python auto_wp_gpt.py --mode=two-posts
           else
             echo "SKIP: auto_wp_gpt.py not found"
           fi
@@ -168,7 +168,9 @@ jobs:
         run: |
           set -o pipefail
           if [ -f affiliate_post.py ]; then
-            python affiliate_post.py --mode=aff-3 2>&1 | tee /tmp/affiliate_out.txt || true
+                        AFFILIATE_TIME_KST=12:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
+            AFFILIATE_TIME_KST=16:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
+            AFFILIATE_TIME_KST=18:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
           else
             echo "SKIP: affiliate_post.py not found"
           fi
@@ -191,3 +193,4 @@ jobs:
             git commit -m "chore: rotate keywords & persist usage logs (auto)"
             git push
           fi
+
