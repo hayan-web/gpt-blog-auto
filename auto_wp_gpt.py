@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
-- keywords_general.csv 우선, 없으면 keywords.csv에서 '쇼핑스멜' 제거
+- keywords_general.csv(열 CSV) 우선, 부족하면 keywords.csv(한 줄)에서 쇼핑스멜 제거
 - 후킹형 제목, 정보형 본문(+CSS), 쇼핑 단어 금지
-- NEW: 해당 슬롯에 예약글 있으면 '다음날 같은 시각'으로 1회 이월
+- NEW: 최근 30일 사용 키워드 회피 + 성공 시 사용 기록(.usage/used_general.txt)
+- NEW: 성공 후 소스 CSV에서 해당 키워드 즉시 제거(폐기)
 """
-import os, re, json, sys
+import os, re, json, sys, csv
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List
@@ -17,178 +18,183 @@ from openai import OpenAI, BadRequestError
 _oai = OpenAI()
 
 # ===== ENV =====
-WP_URL = (os.getenv("WP_URL") or "").strip().rstrip("/")
-WP_USER = os.getenv("WP_USER") or ""
-WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD") or ""
-WP_TLS_VERIFY = (os.getenv("WP_TLS_VERIFY") or "true").lower() != "false"
+WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
+WP_USER=os.getenv("WP_USER") or ""
+WP_APP_PASSWORD=os.getenv("WP_APP_PASSWORD") or ""
+WP_TLS_VERIFY=(os.getenv("WP_TLS_VERIFY") or "true").lower()!="false"
+OPENAI_MODEL=os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()
+USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-general/1.2"
+USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
+USED_FILE=os.path.join(USAGE_DIR,"used_general.txt")
+REQ_HEADERS={"User-Agent":USER_AGENT,"Accept":"application/json"}
 
-OPENAI_MODEL = os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-POST_STATUS = (os.getenv("POST_STATUS") or "future").strip()
-
-# ===== SCHED =====
+# ===== TIME =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
-def _to_gmt_at_kst_time(h:int, m:int=0) -> str:
-    now = _now_kst()
-    tgt = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    if tgt <= now: tgt += timedelta(days=1)
+def _to_gmt_at_kst_time(h:int,m:int=0)->str:
+    now=_now_kst()
+    tgt=now.replace(hour=h,minute=m,second=0,microsecond=0)
+    if tgt<=now: tgt+=timedelta(days=1)
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-# NEW: 해당 UTC 시각 주변에 예약글 있는지 검사
-def _wp_has_future_at(when_gmt_dt: datetime) -> bool:
-    after = (when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    before = (when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    r = requests.get(
-        f"{WP_URL}/wp-json/wp/v2/posts",
-        params={"status": "future", "after": after, "before": before, "per_page": 5},
-        auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15,
-    )
-    r.raise_for_status()
-    return len(r.json()) > 0
+# (옵션) 같은 시각 충돌 방지 쓰고 싶으면 아래 두 함수 사용해도 됨
+def _wp_has_future_at(when_gmt_dt: datetime)->bool:
+    after=(when_gmt_dt-timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    before=(when_gmt_dt+timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    r=requests.get(f"{WP_URL}/wp-json/wp/v2/posts",
+        params={"status":"future","after":after,"before":before,"per_page":5},
+        auth=(WP_USER,WP_APP_PASSWORD),verify=WP_TLS_VERIFY,timeout=15,headers=REQ_HEADERS)
+    r.raise_for_status(); return len(r.json())>0
 
-# NEW: 충돌 시 '다음날 같은 시각'으로 1회만 이월
-def _slot_or_next_day_time(h:int, m:int=0) -> str:
-    now_kst = _now_kst()
-    tgt_kst = now_kst.replace(hour=h, minute=m, second=0, microsecond=0)
-    if tgt_kst <= now_kst:
-        tgt_kst += timedelta(days=1)
-    tgt_utc = tgt_kst.astimezone(timezone.utc)
-    if _wp_has_future_at(tgt_utc):
-        nxt_utc = (tgt_kst + timedelta(days=1)).astimezone(timezone.utc)
-        return nxt_utc.strftime("%Y-%m-%dT%H:%M:%S")
-    return tgt_utc.strftime("%Y-%m-%dT%H:%M:%S")
+def _slot_or_next_day(h:int,m:int=0)->str:
+    now=_now_kst()
+    tgt=now.replace(hour=h,minute=m,second=0,microsecond=0)
+    if tgt<=now: tgt+=timedelta(days=1)
+    utc=tgt.astimezone(timezone.utc)
+    if _wp_has_future_at(utc):
+        return (tgt+timedelta(days=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    return utc.strftime("%Y-%m-%dT%H:%M:%S")
 
 # ===== SHOPPING FILTER =====
-SHOPPING_WORDS = set("""
-추천 리뷰 후기 가격 최저가 세일 특가 쇼핑 쿠폰 할인 핫딜 언박싱 스펙 사용법 베스트
-가전 노트북 스마트폰 냉장고 세탁기 건조기 에어컨 공기청정기 이어폰 헤드폰 카메라 렌즈 TV 모니터 키보드 마우스 의자 책상 침대 매트리스
-에어프라이어 로봇청소기 무선청소기 가습기 제습기 식기세척기 빔프로젝터 유모차 카시트 분유 기저귀 골프 캠핑 텐트 보조배터리 배터리
-가방 지갑 신발 패딩 스니커즈 선크림 드라이어 면도기 전동칫솔 워치 태블릿 케이스 케이블 충전기 허브 SSD HDD
-쿠팡 파트너스 링크 딜 특가전 무료배송 사은품 공동구매 라이브커머스
-""".split())
-
-def is_shopping_like(kw: str) -> bool:
-    k = kw or ""
+SHOPPING_WORDS=set("추천 리뷰 후기 가격 최저가 세일 특가 쇼핑 쿠폰 할인 핫딜 언박싱 스펙 구매 배송".split())
+def is_shopping_like(kw:str)->bool:
+    k=kw or ""
     if any(w in k for w in SHOPPING_WORDS): return True
-    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}", k): return True
-    if re.search(r"(구매|판매|가격|최저가|할인|특가|딜|프로모션|쿠폰|배송)", k): return True
+    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}",k): return True
+    if re.search(r"(구매|판매|가격|최저가|할인|특가|딜|프로모션|쿠폰|배송)",k): return True
     return False
 
-# ===== WP =====
-def _ensure_category(name:str)->int:
-    name = name or "정보"
-    r = requests.get(f"{WP_URL}/wp-json/wp/v2/categories",
-                     params={"search": name, "per_page": 50},
-                     auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
-    r.raise_for_status()
-    for item in r.json():
-        if (item.get("name") or "").strip()==name: return int(item["id"])
-    r = requests.post(f"{WP_URL}/wp-json/wp/v2/categories",
-                      json={"name": name}, auth=(WP_USER, WP_APP_PASSWORD),
-                      verify=WP_TLS_VERIFY, timeout=15)
-    r.raise_for_status()
-    return int(r.json()["id"])
+# ===== CSV IO =====
+def _read_col_csv(path:str)->List[str]:
+    if not os.path.exists(path): return []
+    out=[]
+    with open(path,"r",encoding="utf-8",newline="") as f:
+        rd=csv.reader(f)
+        for i,row in enumerate(rd):
+            if not row: continue
+            if i==0 and (row[0].strip().lower() in ("keyword","title")): continue
+            if row[0].strip(): out.append(row[0].strip())
+    return out
 
-def _ensure_tag(tag:str)->int|None:
-    t = (tag or "").strip()
-    if not t: return None
-    r = requests.get(f"{WP_URL}/wp-json/wp/v2/tags",
-                     params={"search": t, "per_page": 50},
-                     auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
-    r.raise_for_status()
-    for item in r.json():
-        if (item.get("name") or "").strip()==t: return int(item["id"])
-    r = requests.post(f"{WP_URL}/wp-json/wp/v2/tags",
-                      json={"name": t}, auth=(WP_USER, WP_APP_PASSWORD),
-                      verify=WP_TLS_VERIFY, timeout=15)
-    r.raise_for_status()
-    return int(r.json()["id"])
-
-def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str="")->dict:
-    cat_id = _ensure_category(category)
-    tag_ids = []
-    if tag:
-        tid = _ensure_tag(tag)
-        if tid: tag_ids = [tid]
-    payload = {
-        "title": title, "content": html, "status": POST_STATUS,
-        "categories": [cat_id], "tags": tag_ids,
-        "comment_status":"closed","ping_status":"closed",
-        "date_gmt": when_gmt
-    }
-    r = requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
-                      auth=(WP_USER, WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-# ===== KEYWORDS =====
 def _read_line(path:str)->List[str]:
     if not os.path.exists(path): return []
     with open(path,"r",encoding="utf-8") as f:
-        arr=[x.strip() for x in f.readline().split(",") if x.strip()]
-    return arr
+        return [x.strip() for x in f.readline().split(",") if x.strip()]
 
+def _consume_col_csv(path:str, kw:str)->bool:
+    if not os.path.exists(path): return False
+    with open(path,"r",encoding="utf-8",newline="") as f:
+        rows=list(csv.reader(f))
+    if not rows: return False
+    has_header=rows[0] and rows[0][0].strip().lower() in ("keyword","title")
+    body=rows[1:] if has_header else rows[:]
+    before=len(body)
+    body=[r for r in body if (r and r[0].strip()!=kw)]
+    if len(body)==before: return False
+    new_rows=([rows[0]] if has_header else [])+[[r[0].strip()] for r in body]
+    with open(path,"w",encoding="utf-8",newline="") as f:
+        csv.writer(f).writerows(new_rows)
+    print(f"[GENERAL] consumed '{kw}' from {path}")
+    return True
+
+def _consume_line_csv(path:str, kw:str)->bool:
+    if not os.path.exists(path): return False
+    with open(path,"r",encoding="utf-8") as f:
+        toks=[x.strip() for x in f.readline().split(",") if x.strip()]
+    if kw not in toks: return False
+    toks=[t for t in toks if t!=kw]
+    with open(path,"w",encoding="utf-8") as f:
+        f.write(",".join(toks))
+    print(f"[GENERAL] consumed '{kw}' from {path}")
+    return True
+
+def _consume_from_sources(kw:str):
+    if _consume_col_csv("keywords_general.csv",kw): return
+    if _consume_line_csv("keywords.csv",kw): return
+
+# ===== USED LOG =====
+def _ensure_usage_dir(): os.makedirs(USAGE_DIR, exist_ok=True)
+
+def _load_used_set(days:int=30)->set:
+    _ensure_usage_dir()
+    if not os.path.exists(USED_FILE): return set()
+    cutoff=datetime.utcnow().date()-timedelta(days=days)
+    used=set()
+    with open(USED_FILE,"r",encoding="utf-8",errors="ignore") as f:
+        for line in f:
+            line=line.strip()
+            if not line: continue
+            try:
+                d_str, kw = line.split("\t",1)
+                if datetime.strptime(d_str,"%Y-%m-%d").date()>=cutoff:
+                    used.add(kw.strip())
+            except Exception:
+                used.add(line)
+    return used
+
+def _mark_used(kw:str):
+    _ensure_usage_dir()
+    with open(USED_FILE,"a",encoding="utf-8") as f:
+        f.write(f"{datetime.utcnow().date():%Y-%m-%d}\t{kw.strip()}\n")
+
+# ===== KEYWORDS =====
 def pick_daily_keywords(n:int=2)->List[str]:
-    arr = _read_line("keywords_general.csv")
-    if not arr:
-        base = _read_line("keywords.csv")
-        arr = [k for k in base if not is_shopping_like(k)]
-    if len(arr) < n:
-        arr += ["오늘의 작은 통찰", "생각이 자라는 순간", "일상을 바꾸는 관찰"]
-    seen=set(); out=[]
-    for k in arr:
-        if k not in seen and not is_shopping_like(k):
-            seen.add(k); out.append(k)
+    used=_load_used_set(30)
+    out=[]
+    # 1) keywords_general.csv (열)
+    arr1=[k for k in _read_col_csv("keywords_general.csv") if k and (k not in used) and not is_shopping_like(k)]
+    # 2) keywords.csv (한 줄)
+    arr2=[k for k in _read_line("keywords.csv") if k and (k not in used) and not is_shopping_like(k)]
+    for pool in (arr1, arr2):
+        for k in pool:
+            out.append(k)
+            if len(out)>=n: break
         if len(out)>=n: break
+    # 3) 부족하면 안전한 기본 키워드
+    i=0
+    bases=["오늘의 작은 통찰","생각이 자라는 순간","일상을 바꾸는 관찰","시야가 넓어지는 한 줄"]
+    while len(out)<n:
+        stamp=datetime.utcnow().strftime("%Y%m%d")
+        out.append(f"{bases[i%len(bases)]} {stamp}-{i}")
+        i+=1
+    print(f"[GENERAL] picked: {out}")
     return out[:n]
 
-# ===== OpenAI helper (Chat→Responses 폴백; temperature 미지원 모델 자동 재시도) =====
-def _ask_chat_then_responses(model: str, system: str, user: str, max_tokens: int, temperature: float) -> str:
+# ===== OpenAI helper =====
+def _ask_chat_then_responses(model, system, user, max_tokens, temperature):
     try:
-        r = _oai.chat.completions.create(
-            model=model,
-            messages=[{"role":"system","content":system},{"role":"user","content":user}],
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+        r=_oai.chat.completions.create(model=model,
+             messages=[{"role":"system","content":system},{"role":"user","content":user}],
+             temperature=temperature, max_tokens=max_tokens)
         return (r.choices[0].message.content or "").strip()
     except BadRequestError:
-        rr = _oai.responses.create(model=model, input=f"[시스템]\n{system}\n\n[사용자]\n{user}", max_output_tokens=max_tokens)
-        txt = getattr(rr, "output_text", None)
-        if isinstance(txt, str) and txt.strip():
-            return txt.strip()
-        if getattr(rr, "output", None) and rr.output and rr.output[0].content:
-            try:
-                return rr.output[0].content[0].text.strip()
-            except Exception:
-                pass
+        rr=_oai.responses.create(model=model, input=f"[시스템]\n{system}\n\n[사용자]\n{user}", max_output_tokens=max_tokens)
+        txt=getattr(rr,"output_text",None)
+        if isinstance(txt,str) and txt.strip(): return txt.strip()
         return ""
 
 # ===== TITLE / BODY =====
-BANNED_TITLE_PATTERNS = ["브리핑","정리","알아보기","대해 알아보기","에 대해 알아보기","해야 할 것","해야할 것","해야할것"]
-
+BANNED_TITLE=["브리핑","정리","알아보기","대해 알아보기","에 대해 알아보기","해야 할 것","해야할 것","해야할것"]
 def _bad_title(t:str)->bool:
-    if any(p in t for p in BANNED_TITLE_PATTERNS): return True
-    L=len(t.strip())
-    return not (14 <= L <= 26)
+    return any(p in t for p in BANNED_TITLE) or not (14<=len(t.strip())<=26)
 
 def hook_title(kw:str)->str:
-    sys_p = "너는 한국어 카피라이터다. 클릭을 부르는 짧고 강한 제목만 출력."
-    usr = f"""키워드: {kw}
+    sys_p="너는 한국어 카피라이터다. 클릭을 부르는 짧고 강한 제목만 출력."
+    usr=f"""키워드: {kw}
 조건:
 - 14~26자
-- 금지어: {", ".join(BANNED_TITLE_PATTERNS)}
-- '~브리핑', '~정리', '~대해 알아보기', '~해야 할 것' 류 금지
-- 쇼핑/구매/할인/최저가/쿠폰/딜/가격 관련 단어 금지
+- 금지어: {", ".join(BANNED_TITLE)}
+- 쇼핑/구매/할인/최저가/쿠폰/딜/가격 단어 금지
 - '리뷰/가이드/사용기' 표지어 지양
 - 출력은 제목 1줄"""
     for _ in range(3):
-        t = _ask_chat_then_responses(OPENAI_MODEL, sys_p, usr, max_tokens=60, temperature=0.9)
-        t = (t or "").strip().replace("\n"," ")
+        t=_ask_chat_then_responses(OPENAI_MODEL, sys_p, usr, max_tokens=60, temperature=0.9)
+        t=(t or "").strip().replace("\n"," ")
         if not _bad_title(t): return t
     return f"{kw}, 오늘 시야가 넓어지는 순간"
 
-def strip_code_fences(s: str) -> str:
-    return re.sub(r"```(?:\w+)?", "", s).replace("```", "").strip().strip("“”\"'")
+def strip_code_fences(s:str)->str:
+    return re.sub(r"```(?:\w+)?","",s).replace("```","").strip().strip("“”\"'")
 
 def _css_block()->str:
     return """
@@ -205,41 +211,65 @@ def _css_block()->str:
 """
 
 def gen_body_info(kw:str)->str:
-    sys_p = "너는 사람스러운 한국어 칼럼니스트다. 광고/구매 표현 없이 지식형 글을 쓴다."
-    usr = f"""주제: {kw}
+    sys_p="너는 사람스러운 한국어 칼럼니스트다. 광고/구매 표현 없이 지식형 글을 쓴다."
+    usr=f"""주제: {kw}
 스타일: 정의 → 배경/원리 → 실제 영향/사례 → 관련 연구/수치(개념적) → 비교/표 1개 → 적용 팁 → 정리
 요건:
 - 도입부 2~3문장에 '왜 지금 이 주제가 흥미로운지' 훅
 - 본문은 3~5문장 단락으로 나누고, 소제목 <h2>/<h3> 사용
-- 간단한 2~3행 표 1개를 <table><thead><tbody>로 구성 (과장 없이)
+- 간단한 2~3행 표 1개 (<table>)
 - 불릿 <ul><li> 1세트 포함
-- '구매, 가격, 할인, 최저가, 쿠폰, 쿠팡, 쇼핑' 등 상업 단어 금지
-- 'AI/작성' 같은 메타표현 금지
-- 분량: 1000~1300자 (한국어 기준)
-- 출력: 순수 HTML만(<p>, <h2>, <h3>, <ul>, <li>, <table>, <thead>, <tbody>, <tr>, <th>, <td>)"""
-    body = _ask_chat_then_responses(OPENAI_MODEL, sys_p, usr, max_tokens=950, temperature=0.8)
-    return _css_block() + '\n<div class="post-info">\n' + strip_code_fences(body) + "\n</div>"
+- 상업 단어 금지
+- 분량: 1000~1300자
+- 출력: 순수 HTML만"""
+    body=_ask_chat_then_responses(OPENAI_MODEL, sys_p, usr, max_tokens=950, temperature=0.8)
+    return _css_block()+'\n<div class="post-info">\n'+strip_code_fences(body)+"\n</div>"
+
+# ===== WP =====
+def _ensure_term(kind:str, name:str)->int:
+    r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}", params={"search":name,"per_page":50},
+                   auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
+    r.raise_for_status()
+    for it in r.json():
+        if (it.get("name") or "").strip()==name: return int(it["id"])
+    r=requests.post(f"{WP_URL}/wp-json/wp/v2/{kind}", json={"name":name},
+                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15)
+    r.raise_for_status(); return int(r.json()["id"])
+
+def post_wp(title:str, html:str, when_gmt:str, category:str="정보", tag:str="")->dict:
+    cat_id=_ensure_term("categories", category or "정보")
+    tag_ids=[]
+    if tag:
+        try:
+            tid=_ensure_term("tags", tag); tag_ids=[tid]
+        except Exception: pass
+    payload={"title":title,"content":html,"status":POST_STATUS,
+             "categories":[cat_id],"tags":tag_ids,
+             "comment_status":"closed","ping_status":"closed","date_gmt":when_gmt}
+    r=requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
+                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
+    r.raise_for_status(); return r.json()
 
 # ===== RUNNERS =====
 def run_two_posts():
-    kws = pick_daily_keywords(2)
-    times = [ (10,0), (17,0) ]
+    kws=pick_daily_keywords(2)
+    times=[(10,0),(17,0)]
     for idx,(kw,(h,m)) in enumerate(zip(kws,times)):
-        title = hook_title(kw)
-        html  = gen_body_info(kw)
-        when  = _slot_or_next_day_time(h,m)  # ★ 충돌 시 다음날로만 이월
-        link = post_wp(title, html, when, category="정보", tag=kw).get("link")
+        title=hook_title(kw)
+        html=gen_body_info(kw)
+        link=post_wp(title, html, _slot_or_next_day(h,m), category="정보", tag=kw).get("link")
         print(f"[OK] scheduled ({idx}) '{title}' -> {link}")
+        _mark_used(kw)
+        _consume_from_sources(kw)
 
 def main():
     if not (WP_URL and WP_USER and WP_APP_PASSWORD):
         raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
     import argparse
-    ap = argparse.ArgumentParser()
+    ap=argparse.ArgumentParser()
     ap.add_argument("--mode", choices=["two-posts"], default="two-posts")
-    args = ap.parse_args()
-    if args.mode=="two-posts":
-        run_two_posts()
+    args=ap.parse_args()
+    if args.mode=="two-posts": run_two_posts()
 
-if __name__ == "__main__":
+if __name__=="__main__":
     sys.exit(main())
