@@ -98,7 +98,7 @@ def _rotate_csvs_on_success(kw: str):
 def _ensure_usage(): os.makedirs(USAGE_DIR, exist_ok=True)
 
 def _load_used_set(days:int=30)->set:
-    """[호환용] 최근 n일 내 사용된 키워드 집합. (기존 코드 사용처 대비 유지)"""
+    """[호환용] 최근 n일 내 사용된 키워드 집합."""
     _ensure_usage()
     if not os.path.exists(USED_FILE): return set()
     cutoff = datetime.utcnow().date() - timedelta(days=days)

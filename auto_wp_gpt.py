@@ -3,8 +3,8 @@
 auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
 - keywords_general.csv(열 CSV) 우선, 부족하면 keywords.csv(한 줄)에서 쇼핑스멜 제거
 - 후킹형 제목, 정보형 본문(+CSS), 쇼핑 단어 금지
-- NEW: 최근 30일 사용 키워드 회피 + 성공 시 사용 기록(.usage/used_general.txt)
-- NEW: 성공 후 소스 CSV에서 해당 키워드 즉시 제거(폐기)
+- 최근 30일 사용 키워드 회피 + 성공 시 사용 기록(.usage/used_general.txt)
+- 성공 후 소스 CSV에서 해당 키워드 즉시 제거(폐기)
 """
 import os, re, json, sys, csv
 from datetime import datetime, timedelta, timezone
@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from openai import OpenAI, BadRequestError
-_oai = OpenAI()
+_oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY") or None)
 
 # ===== ENV =====
 WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
@@ -37,7 +37,6 @@ def _to_gmt_at_kst_time(h:int,m:int=0)->str:
     if tgt<=now: tgt+=timedelta(days=1)
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-# (옵션) 같은 시각 충돌 방지 쓰고 싶으면 아래 두 함수 사용해도 됨
 def _wp_has_future_at(when_gmt_dt: datetime)->bool:
     after=(when_gmt_dt-timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
     before=(when_gmt_dt+timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
