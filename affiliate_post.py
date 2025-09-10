@@ -48,7 +48,7 @@ AFF_FALLBACK_KEYWORDS_ENV = (os.getenv("AFF_FALLBACK_KEYWORDS") or "").strip()
 REQ_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 _client = OpenAI(api_key=OPENAI_API_KEY)
 
-def _now_kst(): 
+def _now_kst():
     return datetime.now(ZoneInfo("Asia/Seoul"))
 
 # ===== CSV helpers =====
@@ -94,7 +94,7 @@ def _rotate_csvs_on_success(kw: str):
         print("[ROTATE] nothing removed (maybe already rotated)")
 
 # ===== Used-keyword log =====
-def _ensure_usage(): 
+def _ensure_usage():
     os.makedirs(USAGE_DIR, exist_ok=True)
 
 def _load_used_set(days:int=30)->set:
@@ -118,7 +118,7 @@ def _load_used_list()->List[tuple]:
     """[(date, keyword)] 오름차순으로 반환. 파싱 실패 줄은 today(UTC) 처리"""
     _ensure_usage()
     out=[]
-    if not os.path.exists(USED_FILE): 
+    if not os.path.exists(USED_FILE):
         return out
     with open(USED_FILE,"r",encoding="utf-8",errors="ignore") as f:
         for ln in f:
@@ -145,26 +145,74 @@ def _mark_used(kw:str):
     with open(USED_FILE,"a",encoding="utf-8") as f:
         f.write(f"{datetime.utcnow().date():%Y-%m-%d}\t{kw.strip()}\n")
 
-# ===== Time / slot =====
-def _wp_has_future_at(when_gmt_dt):
-    after=(when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    before=(when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
-    r=requests.get(f"{WP_URL}/wp-json/wp/v2/posts",
-                   params={"status":"future","after":after,"before":before,"per_page":5},
-                   headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD),
-                   verify=WP_TLS_VERIFY, timeout=15)
+# ===== WP future-slot detection (정확한 UTC 비교) =====
+def _wp_future_exists_around(when_gmt_dt: datetime, tol_min: int = 2) -> bool:
+    """
+    status=future 글을 넉넉히 가져와 date_gmt(UTC)를 기준으로 ±tol_min분 내 중복을 직접 판단.
+    after/before 파라미터로 필터하지 않고 파이썬에서 비교하여 타임존 혼선을 제거.
+    """
+    url = f"{WP_URL}/wp-json/wp/v2/posts"
+    r = requests.get(
+        url,
+        params={
+            "status": "future",
+            "per_page": 100,
+            "orderby": "date",
+            "order": "asc",
+            "context": "edit",  # 인증 있음
+        },
+        headers=REQ_HEADERS,
+        auth=(WP_USER, WP_APP_PASSWORD),
+        verify=WP_TLS_VERIFY,
+        timeout=15,
+    )
     r.raise_for_status()
-    return len(r.json())>0
+    items = r.json()
+    lo = when_gmt_dt - timedelta(minutes=tol_min)
+    hi = when_gmt_dt + timedelta(minutes=tol_min)
+    for it in items:
+        dstr = (it.get("date_gmt") or "").strip()  # e.g. "2025-09-11T04:00:00"
+        if not dstr:
+            continue
+        try:
+            dt = datetime.fromisoformat(dstr)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)  # WP date_gmt는 tz 미표기 → UTC 지정
+        except Exception:
+            continue
+        if lo <= dt <= hi:
+            return True
+    return False
 
 def _slot_or_next_day(hhmm:str)->str:
-    h,m=(hhmm.split(":")+["0"])[:2]; h=int(h); m=int(m)
-    now=_now_kst()
-    tgt=now.replace(hour=h,minute=m,second=0,microsecond=0)
-    if tgt<=now: tgt+=timedelta(days=1)
-    tgt_utc=tgt.astimezone(timezone.utc)
-    if _wp_has_future_at(tgt_utc):
-        return (tgt+timedelta(days=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-    return tgt_utc.strftime("%Y-%m-%dT%H:%M:%S")
+    """
+    Asia/Seoul 기준 hh:mm 슬롯을 우선 시도.
+    - 현재 시각이 지나있으면 다음날로 기본 이월
+    - 동일 슬롯이 이미 예약돼 있으면 1일씩 밀면서 빈 날을 찾음(최대 7일)
+    반환: WP date_gmt(UTC) 문자열 "YYYY-MM-DDTHH:MM:SS"
+    """
+    try:
+        h, m = (hhmm.split(":") + ["0"])[:2]
+        h, m = int(h), int(m)
+    except Exception:
+        h, m = 13, 0  # 안전 기본값
+
+    now_kst = _now_kst()
+    target_kst = now_kst.replace(hour=h, minute=m, second=0, microsecond=0)
+    if target_kst <= now_kst:
+        target_kst += timedelta(days=1)
+
+    for _ in range(7):
+        when_gmt_dt = target_kst.astimezone(timezone.utc)
+        if _wp_future_exists_around(when_gmt_dt, tol_min=2):
+            print(f"[SLOT] conflict at {when_gmt_dt.strftime('%Y-%m-%dT%H:%M:%S')}Z -> push +1d")
+            target_kst += timedelta(days=1)
+        else:
+            break
+
+    final = target_kst.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    print(f"[SLOT] scheduled UTC = {final}")
+    return final
 
 # ===== Picker helpers =====
 def _parse_list_env(v:str)->List[str]:
@@ -174,7 +222,7 @@ BAN_KEYWORDS = set(_parse_list_env(BAN_KEYWORDS_ENV))
 AFF_FALLBACK_KEYWORDS = _parse_list_env(AFF_FALLBACK_KEYWORDS_ENV)
 
 def _apply_ban(pool:List[str])->List[str]:
-    if not BAN_KEYWORDS: 
+    if not BAN_KEYWORDS:
         return pool
     banned=[k for k in pool if any(b in k for b in BAN_KEYWORDS)]
     if banned:
@@ -237,7 +285,7 @@ def _pick_keyword()->str:
     # 5) 풀 비었을 때 폴백
     fb = AFF_FALLBACK_KEYWORDS[:] if AFF_FALLBACK_KEYWORDS else []
     if not fb:
-        fb = [ _seasonal_fallback() ]
+        fb = [_seasonal_fallback()]
     fb = _apply_ban(fb)
     if fb:
         pick=random.choice(fb)
