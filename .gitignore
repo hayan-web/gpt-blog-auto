@@ -74,3 +74,9 @@ Thumbs.db
 !.usage/
 !.usage/.gitkeep
 !.usage/used_shopping.txt
+
+!golden_shopping_keywords.csv
+!keywords_shopping.csv
+!.usage/used_shopping.txt
+!.usage/.gitkeep
+
