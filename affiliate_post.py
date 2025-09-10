@@ -7,7 +7,7 @@ affiliate_post.py — Coupang Partners 글 자동 포스팅 (상단 고지문/CT
 - URL 없을 때 쿠팡 검색 페이지 폴백
 - 골든키워드 회전/사용로그/예약 충돌 회피(기존 유지)
 """
-import os, re, csv, json, html
+import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List
@@ -15,6 +15,96 @@ import requests
 from dotenv import load_dotenv
 from urllib.parse import quote  # 카테고리 폴백 URL용
 load_dotenv()
+
+# ===== Diverse title (LLM + Template) =====
+try:
+    from openai import OpenAI, BadRequestError
+except Exception:
+    OpenAI = None
+    BadRequestError = Exception
+
+AFF_TITLE_MIN  = int(os.getenv("AFF_TITLE_MIN",  "14"))
+AFF_TITLE_MAX  = int(os.getenv("AFF_TITLE_MAX",  "26"))
+AFF_TITLE_MODE = (os.getenv("AFF_TITLE_MODE") or "llm-then-template").lower()
+AFF_BANNED_PHRASES = (
+    "제대로 써보고 알게 된 포인트",
+    "써보고 알게 된 포인트",
+)
+
+AFF_TITLE_TEMPLATES = [
+    "{name}, 한눈에 핵심만",
+    "{name} 장단점 총정리",
+    "{name} 7일 써본 결론",
+    "{name} 실사용 팁 모음",
+    "{name} 이렇게 쓰니 편해요",
+    "{name} 쓰고 달라진 점",
+    "{name} 이런 분께 맞아요",
+    "{name} 아쉬운 점까지 솔직히",
+    "{name} 구매 전 체크리스트",
+    "{name} 첫인상부터 실전까지",
+    "{name} 놓치기 쉬운 포인트",
+    "{name} 핵심만 쏙 정리",
+]
+
+_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+_OPENAI_MODEL   = (os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
+_oai = OpenAI(api_key=_OPENAI_API_KEY) if (_OPENAI_API_KEY and OpenAI) else None
+
+def _normalize_title(s: str) -> str:
+    s = (s or "").strip()
+    s = html.unescape(s).replace("“","").replace("”","").replace("‘","").replace("’","").strip('"\' ')
+    return s
+
+def _bad_aff_title(t: str) -> bool:
+    if not t: return True
+    if not (AFF_TITLE_MIN <= len(t) <= AFF_TITLE_MAX): return True
+    if any(p in t for p in AFF_BANNED_PHRASES): return True
+    if any(x in t for x in ("최저가","역대급","무조건","100%","클릭")): return True
+    return False
+
+def _aff_title_from_templates(name: str, kw: str) -> str:
+    # 날짜 기반 씨드 → 같은 상품도 매일 다르게
+    seed = abs(hash(f"{name}|{kw}|{datetime.utcnow().date()}")) % (2**32)
+    random.seed(seed)
+    for _ in range(4):
+        cand = _normalize_title(random.choice(AFF_TITLE_TEMPLATES).format(name=name.strip()))
+        if not _bad_aff_title(cand): return cand
+    fallback = f"{name.strip()} 핵심 체크"
+    return fallback if not _bad_aff_title(fallback) else name.strip()
+
+def _aff_title_from_llm(name: str, kw: str) -> str:
+    if not _oai: return ""
+    try:
+        sys_p = "너는 한국어 카피라이터다. 쇼핑 포스트용 짧고 담백한 제목 1개만 출력한다."
+        usr = f"""상품명: {name}
+키워드: {kw}
+조건:
+- 길이 {AFF_TITLE_MIN}~{AFF_TITLE_MAX}자
+- 금지문구: {", ".join(AFF_BANNED_PHRASES)}
+- 과장/낚시 금지(최저가/역대급 등)
+- '~써보고 알게 된 포인트' 같은 반복 패턴 금지
+- 출력은 제목 1줄(순수 텍스트)"""
+        r = _oai.chat.completions.create(
+            model=_OPENAI_MODEL,
+            messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
+            temperature=0.9,
+            max_tokens=60,
+        )
+        cand = _normalize_title(r.choices[0].message.content or "")
+        return "" if _bad_aff_title(cand) else cand
+    except BadRequestError:
+        return ""
+    except Exception as e:
+        print(f"[AFF-TITLE][WARN] {type(e).__name__}: {e}")
+        return ""
+
+def hook_aff_title(product_name: str, keyword: str) -> str:
+    title = ""
+    if AFF_TITLE_MODE in ("llm","llm-then-template"):
+        title = _aff_title_from_llm(product_name, keyword)
+    if not title:
+        title = _aff_title_from_templates(product_name, keyword)
+    return title
 
 # ===== ENV =====
 WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
@@ -382,11 +472,12 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
 </div>
 """.strip()
 
-# ===== TITLE =====
+# ===== TITLE (patched) =====
 def build_title(keyword:str)->str:
-    s=f"{keyword} 제대로 써보고 알게 된 포인트"
-    s = re.sub(r"\s+"," ", html.unescape(s)).strip()
-    return s[:90]
+    # 제품명을 별도로 모르므로 keyword를 제품명으로 사용
+    title = hook_aff_title(keyword, keyword)
+    print(f"[AFF-TITLE] → {title}")
+    return title[:90]
 
 # ===== ROTATE & RUN =====
 def rotate_sources(kw:str):
