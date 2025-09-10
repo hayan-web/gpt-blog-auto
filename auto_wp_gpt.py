@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
 auto_wp_gpt.py — 일상글 2건 예약(10:00 / 17:00 KST)
-- keywords_general.csv(열 CSV) 우선, 부족하면 keywords.csv(한 줄)에서 쇼핑스멜 제거
+- golden_keywords.csv(열) → keywords_general.csv(열) → keywords.csv(한 줄) 순서로 선별  ← 패치
 - 후킹형 제목(HTML 엔티티/태그 제거 후 정규화), 정보형 본문(+CSS), 쇼핑 단어 금지
 - 최근 30일 사용 키워드 회피 + 성공 시 사용 기록(.usage/used_general.txt)
-- 성공 후 소스 CSV에서 해당 키워드 즉시 제거(폐기)
-- WP 예약 슬롯 충돌 시 다음날로 이월(최대 7일 재시도)  ← 패치
+- 성공 후 소스 CSV에서 해당 키워드 즉시 제거(폐기)  ← golden 포함
+- WP 예약 슬롯 충돌 시 다음날로 이월(최대 7일 재시도)
 """
 import os, re, sys, csv, html
 from datetime import datetime, timedelta, timezone
@@ -41,12 +41,12 @@ REQ_HEADERS={
 def _now_kst():
     return datetime.now(ZoneInfo("Asia/Seoul"))
 
-# --- 패치: after/before 사용 안 하고, date_gmt(UTC) 직접 비교 ---
+# --- 예약 충돌: date_gmt(UTC) 직접 비교 ---
 def _wp_future_exists_around(when_gmt_dt: datetime, tol_min: int = 2) -> bool:
     """
     워드프레스 예약글(status=future)을 넉넉히 조회한 뒤,
     UTC date_gmt를 기준으로 ±tol_min 분 내 충돌 여부 판단.
-    타임존 혼선을 피하기 위해 after/before 파라미터는 사용하지 않는다.
+    after/before는 쓰지 않는다(타임존 혼선 회피).
     """
     url = f"{WP_URL}/wp-json/wp/v2/posts"
     try:
@@ -68,7 +68,7 @@ def _wp_future_exists_around(when_gmt_dt: datetime, tol_min: int = 2) -> bool:
         items = r.json()
     except Exception as e:
         print(f"[WP][WARN] future list fetch failed: {type(e).__name__}: {e}")
-        # 조회 실패면 보수적으로 '충돌 없음' 처리 (예약을 막지 않음)
+        # 조회 실패면 보수적으로 '충돌 없음' 처리
         return False
 
     tgt = when_gmt_dt.astimezone(timezone.utc)
@@ -130,10 +130,14 @@ def _read_col_csv(path:str)->List[str]:
     out=[]
     with open(path,"r",encoding="utf-8",newline="") as f:
         rd=csv.reader(f)
-        for i,row in enumerate(rd):
+        first=True
+        for row in rd:
             if not row: continue
-            if i==0 and (row[0].strip().lower() in ("keyword","title")): continue
-            if row[0].strip(): out.append(row[0].strip())
+            cell=(row[0] or "").strip()
+            if first and cell.lower() in ("keyword","title"):
+                first=False; continue
+            first=False
+            if cell: out.append(cell)
     return out
 
 def _read_line(path:str)->List[str]:
@@ -146,12 +150,12 @@ def _consume_col_csv(path:str, kw:str)->bool:
     with open(path,"r",encoding="utf-8",newline="") as f:
         rows=list(csv.reader(f))
     if not rows: return False
-    has_header=rows[0] and rows[0][0].strip().lower() in ("keyword","title")
+    has_header=rows[0] and (rows[0][0] or "").strip().lower() in ("keyword","title")
     body=rows[1:] if has_header else rows[:]
     before=len(body)
-    body=[r for r in body if (r and r[0].strip()!=kw)]
+    body=[r for r in body if (r and (r[0] or "").strip()!=kw)]
     if len(body)==before: return False
-    new_rows=([rows[0]] if has_header else [])+[[r[0].strip()] for r in body]
+    new_rows=([rows[0]] if has_header else [])+[[ (r[0] or "").strip() ] for r in body]
     with open(path,"w",encoding="utf-8",newline="") as f:
         csv.writer(f).writerows(new_rows)
     print(f"[GENERAL] consumed '{kw}' from {path}")
@@ -169,8 +173,10 @@ def _consume_line_csv(path:str, kw:str)->bool:
     return True
 
 def _consume_from_sources(kw:str):
-    if _consume_col_csv("keywords_general.csv",kw): return
-    if _consume_line_csv("keywords.csv",kw): return
+    # golden → general → line 순서로 시도(존재하는 모든 곳에서 제거)
+    _consume_col_csv("golden_keywords.csv", kw)
+    if _consume_col_csv("keywords_general.csv", kw): return
+    _consume_line_csv("keywords.csv", kw)
 
 # ===== USED LOG =====
 def _ensure_usage_dir(): os.makedirs(USAGE_DIR, exist_ok=True)
@@ -198,25 +204,40 @@ def _mark_used(kw:str):
         f.write(f"{datetime.utcnow().date():%Y-%m-%d}\t{kw.strip()}\n")
 
 # ===== KEYWORDS =====
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen=set(); out=[]
+    for k in items:
+        if k in seen: continue
+        seen.add(k); out.append(k)
+    return out
+
 def pick_daily_keywords(n:int=2)->List[str]:
+    """
+    우선순위: golden_keywords.csv → keywords_general.csv → keywords.csv
+    - 최근 30일 사용 회피
+    - 쇼핑스멜 제거
+    """
     used=_load_used_set(30)
-    out=[]
-    # 1) keywords_general.csv (열)
+
+    arr0=[k for k in _read_col_csv("golden_keywords.csv") if k and (k not in used) and not is_shopping_like(k)]
     arr1=[k for k in _read_col_csv("keywords_general.csv") if k and (k not in used) and not is_shopping_like(k)]
-    # 2) keywords.csv (한 줄)
     arr2=[k for k in _read_line("keywords.csv") if k and (k not in used) and not is_shopping_like(k)]
-    for pool in (arr1, arr2):
-        for k in pool:
-            out.append(k)
-            if len(out)>=n: break
+
+    ordered=_dedupe_keep_order(arr0 + arr1 + arr2)
+
+    out=[]
+    for k in ordered:
+        out.append(k)
         if len(out)>=n: break
-    # 3) 부족하면 안전한 기본 키워드(폴백)
+
+    # 폴백
     i=0
     bases=["오늘의 작은 통찰","생각이 자라는 순간","일상을 바꾸는 관찰","시야가 넓어지는 한 줄"]
     while len(out)<n:
         stamp=datetime.utcnow().strftime("%Y%m%d")
         out.append(f"{bases[i%len(bases)]} {stamp}-{i}")
         i+=1
+
     print(f"[GENERAL] picked: {out}")
     return out[:n]
 
@@ -291,9 +312,8 @@ def _css_block()->str:
 </style>
 """
 
-def gen_body_info(kw:str)->str:
-    if _oai.api_key is None:
-        html_body=f"""
+def _static_body_html(kw:str)->str:
+    return f"""
 {_css_block()}
 <div class="post-info">
   <h2>{kw} 한눈에 보기</h2>
@@ -307,7 +327,10 @@ def gen_body_info(kw:str)->str:
   <p>핵심만 빠르게 실행해 보세요. 나중에 다듬는 것보다 <strong>지금 시작</strong>이 더 중요합니다.</p>
 </div>
 """.strip()
-        return html_body
+
+def gen_body_info(kw:str)->str:
+    if _oai.api_key is None:
+        return _static_body_html(kw)
 
     sys_p="너는 사람스러운 한국어 칼럼니스트다. 광고/구매 표현 없이 지식형 글을 쓴다."
     usr=f"""주제: {kw}
@@ -322,7 +345,7 @@ def gen_body_info(kw:str)->str:
 - 출력: 순수 HTML만"""
     body=_ask_chat(OPENAI_MODEL, sys_p, usr, max_tokens=950, temperature=0.8)
     if not body:
-        return gen_body_info.__wrapped__(kw)  # type: ignore
+        return _static_body_html(kw)
     return _css_block()+'\n<div class="post-info">\n'+strip_code_fences(body)+"\n</div>"
 
 # ===== WP =====
@@ -345,8 +368,8 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str="정보", tag:s
         except Exception:
             pass
     payload={
-        "title": title,
-        "content": html_body,
+        "title": title,       # 텍스트
+        "content": html_body, # HTML
         "status": POST_STATUS,
         "categories": [cat_id],
         "tags": tag_ids,

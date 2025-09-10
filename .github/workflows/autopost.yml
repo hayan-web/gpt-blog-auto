@@ -120,7 +120,7 @@ jobs:
       - name: Update keywords (general & shopping)
         run: |
           if [ -f update_keywords.py ]; then
-            python update_keywords.py --k ${KEYWORDS_K} --gold 5 --shop-k 20 --shop-gold 8 --days 7 --parallel 8 || true
+            python update_keywords.py --k 30 --gold 12 --shop-k 30 --shop-gold 12 --days 7 --parallel 8 || true
           else
             echo "SKIP: update_keywords.py not found"
           fi
