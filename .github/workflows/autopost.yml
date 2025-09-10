@@ -1,9 +1,14 @@
-﻿name: run
+﻿# 파일 경로 만들기
+$wf = ".github/workflows/autopost.yml"
+New-Item -ItemType Directory -Force ".github/workflows" | Out-Null
+
+@'
+name: run
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *"  # runs daily (UTC 00:30) — scripts schedule KST posts internally
+    - cron: "30 0 * * *"  # 09:30 KST daily (UTC+9)
 
 concurrency:
   group: autopost
@@ -59,6 +64,7 @@ jobs:
           KEYWORDS_CSV=${{ vars.KEYWORDS_CSV || 'keywords.csv' }}
           ALLOW_CREATE_TERMS=${{ vars.ALLOW_CREATE_TERMS || 1 }}
           EXISTING_CATEGORIES=${{ vars.EXISTING_CATEGORIES || '뉴스,비공개,쇼핑,전체글,게시글,정보,취미' }}
+          GENERAL_TIMES_KST=${{ vars.GENERAL_TIMES_KST || '09:00,11:00,14:00,17:00,20:00' }}
           # ===== Affiliate Content =====
           PRODUCTS_SEED_CSV=${{ vars.PRODUCTS_SEED_CSV || 'products_seed.csv' }}
           DEFAULT_CATEGORY=${{ vars.DEFAULT_CATEGORY || '정보' }}
@@ -156,19 +162,19 @@ jobs:
           mkdir -p .usage
           [ -f .usage/.gitkeep ] || touch .usage/.gitkeep
 
-      - name: Post 5 general articles (KST 09/11/14/17/20)
+      - name: Post five general articles
         run: |
           if [ -f auto_wp_gpt.py ]; then
-                        python auto_wp_gpt.py --mode=two-posts
+            python auto_wp_gpt.py --mode=general-5
           else
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      - name: Affiliate posts x3 (KST 12/16/18)
+      - name: Affiliate posts at 12/16/18 KST
         run: |
           set -o pipefail
           if [ -f affiliate_post.py ]; then
-                        AFFILIATE_TIME_KST=12:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
+            AFFILIATE_TIME_KST=12:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
             AFFILIATE_TIME_KST=16:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
             AFFILIATE_TIME_KST=18:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
           else
@@ -193,4 +199,4 @@ jobs:
             git commit -m "chore: rotate keywords & persist usage logs (auto)"
             git push
           fi
-
+'@ | Set-Content -LiteralPath $wf -Encoding UTF8

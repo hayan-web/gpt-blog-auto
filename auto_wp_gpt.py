@@ -1,9 +1,10 @@
-# auto_wp_gpt.py  — 2025-09-11
+﻿# auto_wp_gpt.py  — 2025-09-11 (patched)
 # 핵심 변경
 # - choose_category(): 키워드가 뉴스 톤이면 '뉴스'로, 아니면 DEFAULT_CATEGORY로
 # - CTA 버튼 URL을 '해당 글에 실제로 지정되는 카테고리' 링크로 생성
 # - --category 옵션으로 강제 카테고리 지정 가능
 # - 로그에 [CTA] category=..., category_url=... 출력
+# - general-5 모드 추가(기본 09/11/14/17/20 KST, env GENERAL_TIMES_KST로 커스텀)
 
 import os, re, sys, csv, html
 from datetime import datetime, timedelta, timezone
@@ -265,7 +266,7 @@ def _split_body_into_two(html_body:str)->Tuple[str,str]:
         return "".join(parts[:mid]),"".join(parts[mid:])
     blocks=[]
     for i in range(0,len(parts),2):
-        blk=parts[i]; 
+        blk=parts[i]
         if i+1<len(parts): blk+=parts[i+1]
         blocks.append(blk)
     total=sum(len(b) for b in blocks); acc=0; cut_idx=1
@@ -314,6 +315,26 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str="정보", tag:s
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
     r.raise_for_status(); return r.json()
 
+# === 키워드/시간 도우미 ===
+def _parse_general_times_env(default_times=None):
+    """Parse GENERAL_TIMES_KST env (e.g., '09:00,11:00,14:00,17:00,20:00') -> list[(h,m)]"""
+    if default_times is None:
+        default_times = [(9,0),(11,0),(14,0),(17,0),(20,0)]
+    v = os.getenv("GENERAL_TIMES_KST")
+    if not v:
+        return default_times
+    slots = []
+    for part in v.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            hh, mm = part.split(":")
+            slots.append((int(hh), int(mm)))
+        except Exception:
+            continue
+    return slots or default_times
+
 # === 메인 ===
 def pick_daily_keywords(n:int=2)->List[str]:
     used=_load_used_set(30); out=[]
@@ -321,7 +342,7 @@ def pick_daily_keywords(n:int=2)->List[str]:
     arr2=[k for k in _read_line("keywords.csv")       if k and (k not in used) and not is_shopping_like(k)]
     for pool in (arr1,arr2):
         for k in pool:
-            out.append(k); 
+            out.append(k)
             if len(out)>=n: break
         if len(out)>=n: break
     while len(out)<n:
@@ -330,7 +351,7 @@ def pick_daily_keywords(n:int=2)->List[str]:
     print(f"[GENERAL] picked: {out}")
     return out[:n]
 
-def run_two_posts(force_category:str|None=None):
+def run_two_posts(force_category: str|None=None):
     kws=pick_daily_keywords(2)
     times=[(10,0),(17,0)]
     for idx,(kw,(h,m)) in enumerate(zip(kws,times)):
@@ -343,15 +364,44 @@ def run_two_posts(force_category:str|None=None):
         print(f"[OK] scheduled ({idx}) '{title}' -> {link}")
         _mark_used(kw); _consume_from_sources(kw)
 
+def run_general_5(force_category: str|None=None):
+    # 5개 일반글: 기본 09/11/14/17/20 KST 또는 GENERAL_TIMES_KST 사용
+    times = _parse_general_times_env()
+    # 정확히 5개로 맞추기(부족하면 마지막 시간 반복, 넘치면 앞의 5개만)
+    if len(times) < 5:
+        last = times[-1] if times else (9,0)
+        times = (times + [last]*5)[:5]
+    else:
+        times = times[:5]
+
+    kws=pick_daily_keywords(5)
+    for idx, (kw, (h,m)) in enumerate(zip(kws, times)):
+        category = force_category or choose_category(kw)
+        cta_url  = _category_link(category)
+        print(f"[CTA] category='{category}', category_url={cta_url}")
+        title    = hook_title(kw)
+        html_b   = gen_body_info(kw, cta_url)
+        try:
+            link = post_wp(title, html_b, _slot_or_next_day(h,m), category=category, tag=kw).get("link")
+            print(f"[OK] scheduled ({idx}) '{title}' -> {link}")
+            _mark_used(kw); _consume_from_sources(kw)
+        except Exception as e:
+            print(f"[ERR] posting '{kw}' @ {h:02d}:{m:02d} -> {e}")
+
 def main():
     if not (WP_URL and WP_USER and WP_APP_PASSWORD):
         raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
     import argparse
     ap=argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=["two-posts"], default="two-posts")
+    ap.add_argument("--mode", choices=["two-posts","general-5"], default="two-posts")
     ap.add_argument("--category", help="모드 전체에 강제 카테고리(예: 뉴스)")
     args=ap.parse_args()
-    if args.mode=="two-posts": run_two_posts(force_category=args.category)
+    if args.mode=="two-posts":
+        run_two_posts(force_category=args.category)
+    elif args.mode=="general-5":
+        run_general_5(force_category=args.category)
+    else:
+        print("unknown mode")
 
 if __name__=="__main__":
     sys.exit(main())
