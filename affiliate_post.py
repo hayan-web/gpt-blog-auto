@@ -128,7 +128,6 @@ def _load_used_set(days:int=30) -> set:
                 if d >= cutoff:
                     used.add(kw.strip())
             except Exception:
-                # 구버전 호환(키워드만 저장한 경우)
                 used.add(line)
     return used
 
@@ -151,7 +150,7 @@ def _pick_keyword() -> str:
     for p in KEYWORDS_PRIMARY:
         arr = _read_col_csv(p) if p.endswith(".csv") and p != "keywords.csv" else _read_line_csv(p)
         cand = [k for k in arr if k]
-        if not cand: 
+        if not cand:
             continue
         # 최근 사용 회피 우선
         for k in cand:
