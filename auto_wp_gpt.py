@@ -1,7 +1,8 @@
 # auto_wp_gpt.py
 # 일상글 2건 자동 예약(10:00, 17:00 KST) + 슬롯 충돌 시 최대 7일 이월
-# 본문은 마크다운이 아닌 **HTML**로 전송하여 워드프레스 기본 스타일을 유지
-# (Gutenberg/테마 스타일에 자연스럽게 맞는 h2/h3/ul/table 등 표준 태그 사용)
+# 본문은 마크다운이 아닌 HTML로 전송하여 워드프레스 기본 스타일 유지
+# (h2/h3/ul/ol/blockquote/table 표준 태그 사용)
+# 폴백 키워드("일상 아카이브 …")는 제목/본문/프롬프트에 노출하지 않음
 
 from __future__ import annotations
 import argparse, csv, os, sys, requests
@@ -151,22 +152,32 @@ def _append_usage(kw:str)->None:
     with open(USAGE_GENERAL,"a",encoding="utf-8") as f:
         f.write(f"{today},{kw}\n")
 
+# --- Fallback detection -------------------------------------
+def _is_fallback_kw(kw: str) -> bool:
+    return kw.startswith("일상 아카이브 ")
+
 # --- Title / Body (HTML) ------------------------------------
 def _make_title_from_keyword(kw:str)->str:
-    # '예약' 같은 접두어 절대 삽입하지 않음
+    """
+    폴백 키워드(일상 아카이브 …)는 사용자에게 노출하지 않음.
+    """
+    if _is_fallback_kw(kw):
+        return "요즘 사람들이 진짜 궁금해하는 포인트 정리"
     return f"{kw} : 요즘 사람들이 진짜 궁금해하는 포인트 정리"
 
 def _build_static_html_body(kw:str)->str:
     """마크다운 X, 표준 HTML. 테마/구텐베르크 스타일을 그대로 받는다."""
-    # TOC 플러그인/테마가 있으면 [toc] 인식, 없으면 그냥 텍스트로 노출되나 무해.
+    # TOC 플러그인/테마가 있으면 [toc] 인식, 없으면 텍스트로 노출되지만 무해.
+    heading = "" if _is_fallback_kw(kw) else f"<h2>{kw} 한눈에 보기</h2>"
+    intro = (
+        "<p>핵심 포인트를 빠르게 이해할 수 있도록 간단히 정리했습니다. "
+        "최신 사례와 실전 팁을 바탕으로 <strong>바로 적용 가능한 포인트</strong>만 담았습니다.</p>"
+    )
     return f"""
 <p>[toc]</p>
 
-<h2>{kw} 한눈에 보기</h2>
-<ul>
-  <li>핵심 포인트를 빠르게 이해할 수 있도록 간단히 정리했습니다.</li>
-  <li>최신 사례와 실전 팁을 바탕으로 <strong>바로 적용 가능한 포인트</strong>만 담았습니다.</li>
-</ul>
+{heading}
+{intro}
 
 <h2>핵심 요약</h2>
 <ol>
@@ -197,14 +208,18 @@ def _openai_generate_html_body(kw:str)->str:
     try:
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
+
+        # 폴백이면 키워드를 프롬프트에 넣지 않음(노출 방지)
+        prompt_kw = "" if _is_fallback_kw(kw) else f"키워드: {kw}\n"
+
         sys_prompt = (
             "너는 한국어 글쓰기 전문가다. 워드프레스에 그대로 붙여넣을 "
-            "<h2>/<h3>/<p>/<ul>/<ol>/<blockquote>/<table> 등 <strong>HTML</strong>만 출력해라. "
-            "마크다운(##, -, **) 금지. 인라인 스타일은 최소화. 제목에 '예약' 같은 접두어 금지. "
+            "<h2>/<h3>/<p>/<ul>/<ol>/<blockquote>/<table> 등 HTML만 출력해라. "
+            "마크다운(##, -, **) 금지. 인라인 스타일 최소화. 제목에 '예약' 같은 접두어 금지. "
             "본문 맨 위에 [toc] 단축코드를 한 단락으로 포함해라."
         )
         user_prompt = (
-            f"키워드: {kw}\n"
+            f"{prompt_kw}"
             f"- 섹션: 한눈에 보기 / 핵심 요약 / 디테일 가이드 / 정리\n"
             f"- 톤: 간결하고 실용적, 소제목은 h2, 필요시 h3\n"
             f"- 글자수: 900~1400자\n"
@@ -229,7 +244,7 @@ def _wp_create_post(date_gmt_str:str, title:str, content_html:str)->dict:
     url = f"{WP_URL}/wp-json/wp/v2/posts"
     payload = {
         "title": title,
-        "content": content_html,   # << HTML 그대로 전송
+        "content": content_html,   # HTML 그대로 전송
         "status": POST_STATUS,
         "date_gmt": date_gmt_str,
     }
