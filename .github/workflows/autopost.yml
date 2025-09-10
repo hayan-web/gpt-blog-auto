@@ -1,11 +1,11 @@
-name: run
+﻿name: run
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *"  # 매일 09:30 KST (UTC 기준 00:30)
+    - cron: "30 0 * * *"  # 留ㅼ씪 09:30 KST (UTC 湲곗? 00:30)
 
-# 동시 실행 방지: 수동/스케줄이 겹쳐도 한 번만 수행
+# ?숈떆 ?ㅽ뻾 諛⑹?: ?섎룞/?ㅼ?以꾩씠 寃뱀퀜????踰덈쭔 ?섑뻾
 concurrency:
   group: autopost
   cancel-in-progress: true
@@ -58,14 +58,14 @@ jobs:
           POST_STATUS=${{ vars.POST_STATUS || 'future' }}
           KEYWORDS_CSV=${{ vars.KEYWORDS_CSV || 'keywords.csv' }}
           ALLOW_CREATE_TERMS=${{ vars.ALLOW_CREATE_TERMS || 1 }}
-          EXISTING_CATEGORIES=${{ vars.EXISTING_CATEGORIES || '뉴스,비공개,쇼핑,전체글,게시글,정보,취미' }}
+          EXISTING_CATEGORIES=${{ vars.EXISTING_CATEGORIES || '?댁뒪,鍮꾧났媛??쇳븨,?꾩껜湲,寃뚯떆湲,?뺣낫,痍⑤?' }}
           # ===== Affiliate Content =====
           PRODUCTS_SEED_CSV=${{ vars.PRODUCTS_SEED_CSV || 'products_seed.csv' }}
-          DEFAULT_CATEGORY=${{ vars.DEFAULT_CATEGORY || '정보' }}
+          DEFAULT_CATEGORY=${{ vars.DEFAULT_CATEGORY || '?뺣낫' }}
           DEFAULT_TAGS=${{ vars.DEFAULT_TAGS }}
-          AFFILIATE_CATEGORY=${{ vars.AFFILIATE_CATEGORY || '쇼핑' }}
+          AFFILIATE_CATEGORY=${{ vars.AFFILIATE_CATEGORY || '?쇳븨' }}
           AFFILIATE_TAGS=${{ vars.AFFILIATE_TAGS }}
-          DISCLOSURE_TEXT=${{ vars.DISCLOSURE_TEXT || '이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.' }}
+          DISCLOSURE_TEXT=${{ vars.DISCLOSURE_TEXT || '???ъ뒪?낆? 荑좏뙜 ?뚰듃?덉뒪 ?쒕룞???쇳솚?쇰줈, ?댁뿉 ?곕Ⅸ ?쇱젙?≪쓽 ?섏닔猷뚮? ?쒓났?⑸땲??' }}
           # ===== Ads =====
           AD_METHOD=${{ vars.AD_METHOD }}
           AD_SHORTCODE=${{ vars.AD_SHORTCODE }}
@@ -114,7 +114,7 @@ jobs:
           if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
             echo "[OK] Coupang keys are set."
           else
-            echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 검색/딥링크는 폴백 사용"
+            echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> API 寃???λ쭅?щ뒗 ?대갚 ?ъ슜"
           fi
 
       - name: Update keywords (general & shopping)
@@ -159,7 +159,7 @@ jobs:
       - name: Post two general articles
         run: |
           if [ -f auto_wp_gpt.py ]; then
-            python auto_wp_gpt.py --mode=two-posts
+                python auto_wp_gpt.py --mode=general-5
           else
             echo "SKIP: auto_wp_gpt.py not found"
           fi
@@ -167,7 +167,7 @@ jobs:
       - name: Affiliate post (LRU/no-repeat/rotate)
         run: |
           set -o pipefail
-          python affiliate_post.py 2>&1 | tee /tmp/affiliate_out.txt || true
+              python affiliate_post.py --mode=aff-3
           echo "---- Affiliate tail ----"
           tail -n 200 /tmp/affiliate_out.txt || true
           echo "---- used_shopping tail ----"
@@ -178,7 +178,7 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # 혹시 모를 원격 갱신 반영(충돌 최소화)
+          # ?뱀떆 紐⑤? ?먭꺽 媛깆떊 諛섏쁺(異⑸룎 理쒖냼??
           git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
           git add -f golden_shopping_keywords.csv keywords_shopping.csv || true
           git add -f .usage/used_shopping.txt .usage/used_general.txt .usage/.gitkeep || true
@@ -188,3 +188,4 @@ jobs:
             git commit -m "chore: rotate keywords & persist usage logs (auto)"
             git push
           fi
+
