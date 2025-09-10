@@ -2,7 +2,7 @@
 import os, re, csv, json, sys, html, urllib.parse, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -38,6 +38,10 @@ USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.3"
 USAGE_DIR = os.getenv("USAGE_DIR") or ".usage"
 USED_FILE = os.path.join(USAGE_DIR, "used_shopping.txt")
 
+# NEW: 반복 방지/우선순위
+AFF_USED_BLOCK_DAYS = int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")  # 최근 n일 내 사용은 후순위
+NO_REPEAT_TODAY = (os.getenv("NO_REPEAT_TODAY") or "1").lower() in ("1","true","yes","y","on")
+
 REQ_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 _client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -53,7 +57,12 @@ def _read_col_csv(path: str) -> List[str]:
             if not row: continue
             if i==0 and row[0].lower() in ("keyword","title"): continue
             if row[0].strip(): out.append(row[0].strip())
-    return out
+    # 중복 제거(순서 보존)
+    seen=set(); uniq=[]
+    for k in out:
+        if k not in seen:
+            seen.add(k); uniq.append(k)
+    return uniq
 
 def _read_line_csv(path: str) -> List[str]:
     if not os.path.exists(path): return []
@@ -89,6 +98,7 @@ def _rotate_csvs_on_success(kw: str):
 def _ensure_usage(): os.makedirs(USAGE_DIR, exist_ok=True)
 
 def _load_used_set(days:int=30)->set:
+    """[호환용] 최근 n일 내 사용된 키워드 집합. (기존 코드 사용처 대비 유지)"""
     _ensure_usage()
     if not os.path.exists(USED_FILE): return set()
     cutoff = datetime.utcnow().date() - timedelta(days=days)
@@ -104,6 +114,29 @@ def _load_used_set(days:int=30)->set:
             except Exception:
                 s.add(ln)
     return s
+
+def _load_usage_map()->Tuple[Dict[str, datetime.date], set]:
+    """키워드별 마지막 사용일(last)과 '오늘 사용' 집합(used_today) 반환."""
+    _ensure_usage()
+    last: Dict[str, datetime.date] = {}
+    used_today=set()
+    today=datetime.utcnow().date()
+    if os.path.exists(USED_FILE):
+        with open(USED_FILE,"r",encoding="utf-8",errors="ignore") as f:
+            for ln in f:
+                ln=ln.strip()
+                if not ln: continue
+                try:
+                    d_str, kw = ln.split("\t",1)
+                    d=datetime.strptime(d_str,"%Y-%m-%d").date()
+                    kw=kw.strip()
+                except Exception:
+                    continue
+                prev=last.get(kw)
+                last[kw] = d if (prev is None or d>prev) else prev
+                if d==today:
+                    used_today.add(kw)
+    return last, used_today
 
 def _mark_used(kw:str):
     _ensure_usage()
@@ -131,7 +164,7 @@ def _slot_or_next_day(hhmm:str)->str:
         return (tgt+timedelta(days=1)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     return tgt_utc.strftime("%Y-%m-%dT%H:%M:%S")
 
-# ===== Picking keyword (랜덤 + 30일 회피) =====
+# ===== Picking keyword (LRU + 30일 회피) =====
 def _seasonal_fallback()->str:
     m=_now_kst().month
     summer=["넥쿨러","휴대용 선풍기","냉감 패드","아이스 넥밴드","쿨링 타월","쿨링 토퍼"]
@@ -141,30 +174,50 @@ def _seasonal_fallback()->str:
     return random.choice(pool)
 
 def _pick_keyword()->str:
-    used=_load_used_set(30)
-    pool=[]
-    a=_read_col_csv("golden_shopping_keywords.csv")
-    b=_read_col_csv("keywords_shopping.csv")
-    c=_read_line_csv("keywords.csv")
-    for src,arr in [("golden",a),("shop",b),("line",c)]:
-        if arr: pool.extend([(src,k) for k in arr])
-    pool_unique=[]
+    # 소스별 키워드 수집(순서 보존, 중복 제거)
+    golden=_read_col_csv("golden_shopping_keywords.csv")
+    shop  =_read_col_csv("keywords_shopping.csv")
+    line  =_read_line_csv("keywords.csv")
+    union=[]
     seen=set()
-    for src,k in pool:
-        if k not in seen:
-            seen.add(k); pool_unique.append((src,k))
-    # 우선: 30일 미사용 + 랜덤
-    candidates=[k for _,k in pool_unique if k not in used]
-    if candidates:
-        k=random.choice(candidates)
-        print(f"[AFFILIATE] pick '{k}' (unused in 30d) from union")
-        return k
-    if pool_unique:
-        print(f"[AFFILIATE] all candidates used recently; fallback to first from union")
-        return pool_unique[0][1]
-    fb=_seasonal_fallback()
-    print(f"[AFFILIATE] WARN: no shopping keywords -> seasonal '{fb}'")
-    return fb
+    for k in golden + shop + line:
+        if k and k not in seen:
+            seen.add(k); union.append(k)
+
+    if not union:
+        fb=_seasonal_fallback()
+        print(f"[AFFILIATE] WARN: no shopping keywords -> seasonal '{fb}'")
+        return fb
+
+    last, used_today = _load_usage_map()
+    today=datetime.utcnow().date()
+
+    def days_since(kw:str)->int:
+        d=last.get(kw)
+        return (today - d).days if d else 10**6  # 한 번도 안 쓴 경우 최우선
+
+    # 1) 당일 사용 키워드는 제외(설정 켜져 있으면)
+    pool = [k for k in union if (k not in used_today) or (not NO_REPEAT_TODAY)]
+    if not pool:
+        pool = union[:]  # 전부 오늘 쓴 상태면 전체로 진행
+
+    # 2) 최근 n일 내 사용은 후순위 (fresh 먼저, stale 나중)
+    fresh=[k for k in pool if days_since(k) >= AFF_USED_BLOCK_DAYS]
+    stale=[k for k in pool if days_since(k) <  AFF_USED_BLOCK_DAYS]
+
+    # 3) 각 그룹 내부에서 LRU(가장 오래 안 쓴) 우선: days_since 내림차순
+    fresh.sort(key=days_since, reverse=True)
+    stale.sort(key=days_since, reverse=True)
+
+    ordered = (fresh + stale) if (fresh or stale) else sorted(pool, key=days_since, reverse=True)
+    pick = ordered[0]
+
+    if fresh:
+        print(f"[AFFILIATE] pick '{pick}' (unused >= {AFF_USED_BLOCK_DAYS}d or never)")
+    else:
+        print(f"[AFFILIATE] all candidates used < {AFF_USED_BLOCK_DAYS}d; pick least-recently-used -> '{pick}'")
+
+    return pick
 
 # ===== Tag util =====
 def _clean_hashtag_token(s:str)->str:
