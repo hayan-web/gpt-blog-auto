@@ -7,6 +7,7 @@ affiliate_post.py — 쿠팡글 1건 예약(기본 13:00 KST)
 - 딥링크: 키 있으면 API 변환, 없으면 검색 URL 폴백
 - CTA: 본문 중간 1회 + 끝 1회 버튼형(gradient/hover/shadow, 모바일 100%)
 - NEW: 해당 시각에 예약글 있으면 '다음날 같은 시각'으로 1회 이월
+- NEW2: 최근 사용(30일) 키워드 회피 + 예약 성공 시 사용 기록(.usage/used_shopping.txt)
 """
 import os, re, csv, json, sys, html, urllib.parse, random
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,8 @@ BUTTON_TEXT_ENV = (os.getenv("BUTTON_TEXT") or "").strip()
 KEYWORDS_PRIMARY = ["golden_shopping_keywords.csv", "keywords_shopping.csv", "keywords.csv"]
 PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv"
 USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.2"
+USAGE_DIR = os.getenv("USAGE_DIR") or ".usage"
+USED_FILE = os.path.join(USAGE_DIR, "used_shopping.txt")
 
 REQ_HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
@@ -60,24 +63,20 @@ def _to_gmt_at_kst(hhmm: str) -> str:
     if tgt <= now: tgt += timedelta(days=1)
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-# NEW: 해당 UTC 시각 주변에 예약글이 있는지 검사
+# 예약 충돌 검사(±1분)
 def _wp_has_future_at(when_gmt_dt: datetime) -> bool:
-    try:
-        after = (when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        before = (when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        r = requests.get(
-            f"{WP_URL}/wp-json/wp/v2/posts",
-            params={"status": "future", "after": after, "before": before, "per_page": 5},
-            headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
-            verify=WP_TLS_VERIFY, timeout=15,
-        )
-        r.raise_for_status()
-        return len(r.json()) > 0
-    except Exception as e:
-        print(f"[AFFILIATE] WARN: future slot check failed: {e}")
-        return False
+    after = (when_gmt_dt - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    before = (when_gmt_dt + timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    r = requests.get(
+        f"{WP_URL}/wp-json/wp/v2/posts",
+        params={"status": "future", "after": after, "before": before, "per_page": 5},
+        headers=REQ_HEADERS, auth=(WP_USER, WP_APP_PASSWORD),
+        verify=WP_TLS_VERIFY, timeout=15,
+    )
+    r.raise_for_status()
+    return len(r.json()) > 0
 
-# NEW: 예약 충돌 시 '다음날 같은 시각'으로 1회만 이월
+# 충돌 시 +1일
 def _slot_or_next_day(hhmm: str) -> str:
     h, m = (hhmm.split(":") + ["0"])[:2]
     h, m = int(h), int(m)
@@ -109,6 +108,35 @@ def _read_line_csv(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         return [x.strip() for x in f.readline().split(",") if x.strip()]
 
+# ===== USED KEYWORD LOG =====
+def _ensure_usage_dir():
+    os.makedirs(USAGE_DIR, exist_ok=True)
+
+def _load_used_set(days:int=30) -> set:
+    _ensure_usage_dir()
+    if not os.path.exists(USED_FILE): return set()
+    cutoff = datetime.utcnow().date() - timedelta(days=days)
+    used = set()
+    with open(USED_FILE, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            # 형식: YYYY-MM-DD\tkeyword
+            try:
+                d_str, kw = line.split("\t", 1)
+                d = datetime.strptime(d_str, "%Y-%m-%d").date()
+                if d >= cutoff:
+                    used.add(kw.strip())
+            except Exception:
+                # 구버전 호환(키워드만 저장한 경우)
+                used.add(line)
+    return used
+
+def _mark_used(kw: str):
+    _ensure_usage_dir()
+    with open(USED_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.utcnow().date():%Y-%m-%d}\t{kw.strip()}\n")
+
 # ===== KEYWORDS (seasonal fallback) =====
 def _seasonal_fallback() -> str:
     m = _now_kst().month
@@ -119,10 +147,20 @@ def _seasonal_fallback() -> str:
     return pool[(datetime.utcnow().day-1) % len(pool)]
 
 def _pick_keyword() -> str:
+    used = _load_used_set(30)
     for p in KEYWORDS_PRIMARY:
         arr = _read_col_csv(p) if p.endswith(".csv") and p != "keywords.csv" else _read_line_csv(p)
-        arr = [k for k in arr if k]
-        if arr: return arr[0]
+        cand = [k for k in arr if k]
+        if not cand: 
+            continue
+        # 최근 사용 회피 우선
+        for k in cand:
+            if k not in used:
+                print(f"[AFFILIATE] pick '{k}' from {p} (unused in 30d)")
+                return k
+        # 전부 사용된 경우라도 첫 항목 사용
+        print(f"[AFFILIATE] all candidates used recently; fallback to first from {p}")
+        return cand[0]
     fb = _seasonal_fallback()
     print(f"[AFFILIATE] WARN: shopping keywords empty -> seasonal fallback '{fb}'")
     return fb
@@ -310,12 +348,11 @@ def _css_block() -> str:
 """
 
 def _sanitize_label(s: str) -> str:
-    import re
     return re.sub(r'^[#\s]+', '', (s or '')).strip()
 
 def _cta_text(primary: bool) -> str:
     if primary:
-        return "제품 보러가기"  # 메인 버튼은 고정
+        return "제품 보러가기"
     if BUTTON_TEXT_ENV:
         return _sanitize_label(BUTTON_TEXT_ENV)
     choices = [
@@ -329,7 +366,6 @@ def _cta_text(primary: bool) -> str:
 def _cta_html(link: str, primary: bool = True) -> str:
     label = html.escape(_cta_text(primary))
     cls = "btn-cta" if primary else "btn-ghost"
-    # 테마/플러그인 CSS에 덮이지 않도록 인라인 스타일도 함께 적용(이중 안전장치)
     if primary:
         inline = ("display:inline-flex;align-items:center;justify-content:center;gap:8px;"
                   "padding:16px 28px;border-radius:999px;font-weight:900;font-size:1.05rem;"
@@ -358,12 +394,10 @@ def _inject_mid_cta(body_html: str, cta_html: str) -> str:
             break
     if idx != -1:
         return body_html[:idx] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[idx:]
-
     m2 = re.search(r"<h3[^>]*>", body_html, flags=re.I)
     if m2:
         pos = m2.start()
         return body_html[:pos] + f'\n<div class="cta">{cta_html}</div>\n' + body_html[pos:]
-
     return f'<div class="cta">{cta_html}</div>\n' + body_html
 
 def _gen_review_html(kw: str, deeplink: str, img_url: str = "", search_url: str = "") -> str:
@@ -417,16 +451,21 @@ def main():
 
     title = _hook_title(kw)
     html_body = _gen_review_html(kw, deeplink, hero_img, search_url)
-    # ★ 기존 옵션 유지 + '다음날 이월'만 추가
     when_gmt = _slot_or_next_day(AFFILIATE_TIME_KST)
 
     res = _post_wp(title, html_body, when_gmt, DEFAULT_CATEGORY, tags)
+
+    # 예약 성공 시 사용 키워드 기록
+    if res.get("id"):
+        _mark_used(kw)
+
     print(json.dumps({
         "post_id": res.get("id"),
         "link": res.get("link"),
         "status": res.get("status"),
         "date_gmt": res.get("date_gmt"),
-        "title": res.get("title", {}).get("rendered", title)
+        "title": res.get("title", {}).get("rendered", title),
+        "keyword": kw
     }, ensure_ascii=False))
 
 if __name__ == "__main__":
