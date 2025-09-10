@@ -1,277 +1,273 @@
 # -*- coding: utf-8 -*-
 """
-update_keywords.py
-- 일반/쇼핑 키워드 최대 30개 수집 → 점수화 → 골든 선별(기본 12개)
-- 일반: 뉴스 기반 빈도+신선도+형태 점수
-- 쇼핑: 계절/월 가중치 + 길이/스멜 보정
-- 출력:
-  - keywords_general.csv, golden_keywords.csv
-  - keywords_shopping.csv, golden_shopping_keywords.csv
+update_keywords.py — 일반/쇼핑 키워드 자동 수집·클린·선별
+- 일반/쇼핑 각각 최대 K개(기본 30) 수집 후 정제/점수화 → CSV 2종 + golden 2종 작성
+  * 일반: keywords_general.csv, golden_keywords.csv
+  * 쇼핑: keywords_shopping.csv, golden_shopping_keywords.csv
+- HTML 엔티티/태그/퍼블리셔 꼬리/연도-only/짧은 토큰/&quot 등 쓰레기 제거
+- 'Namespace is not subscriptable' 오류 수정(모든 args는 속성 접근)
+- 외부 API(NEWSAPI, NAVER) 실패 시에도 안전 폴백
 """
-import os, re, csv, math, argparse, time
+
+from __future__ import annotations
+import os, re, csv, html, time, json
 from datetime import datetime, timedelta, timezone
-from collections import Counter, defaultdict
+from typing import Iterable, List, Tuple
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 
-KST = timezone(timedelta(hours=9))
-
-# ---------- ENV ----------
+# ===== ENV =====
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
 NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
 
 USER_AGENT = os.getenv("USER_AGENT", "gpt-blog-keywords/1.3")
+HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json; charset=utf-8"}
 
-HEADERS_NEWS = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-HEADERS_NAVER = {
-    "User-Agent": USER_AGENT, "Accept": "application/json",
-    "X-Naver-Client-Id": NAVER_CLIENT_ID or "",
-    "X-Naver-Client-Secret": NAVER_CLIENT_SECRET or "",
-}
+# ===== I/O =====
+GEN_OUT = "keywords_general.csv"
+GEN_GOLD = "golden_keywords.csv"
+SHOP_OUT = "keywords_shopping.csv"
+SHOP_GOLD = "golden_shopping_keywords.csv"
 
-# ---------- I/O ----------
-def write_list_csv(path, items):
+# ===== Helpers =====
+def _write_col_csv(path: str, items: List[str]) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         w.writerow(["keyword"])
-        for it in items:
-            if isinstance(it, (list, tuple)): it = it[0]
-            w.writerow([str(it).strip()])
+        for k in items:
+            w.writerow([k])
 
-# ---------- TEXT UTILS ----------
-BAN_REGEX = re.compile(r"(쿠폰|최저가|할인|핫딜|쇼핑|구매|세일|공동구매|무료배송|원가|대란)")
-ONLY_KO = re.compile(r"[^가-힣0-9A-Za-z\s\-\&]")
-
-def norm(s: str) -> str:
-    s = s or ""
-    s = s.replace("\u200b", "").replace("\u00A0", " ")
-    s = ONLY_KO.sub(" ", s)
+def _norm_text(s: str) -> str:
+    if not s: return ""
+    s = html.unescape(s)
+    s = re.sub(r"<[^>]+>", " ", s)                  # strip tags
+    s = re.sub(r"[\|\-–—~·•●▶▷›»]+.*$", "", s)      # cut publisher tail "제목 | 언론사"
     s = re.sub(r"\s+", " ", s).strip()
+    # remove leading quotes/ticks
+    s = s.strip(" \"'“”‘’`")
     return s
 
-def is_shopping_like(s: str) -> bool:
-    if BAN_REGEX.search(s or ""): return True
-    if re.search(r"[A-Za-z]+[\-\s]?\d{2,}", s or ""): return True
-    # 제품/소재/의류 카테고리 흔한 단어
-    if re.search(r"(가습기|제습기|히터|전기요|패딩|코트|핫팩|선풍기|쿨링|담요|냉감|부츠|우산|레인코트|레인부츠|방수|텐트|버너|아이스박스|보온병|커피머신|에어프라이어|공기청정기|청소기)", s or ""):
-        return True
+def _is_bad_token(s: str) -> bool:
+    if not s: return True
+    if any(ent in s for ent in ["&quot", "&amp", "&lt", "&gt", "&#", ";"]): return True
+    if re.fullmatch(r"\d{2,4}(년|월|일)?", s): return True      # year/month/day only
+    if len(s) < 2 or len(s) > 30: return True
+    if re.fullmatch(r"[A-Za-z0-9 _\-]+", s) and len(s) < 5: return True  # too plain ascii short
+    # generic/잡음 단어들
+    ban = ["속보", "인사이트", "지디넷코리아", "오피니언", "기고", "사설", "단독", "기획", "종합", "오늘", "영상"]
+    if s in ban: return True
+    # 끝이 기호
+    if re.search(r"[^\w가-힣)]$", s): return True
+    # url-like
+    if "http" in s or "www." in s: return True
     return False
 
-def ngram_candidates(text, n=2):
-    toks = [t for t in norm(text).split(" ") if 1 < len(t) <= 20]
-    out = []
-    if n == 1:
-        out = toks
-    else:
-        for i in range(len(toks) - n + 1):
-            out.append(" ".join(toks[i:i+n]))
+def _dedup_keep_order(items: Iterable[str]) -> List[str]:
+    seen, out = set(), []
+    for x in items:
+        if not x or x in seen: continue
+        seen.add(x); out.append(x)
     return out
 
-# ---------- FETCH ----------
-def newsapi_top(days=3, limit=120):
+def _split_candidates(title: str) -> List[str]:
+    t = _norm_text(title)
+    if not t: return []
+    # split by separators, keep first meaningful part
+    parts = re.split(r"[|\-–—:~]", t)
+    parts = [p.strip() for p in parts if p.strip()]
+    cands = []
+    for p in parts:
+        # strip trailing publisher-like tokens (예: "네이버 뉴스", "조선일보")
+        p = re.sub(r"(네이버|다음|카카오|뉴스|일보|신문|TV|지디넷코리아|한겨레|중앙일보|조선일보|경향신문)$", "", p).strip()
+        # trail brackets/quotes
+        p = re.sub(r"^[\(\[]|[\)\]]$", "", p)
+        if not _is_bad_token(p): cands.append(p)
+    return cands[:2]  # 과분할 방지
+
+def _score_general(s: str) -> float:
+    score = 0.0
+    # 길이 보너스(적당한 길이)
+    L = len(s)
+    if 7 <= L <= 18: score += 2.0
+    elif 5 <= L <= 22: score += 1.0
+    # 한글 포함 가점
+    if re.search(r"[가-힣]", s): score += 1.5
+    # 숫자 과다 패널티
+    if re.search(r"\d{3,}", s): score -= 1.0
+    # 클린 여부 가점
+    if not _is_bad_token(s): score += 0.5
+    return score
+
+def _score_shopping(s: str, month: int) -> float:
+    score = 0.0
+    # 기본 길이/가독성
+    L = len(s)
+    if 6 <= L <= 20: score += 1.2
+    if re.search(r"[가-힣]", s): score += 1.0
+    # 계절 보정
+    seasonal = {
+        12: ["히터","전기장판","가습기","패딩","온열","핫팩","크리스마스"],
+        1:  ["히터","전기장판","가습기","패딩","온열","핫팩"],
+        2:  ["가습기","제습기","난방","온열","패딩"],
+        3:  ["공기청정기","미세먼지","자외선","봄코트","우산"],
+        4:  ["우산","우비","바람막이","운동화","피크닉","모기"],
+        5:  ["선풍기","쿨링","모기","캠핑","여행가방"],
+        6:  ["선풍기","휴대용 선풍기","쿨링","샤워필터","모기","썬케어"],
+        7:  ["에어컨","선풍기","쿨링","모기","여름이불","워터파크"],
+        8:  ["에어컨","쿨링","아이스팩","쿨매트","휴가"],
+        9:  ["가을 니트","가을 이불","전기포트","가습기","트렌치코트"],
+        10: ["전기장판","가습기","가을 니트","코트","무선청소기"],
+        11: ["전기장판","히터","가습기","김장","코트","블랙프라이데이"],
+    }
+    for w in seasonal.get(month, []):
+        if w in s: score += 2.0
+    # 쇼핑 냄새 가점(제품 카테고리성 명사)
+    if re.search(r"(선풍기|가습기|전기장판|히터|청소기|에어컨|이불|니트|코트|패딩|가방|키보드|마우스|헤드폰|충전기)", s):
+        score += 1.5
+    # 과도한 모델명/숫자 패널티
+    if re.search(r"[A-Za-z]+[-\s]?\d{2,}", s):
+        score -= 0.8
+    return score
+
+def _newsapi_titles(query: str, days: int, size: int = 50) -> List[str]:
     if not NEWSAPI_KEY: return []
-    url = "https://newsapi.org/v2/top-headlines"
-    params = {"country": "kr", "pageSize": 100, "apiKey": NEWSAPI_KEY}
-    items = []
+    url = "https://newsapi.org/v2/everything"
+    frm = (datetime.utcnow() - timedelta(days=max(1, days))).strftime("%Y-%m-%d")
     try:
-        r = requests.get(url, params=params, headers=HEADERS_NEWS, timeout=15)
+        r = requests.get(url, params={
+            "apiKey": NEWSAPI_KEY, "q": query, "from": frm, "language": "ko",
+            "pageSize": min(100, size), "sortBy": "publishedAt"
+        }, headers=HEADERS, timeout=15)
         r.raise_for_status()
-        items.extend(r.json().get("articles", []))
-    except Exception:
-        pass
-    # 보강: everything에서 최근 n일 범위 일반 주제 쿼리
-    q = "(일상 OR 라이프 OR 생활 OR 팁 OR 방법)"
-    frm = (datetime.now(KST) - timedelta(days=days)).strftime("%Y-%m-%d")
-    try:
-        r2 = requests.get(
-            "https://newsapi.org/v2/everything",
-            params={"q": q, "from": frm, "language": "ko", "sortBy": "publishedAt", "pageSize": 100, "apiKey": NEWSAPI_KEY},
-            headers=HEADERS_NEWS, timeout=15)
-        r2.raise_for_status()
-        items.extend(r2.json().get("articles", []))
-    except Exception:
-        pass
-    out = []
-    for a in items[:limit]:
-        t = a.get("title") or ""
-        d = a.get("description") or ""
-        p = a.get("publishedAt") or ""
-        out.append({"title": t, "desc": d, "at": p})
-    return out
-
-def naver_news_sample(q="생활 팁", display=50):
-    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET): return []
-    try:
-        r = requests.get(
-            "https://openapi.naver.com/v1/search/news.json",
-            params={"query": q, "display": display, "sort": "date"},
-            headers=HEADERS_NAVER, timeout=10)
-        r.raise_for_status()
-        items = r.json().get("items", [])
-        out = []
-        for it in items:
-            out.append({"title": it.get("title", ""), "desc": it.get("description", ""), "at": it.get("pubDate", "")})
-        return out
-    except Exception:
+        data = r.json()
+        return [a.get("title","") or "" for a in data.get("articles", [])]
+    except Exception as e:
+        print(f"[NEWSAPI][WARN] {type(e).__name__}: {e}")
         return []
 
-# ---------- SCORING ----------
-def recency_score(ts: str) -> float:
+def _naver_search_news(query: str, display: int = 30) -> List[str]:
+    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET): return []
+    url = "https://openapi.naver.com/v1/search/news.json"
+    headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
     try:
-        # NewsAPI ISO → UTC, Naver RFC-822 → local guess
-        if "T" in ts:
-            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        else:
-            dt = datetime.strptime(ts, "%a, %d %b %Y %H:%M:%S %z")
-        age_d = max(0.0, (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 86400.0)
-        return 1.5 * math.exp(-age_d/3.0)  # 0~1.5
-    except Exception:
-        return 0.6
+        r = requests.get(url, params={"query": query, "display": min(100, display), "sort": "date"},
+                         headers={**HEADERS, **headers}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        R = []
+        for it in data.get("items", []):
+            R.append(it.get("title","") or "")
+        return R
+    except Exception as e:
+        print(f"[NAVER][WARN] {type(e).__name__}: {e}")
+        return []
 
-def phrase_score(phrase: str) -> float:
-    # 너무 짧거나 긴 표현 억제
-    L = len(phrase)
-    s = 0.0
-    if 6 <= L <= 26: s += 0.8
-    if " " in phrase: s += 0.3  # 2그램 가산
-    if is_shopping_like(phrase): s -= 0.8  # 일반키워드일 땐 페널티
-    return s
+def _naver_search_shop(query: str, display: int = 30) -> List[str]:
+    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET): return []
+    url = "https://openapi.naver.com/v1/search/shop.json"
+    headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
+    try:
+        r = requests.get(url, params={"query": query, "display": min(100, display)},
+                         headers={**HEADERS, **headers}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        return [it.get("title","") or "" for it in data.get("items", [])]
+    except Exception as e:
+        print(f"[NAVERSHOP][WARN] {type(e).__name__}: {e}")
+        return []
 
-def aggregate_scores(rows):
-    # rows: [{title, desc, at}]
-    freq = Counter()
-    rec = defaultdict(float)
-    for r in rows:
-        txt = f"{r.get('title','')} {r.get('desc','')}"
-        at = r.get("at", "")
-        base = recency_score(at)
-        # 1-gram + 2-gram 혼합
-        for n in (1, 2):
-            for ph in ngram_candidates(txt, n=n):
-                ph = ph.strip()
-                if len(ph) < 4: continue
-                freq[ph] += 1
-                rec[ph] = max(rec[ph], base)
-    scores = {}
-    for ph, c in freq.items():
-        scores[ph] = c * 0.9 + rec[ph] + phrase_score(ph)
-    return scores
+# ===== Builders =====
+def build_general(k: int = 30, gold: int = 12, days: int = 7) -> Tuple[List[str], List[str]]:
+    seed_q = ["트렌드", "이슈", "심층", "분석", "관찰", "통찰", "연구", "데이터", "변화", "정책"]
+    titles: List[str] = []
+    for q in seed_q:
+        titles += _newsapi_titles(q, days, size=60)
+        titles += _naver_search_news(q, display=40)
+        time.sleep(0.2)
 
-# ---------- SEASON ----------
-def month_season_boost(month: int, kw: str) -> float:
-    kw = kw.lower()
-    season_map = {
-        12: ["크리스마스","연말","히터","전기요","핫팩","가습기","패딩","부츠","난방","방한","온수","보온","김장","연하장"],
-        1:  ["히터","전기요","핫팩","가습기","패딩","부츠","난방","방한","겨울 이불","보온","설 선물","다이어리"],
-        2:  ["가습기","핫팩","전기요","방한","발열내의","졸업","입학","밸런타인","프라그먼트","코트"],
-        3:  ["공기청정기","알레르기","미세먼지","우산","우비","봄 코트","스니커즈","여행가방","캠핑"],
-        4:  ["공기청정기","진드기","의류케어","피크닉","자외선차단","봄 이불","가벼운 자켓","청소기"],
-        5:  ["자외선차단","선크림","선풍기","제습기","긴팔셔츠","캠핑","가벼운 운동화","냉감","휴가 준비"],
-        6:  ["장마","우산","레인부츠","레인코트","방수","제습기","선풍기","냉감","모기퇴치","쿨링 타월"],
-        7:  ["선풍기","에어컨","쿨링 타월","냉감","물놀이","아이스박스","캠핑","여름 이불","모기퇴치"],
-        8:  ["휴가","물놀이","아이스박스","쿨링 타월","냉감","샌들","서큘레이터","선풍기","자외선차단"],
-        9:  ["가을 이불","가디건","가을 코트","보온병","커피머신","캠핑","운동회","학용품"],
-        10: ["가을 코트","트렌치","보온병","전기장판","가습기","건조기","미세먼지","핫팩"],
-        11: ["가습기","전기요","전기장판","히터","핫팩","보온병","패딩","부츠","김장","블랙프라이데이"],
+    cands: List[str] = []
+    for t in titles:
+        cands += _split_candidates(t)
+
+    # 클린 + dedup
+    cands = [c for c in cands if not _is_bad_token(c)]
+    cands = _dedup_keep_order(cands)
+    # 점수화
+    scored = sorted([(c, _score_general(c)) for c in cands], key=lambda x: x[1], reverse=True)
+    picked = [c for c,_ in scored][:k]
+    golds = [c for c,_ in scored][:max(1, min(gold, len(picked)))]
+
+    print(f"[GENERAL] {len(picked)} collected → write {len(picked)} (gold {len(golds)})")
+    _write_col_csv(GEN_OUT, picked)
+    _write_col_csv(GEN_GOLD, golds)
+    return picked, golds
+
+def build_shopping(shop_k: int = 30, shop_gold: int = 12, days: int = 7) -> Tuple[List[str], List[str]]:
+    # 계절 시드 + 범용 시드
+    month = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).month
+    season_seeds = {
+        12: ["히터", "전기장판", "가습기", "핫팩", "겨울 이불"],
+        1:  ["히터", "전기장판", "가습기", "패딩", "핫팩"],
+        2:  ["가습기", "온열", "전기요", "난방 텐트"],
+        3:  ["공기청정기", "봄코트", "자외선 차단"],
+        4:  ["우산", "바람막이", "운동화", "피크닉 매트"],
+        5:  ["선풍기", "쿨링 타월", "모기 퇴치기", "캠핑 의자"],
+        6:  ["휴대용 선풍기", "쿨매트", "모기장", "샤워필터"],
+        7:  ["에어컨", "아이스박스", "워터파크 준비물", "여름 이불"],
+        8:  ["휴가 준비물", "쿨러백", "아이스팩", "썬케어"],
+        9:  ["가을 니트", "무선청소기", "가습기", "전기포트"],
+        10: ["전기장판", "가습기", "코트", "김장 용품"],
+        11: ["블랙프라이데이", "히터", "전기장판", "가습기"],
     }
-    base = season_map.get(month, [])
-    boost = 0.0
-    for token in base:
-        if token.lower() in kw: boost += 1.0
-    # 제품/카테고리 느낌엔 추가 보정
-    if is_shopping_like(kw): boost += 0.3
-    return boost  # 0~N
+    base_seeds = ["베스트셀러", "가성비", "프리미엄", "신상품", "추천템"]
 
-# ---------- PIPELINE ----------
-def build_general(k=30, gold=12, days=7):
-    rows = []
-    rows += newsapi_top(days=days, limit=120)
-    rows += naver_news_sample("생활 팁", 50)
-    rows += naver_news_sample("트렌드 인사이트", 50)
+    titles: List[str] = []
+    for q in season_seeds.get(month, []) + base_seeds:
+        titles += _naver_search_shop(q, display=40)
+        titles += _naver_search_news(q, display=20)
+        time.sleep(0.2)
 
-    scores = aggregate_scores(rows)
-    # 일반에서 쇼핑스멜은 제거
-    filt = [(kw, sc) for kw, sc in scores.items() if not is_shopping_like(kw)]
-    filt.sort(key=lambda x: x[1], reverse=True)
+    cands: List[str] = []
+    for t in titles:
+        cands += _split_candidates(t)
 
-    topk = [kw for kw,_ in filt[:k]]
-    goldk = [kw for kw,_ in filt[:gold]]
+    # 클린
+    def _shop_clean(s: str) -> str:
+        s = re.sub(r"\b(무료배송|정품|공식|행사|특가|세일|쿠폰|핫딜|가격)\b", "", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
 
-    write_list_csv("keywords_general.csv", topk)
-    write_list_csv("golden_keywords.csv", goldk)
-    print(f"[GENERAL] {len(topk)} collected → write {len(topk)} (gold {len(goldk)})")
+    cands = [_shop_clean(c) for c in cands if not _is_bad_token(c)]
+    cands = [c for c in cands if len(c) >= 3]
+    cands = _dedup_keep_order(cands)
 
-def build_shopping(shop_k=30, shop_gold=12, days=7):
-    # 간단 접근: 일반 뉴스+검색에서 얻은 n그램 중 '쇼핑스멜' 나는 것을 후보로 삼고,
-    # 월/계절 가중치로 정렬
-    rows = []
-    rows += newsapi_top(days=days, limit=120)
-    rows += naver_news_sample("세일 특가 할인 핫딜", 50)
-    rows += naver_news_sample("계절 인기템 추천", 50)
+    month_now = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).month
+    scored = sorted([(c, _score_shopping(c, month_now)) for c in cands], key=lambda x: x[1], reverse=True)
+    picked = [c for c,_ in scored][:shop_k]
+    golds  = [c for c,_ in scored][:max(1, min(shop_gold, len(picked)))]
 
-    scores = aggregate_scores(rows)  # 기본 점수
-    month = datetime.now(KST).month
-    enriched = []
-    for kw, sc in scores.items():
-        if not is_shopping_like(kw):  # 쇼핑 느낌 아니면 제외
-            continue
-        s = sc + month_season_boost(month, kw)
-        # 너무 뉴스성(정치/사건) 제거
-        if re.search(r"(속보|단독|의혹|검찰|폭우|태풍|선거|파업)", kw): 
-            continue
-        enriched.append((kw, s))
+    print(f"[SHOPPING] {len(picked)} collected → write {len(picked)} (gold {len(golds)})")
+    _write_col_csv(SHOP_OUT, picked)
+    _write_col_csv(SHOP_GOLD, golds)
+    return picked, golds
 
-    # 후보가 빈약하면 시즌 프리셋 주입
-    if len(enriched) < shop_k//2:
-        presets = {
-            12: ["전기요","히터","핫팩","가습기","패딩","부츠","크리스마스 트리","전구"],
-            1:  ["전기요","히터","핫팩","가습기","방한 장갑","보온병","기모 후드티"],
-            2:  ["가습기","발열내의","전기요","코트","초콜릿 선물","공기청정기 필터"],
-            3:  ["공기청정기","알레르기 마스크","우산","피크닉 매트","봄 이불"],
-            4:  ["자외선차단","공기청정기","로봇청소기","봄 코트","의류케어"],
-            5:  ["선풍기","제습기","냉감 침구","캠핑 의자","쿨링 타월"],
-            6:  ["장마 우산","레인부츠","방수 스프레이","제습기","모기퇴치기","쿨링 타월"],
-            7:  ["서큘레이터","쿨링 타월","아이스박스","튜브/구명조끼","여름 이불"],
-            8:  ["휴가 캐리어","쿨링 타월","샌들","선풍기","서큘레이터","냉감 티셔츠"],
-            9:  ["가을 이불","가디건","보온병","캠핑 랜턴","드립 커피세트"],
-            10: ["전기장판","가습기","핫팩","보온병","트렌치 코트","건조대"],
-            11: ["전기장판","전기요","히터","가습기","핫팩","블랙프라이데이 세일"],
-        }.get(month, [])
-        enriched.extend((kw, 1.2 + month_season_boost(month, kw)) for kw in presets)
-
-    # 정렬 및 상위 선택
-    enriched.sort(key=lambda x: x[1], reverse=True)
-    uniq = []
-    seen = set()
-    for kw, sc in enriched:
-        k = norm(kw)
-        if not k or len(k) < 2: continue
-        if k in seen: continue
-        seen.add(k)
-        uniq.append((k, sc))
-
-    topk = [kw for kw,_ in uniq[:shop_k]]
-    goldk = [kw for kw,_ in uniq[:shop_gold]]
-
-    write_list_csv("keywords_shopping.csv", topk)
-    write_list_csv("golden_shopping_keywords.csv", goldk)
-    print(f"[SHOPPING] {len(topk)} collected → write {len(topk)} (gold {len(goldk)})")
-
-# ---------- CLI ----------
+# ===== CLI =====
 def main():
+    import argparse
     ap = argparse.ArgumentParser()
-    ap.add_argument("--k", type=int, default=30)                 # 일반 최대
-    ap.add_argument("--gold", type=int, default=12)              # 일반 골든
-    ap.add_argument("--shop-k", type=int, default=30)            # 쇼핑 최대
-    ap.add_argument("--shop-gold", type=int, default=12)         # 쇼핑 골든
+    ap.add_argument("--k", type=int, default=30)
+    ap.add_argument("--gold", type=int, default=12)
+    ap.add_argument("--shop-k", type=int, default=30)
+    ap.add_argument("--shop-gold", type=int, default=12)
     ap.add_argument("--days", type=int, default=7)
-    ap.add_argument("--parallel", type=int, default=8)           # 호환용(미사용)
+    ap.add_argument("--parallel", type=int, default=8)  # dummy (미사용) — 인터페이스 유지
     args = ap.parse_args()
 
     build_general(k=args.k, gold=args.gold, days=args.days)
-    build_shopping(shop_k=args["shop_k"] if hasattr(args, "shop_k") else args.shop_k,
-                   shop_gold=args["shop_gold"] if hasattr(args, "shop_gold") else args.shop_gold,
-                   days=args.days)
+    build_shopping(shop_k=args.shop_k, shop_gold=args.shop_gold, days=args.days)
 
 if __name__ == "__main__":
     main()
