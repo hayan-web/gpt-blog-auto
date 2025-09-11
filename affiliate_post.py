@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 affiliate_post.py — Coupang Partners 글 자동 포스팅
-- 상단 고지문 + 상단 CTA 2개 + 카테고리 버튼 + 내부광고(상단)
-- 본문: 고려요소 → 주요 특징 → 가격/가성비 → (내부광고) → 장단점 → 이런 분께 추천
+- 상단 고지문(굵게/강조) + 상단 CTA 2개 + 카테고리 이동 버튼 + 내부광고(상단)
+- 본문 섹션: 고려요소 → 주요 특징 → 가격/가성비 → (내부광고) → 장단점 → 이런 분께 추천
+- 하단 CTA 2개 + 카테고리 이동 버튼
 - URL 없을 때 쿠팡 검색 페이지 폴백
 - 골든키워드 회전/사용로그/예약 충돌 회피
-- 제목: 스토리(사람 말투) → LLM(선택) → 템플릿 폴백
+- ✨ 제목 생성 로직: 사람 말투 '미니 스토리' → (LLM) → 템플릿 폴백
 """
 import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
@@ -64,6 +65,7 @@ USED_FILE=os.path.join(USAGE_DIR,"used_shopping.txt")
 
 NO_REPEAT_TODAY=(os.getenv("NO_REPEAT_TODAY") or "1").lower() in ("1","true","y","yes","on")
 AFF_USED_BLOCK_DAYS=int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")
+
 PRODUCTS_SEED_CSV=(os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv")
 
 REQ_HEADERS={
@@ -98,16 +100,18 @@ def _bad_aff_title(t: str) -> bool:
         return True
     return False
 
-# ===== 한글 조사 =====
+# ===== 한글 조사 보정 =====
 def _has_jong(ch: str) -> bool:
     code = ord(ch) - 0xAC00
     return 0 <= code <= 11171 and (code % 28) != 0
+
 def _josa(word: str, pair=("이","가")) -> str:
     return pair[0] if word and _has_jong(word[-1]) else pair[1]
+
 def _iraseo(word: str) -> str:
     return "이라서" if word and _has_jong(word[-1]) else "라서"
 
-# ===== 키워드 압축 =====
+# ===== 핵심 키워드 압축 =====
 _COLOR_WORDS = {"화이트","블랙","아이보리","핑크","레드","블루","네이비","브라운","베이지","하늘색","그레이","회색","카키","민트"}
 _DROP_TOKENS = {"여성","남성","남녀","3컬러","2컬러","25fw","fw","ss","가을니트","겨울니트","여름","봄","가을겨울","신상","인기","베스트","새상품","정품"}
 _KEEP_ADJ = {"가을","겨울","간절기","울","캐시미어","브이넥","라운드","오버핏","루즈핏","크롭","롱","퍼프","반팔","폴라","반목","하이넥","레이스","케이블","아가일","데일리","포근","경량","무선","가열식","초음파","미니"}
@@ -123,16 +127,25 @@ def _compress_keyword(keyword: str) -> Tuple[str, str]:
     toks = _tokenize_ko(keyword)
     kept_adj, cat = [], None
     for t in toks:
-        if t in _COLOR_WORDS or t in _DROP_TOKENS: continue
-        if any(c.isdigit() for c in t): continue
-        if t in _KEEP_ADJ and len(kept_adj) < 2: kept_adj.append(t); continue
-        if (t in _CATS) and not cat: cat = t
+        if t in _COLOR_WORDS or t in _DROP_TOKENS:
+            continue
+        if any(c.isdigit() for c in t):
+            continue
+        if t in _KEEP_ADJ and len(kept_adj) < 2:
+            kept_adj.append(t); continue
+        if (t in _CATS) and not cat:
+            cat = t
     if not cat:
         for c in _CATS:
-            if c in keyword: cat = c; break
-    core = (" ".join(kept_adj + [cat]).strip() if cat else " ".join(toks[:3])).strip()
+            if c in keyword:
+                cat = c; break
+    if cat:
+        core = " ".join(kept_adj + [cat]).strip()
+    else:
+        core = " ".join(toks[:3])
     core = re.sub(r"\s+", " ", core).strip()
-    if len(core) < 4 and "니트" in keyword: core = "가을 니트"
+    if len(core) < 4 and "니트" in keyword:
+        core = "가을 니트"
     return core, " ".join(toks)
 
 # ===== 카테고리 감지 =====
@@ -155,7 +168,7 @@ def _core_phrase_by_cat(cat: str, src: str) -> str:
     if cat == "knit":         return "니트"
     return _compress_keyword(src)[0] or "아이템"
 
-# ===== 제목 후보 =====
+# ===== 스토리 톤 풀 =====
 TIME_PHRASES = {
     "cleaner_mop":  ["저녁마다", "주말엔", "요즘"],
     "cleaner_mini": ["퇴근하고", "아침마다", "요즘"],
@@ -189,12 +202,29 @@ TAILS = [
     "한 번 써보면 이유를 알게 돼요",
     "돌려보면 차이가 나요",
 ]
+
+# ===== 템플릿(폴백용) =====
 AFF_TITLE_TEMPLATES = [
-    "{core}, 한 장이면 끝","가을엔 역시 {core}","{core} 이렇게 입어요","{core} 포근함을 더하다",
-    "출근룩은 {core}로","오늘은 {core}","부드럽게, {core}","{core} 깔끔한 데일리",
-    "{core} 선택 가이드","{core} 고민 끝!","가볍게 챙기는 {core}","지금 딱, {core}",
-    "센스 완성 {core}","이유 있는 선택, {core}","따뜻함 한 장, {core}","{core} 핵심만 쏙",
-    "편안함의 기준, {core}","꾸안꾸의 정석 {core}","레이어드 맛집 {core}","포인트 주기 좋은 {core}",
+    "{core}, 한 장이면 끝",
+    "가을엔 역시 {core}",
+    "{core} 이렇게 입어요",
+    "{core} 포근함을 더하다",
+    "출근룩은 {core}로",
+    "오늘은 {core}",
+    "부드럽게, {core}",
+    "{core} 깔끔한 데일리",
+    "{core} 선택 가이드",
+    "{core} 고민 끝!",
+    "가볍게 챙기는 {core}",
+    "지금 딱, {core}",
+    "센스 완성 {core}",
+    "이유 있는 선택, {core}",
+    "따뜻함 한 장, {core}",
+    "{core} 핵심만 쏙",
+    "편안함의 기준, {core}",
+    "꾸안꾸의 정석 {core}",
+    "레이어드 맛집 {core}",
+    "포인트 주기 좋은 {core}",
 ]
 
 def _story_candidates(core: str, cat: str) -> List[str]:
@@ -202,9 +232,11 @@ def _story_candidates(core: str, cat: str) -> List[str]:
     s  = random.choice(SITCH.get(cat, SITCH["general"]))
     b  = random.choice(BENEFITS.get(cat, BENEFITS["general"]))
     tail = random.choice(TAILS)
+
     core_eunneun = core + _josa(core, ("은","는"))
     core_iga     = core + _josa(core, ("이","가"))
     core_iraseo  = core + " " + _iraseo(core)
+
     cands = [
         f"{t} {s} {core} 쓰니 {b}",
         f"{s} {core_eunneun} {b}",
@@ -212,51 +244,64 @@ def _story_candidates(core: str, cat: str) -> List[str]:
         f"{core} 켜두면 {b}",
         f"한 번 써보면 {core_iga} 왜 편한지 알게 돼요",
         f"{b}, 그래서 {core}로 갈아탔어요",
+        f"{t} {core_eunneun} {b}, 그래서 계속 손이 가요",
         f"{t} {core_eunneun} {b}, {tail}",
     ]
     out=[]
     for s in cands:
-        s=_sanitize_title_text(s)
-        if len(s)<AFF_TITLE_MIN-2: s+=" 좋아요"
-        if len(s)>AFF_TITLE_MAX: s=s[:AFF_TITLE_MAX-1].rstrip()+"…"
+        s = _sanitize_title_text(s)
+        if len(s) < AFF_TITLE_MIN - 2:
+            s += " 좋아요"
+        if len(s) > AFF_TITLE_MAX:
+            s = s[:AFF_TITLE_MAX-1].rstrip()+"…"
         out.append(s)
     return out
 
 def _aff_title_from_story(keyword: str) -> str:
-    src=_sanitize_title_text(keyword)
-    cat=_detect_category_from_text(src)
-    core=_core_phrase_by_cat(cat, src)
-    seed=abs(hash(f"story|{core}|{src}|{datetime.utcnow().date()}"))%(2**32)
-    rnd=random.Random(seed)
-    pool=_story_candidates(core, cat); rnd.shuffle(pool)
+    src = _sanitize_title_text(keyword)
+    cat = _detect_category_from_text(src)
+    core = _core_phrase_by_cat(cat, src)
+    seed = abs(hash(f"story|{core}|{src}|{datetime.utcnow().date()}")) % (2**32)
+    rnd = random.Random(seed)
+
+    pool = _story_candidates(core, cat)
+    rnd.shuffle(pool)
+
     seen=set()
     for cand in pool:
-        cand=_sanitize_title_text(cand)
-        if not cand or cand in seen: continue
+        cand = _sanitize_title_text(cand)
+        if not cand or cand in seen:
+            continue
         seen.add(cand)
-        if not _bad_aff_title(cand): return cand
+        if not _bad_aff_title(cand):
+            return cand
     return ""
 
 def _aff_title_from_templates(core: str, kw: str) -> str:
-    seed=abs(hash(f"{core}|{kw}|{datetime.utcnow().date()}"))%(2**32)
-    rnd=random.Random(seed)
-    cands=rnd.sample(AFF_TITLE_TEMPLATES, k=min(6, len(AFF_TITLE_TEMPLATES)))
-    for tpl in cands:
-        cand=_sanitize_title_text(tpl.format(core=core))
-        if _bad_aff_title(cand): continue
-        a=re.sub(r"[^\w가-힣]","",cand); b=re.sub(r"[^\w가-힣]","",kw)
-        if a==b: continue
+    seed = abs(hash(f"{core}|{kw}|{datetime.utcnow().date()}")) % (2**32)
+    rnd = random.Random(seed)
+    cands = rnd.sample(AFF_TITLE_TEMPLATES, k=min(6, len(AFF_TITLE_TEMPLATES)))
+    for cand_tpl in cands:
+        cand = _sanitize_title_text(cand_tpl.format(core=core))
+        if _bad_aff_title(cand):
+            continue
+        a = re.sub(r"[^\w가-힣]", "", cand)
+        b = re.sub(r"[^\w가-힣]", "", kw)
+        if a == b:
+            continue
         return cand
-    fb=_sanitize_title_text(f"{core} 핵심만 쏙")
-    if not _bad_aff_title(fb): return fb
+    fallback = _sanitize_title_text(f"{core} 핵심만 쏙")
+    if not _bad_aff_title(fallback):
+        return fallback
     return _sanitize_title_text(core)[:AFF_TITLE_MAX]
 
 def _aff_title_from_llm(core: str, kw: str) -> str:
-    if not _oai: return ""
+    if not _oai:
+        return ""
     try:
-        sys_p="너는 한국어 카피라이터다. 쇼핑 포스트용 모바일 최적 제목을 1개만 출력한다."
-        styles="후킹형, 상황형, 하우투형, 혜택·해결형, 담백한 문장형"
-        usr=f"""핵심 키워드(core): {core}
+        sys_p = "너는 한국어 카피라이터다. 쇼핑 포스트용 모바일 최적 제목을 1개만 출력한다."
+        styles = "후킹형, 상황형, 하우투형, 혜택·해결형, 담백한 문장형"
+        usr = f"""핵심 키워드(core): {core}
 원문 키워드(raw): {kw}
 
 요청:
@@ -265,12 +310,13 @@ def _aff_title_from_llm(core: str, kw: str) -> str:
 - 금지문구: {", ".join(AFF_BANNED_PHRASES)}
 - 과장/낚시 금지(최저가/역대 등)
 - 출력은 제목 1줄(순수 텍스트)만"""
-        r=_oai.chat.completions.create(
+        r = _oai.chat.completions.create(
             model=_OPENAI_MODEL,
             messages=[{"role":"system","content":sys_p},{"role":"user","content":usr}],
-            temperature=0.9, max_tokens=60,
+            temperature=0.9,
+            max_tokens=60,
         )
-        cand=_sanitize_title_text(r.choices[0].message.content or "")
+        cand = _sanitize_title_text(r.choices[0].message.content or "")
         return "" if _bad_aff_title(cand) else cand
     except BadRequestError:
         return ""
@@ -279,11 +325,21 @@ def _aff_title_from_llm(core: str, kw: str) -> str:
         return ""
 
 def hook_aff_title(keyword: str) -> str:
-    core,_=_compress_keyword(keyword)
+    core, _ = _compress_keyword(keyword)
+
+    # 1) 스토리형(사람 말투)
     if AFF_TITLE_MODE in ("story","story-first","story-then-template","story-then-llm"):
-        t=_aff_title_from_story(keyword);  if t: return t
+        t = _aff_title_from_story(keyword)
+        if t:
+            return t
+
+    # 2) LLM (선택)
     if AFF_TITLE_MODE in ("llm","llm-then-template","story-then-llm"):
-        t=_aff_title_from_llm(core, keyword);  if t: return t
+        t = _aff_title_from_llm(core, keyword)
+        if t:
+            return t
+
+    # 3) 템플릿 폴백
     return _aff_title_from_templates(core, keyword)
 
 # ===== TIME / SLOT =====
@@ -291,38 +347,43 @@ def _now_kst():
     return datetime.now(ZoneInfo("Asia/Seoul"))
 
 def _wp_future_exists_around(when_gmt_dt: datetime, tol_min: int = 2) -> bool:
-    url=f"{WP_URL}/wp-json/wp/v2/posts"
+    url = f"{WP_URL}/wp-json/wp/v2/posts"
     try:
-        r=requests.get(url, params={"status":"future","per_page":100,"orderby":"date","order":"asc","context":"edit"},
-                       headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
-        r.raise_for_status(); items=r.json()
+        r = requests.get(
+            url, params={"status":"future","per_page":100,"orderby":"date","order":"asc","context":"edit"},
+            headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20
+        ); r.raise_for_status()
+        items = r.json()
     except Exception as e:
         print(f"[WP][WARN] future list fetch failed: {type(e).__name__}: {e}")
         return False
-    tgt=when_gmt_dt.astimezone(timezone.utc)
-    win=timedelta(minutes=max(1,int(tol_min))); lo,hi=tgt-win, tgt+win
+    tgt = when_gmt_dt.astimezone(timezone.utc)
+    win = timedelta(minutes=max(1,int(tol_min)))
+    lo, hi = tgt - win, tgt + win
     for it in items:
         d=(it.get("date_gmt") or "").strip()
         if not d: continue
         try:
             dt=datetime.fromisoformat(d.replace("Z","+00:00"))
             dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-        except Exception: continue
-        if lo <= dt <= hi: return True
+        except Exception:
+            continue
+        if lo <= dt <= hi:
+            return True
     return False
 
 def _slot_affiliate()->str:
-    hh,mm=[int(x) for x in (AFFILIATE_TIME_KST.split(":")+["0"])[:2]]
-    now=_now_kst()
-    tgt=now.replace(hour=hh,minute=mm,second=0,microsecond=0)
+    hh, mm = [int(x) for x in (AFFILIATE_TIME_KST.split(":")+["0"])[:2]]
+    now = _now_kst()
+    tgt = now.replace(hour=hh,minute=mm,second=0,microsecond=0)
     if tgt <= now: tgt += timedelta(days=1)
     for _ in range(7):
-        utc=tgt.astimezone(timezone.utc)
+        utc = tgt.astimezone(timezone.utc)
         if _wp_future_exists_around(utc, tol_min=2):
             print(f"[SLOT] conflict at {utc.strftime('%Y-%m-%dT%H:%M:%S')}Z -> push +1d")
             tgt += timedelta(days=1); continue
         break
-    final=tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    final = tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     print(f"[SLOT] scheduled UTC = {final}")
     return final
 
@@ -339,7 +400,7 @@ def _load_used_set(days:int=30)->set:
             line=line.strip()
             if not line: continue
             try:
-                d_str,kw=line.split("\t",1)
+                d_str, kw = line.split("\t",1)
                 if datetime.strptime(d_str,"%Y-%m-%d").date()>=cutoff:
                     used.add(kw.strip())
             except Exception:
@@ -380,8 +441,8 @@ def _consume_col_csv(path:str, kw:str)->bool:
 
 # ===== KEYWORD / URL =====
 def pick_affiliate_keyword()->str:
-    used_today=_load_used_set(1) if NO_REPEAT_TODAY else set()
-    used_block=_load_used_set(AFF_USED_BLOCK_DAYS)
+    used_today = _load_used_set(1) if NO_REPEAT_TODAY else set()
+    used_block = _load_used_set(AFF_USED_BLOCK_DAYS)
     gold=_read_col_csv("golden_shopping_keywords.csv")
     shop=_read_col_csv("keywords_shopping.csv")
     pool=[k for k in gold+shop if k and (k not in used_block)]
@@ -425,13 +486,16 @@ def _ensure_term(kind:str, name:str)->int:
 
 def _category_url_for(name:str)->str:
     try:
-        r=requests.get(f"{WP_URL}/wp-json/wp/v2/categories",
-                       params={"search":name,"per_page":50,"context":"view"},
-                       headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=12)
-        r.raise_for_status(); items=r.json()
+        r = requests.get(
+            f"{WP_URL}/wp-json/wp/v2/categories",
+            params={"search": name, "per_page": 50, "context":"view"},
+            headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=12
+        )
+        r.raise_for_status()
+        items = r.json()
         for it in items:
-            if (it.get("name") or "").strip()==name:
-                link=(it.get("link") or "").strip()
+            if (it.get("name") or "").strip() == name:
+                link = (it.get("link") or "").strip()
                 if link: return link
         if items and (items[0].get("link") or "").strip():
             return items[0]["link"].strip()
@@ -461,24 +525,21 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
     r.raise_for_status(); return r.json()
 
-# ===== 스타일 (버튼만 개선: 가운데/넓게/호버) =====
+# ===== TEMPLATE (본문) =====
 def _css_block()->str:
     return """
 <style>
 .aff-wrap{font-family:inherit}
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #ef4444;background:#fff1f2;color:#991b1b;font-weight:700;border-radius:10px}
-
-/* CTA */
-.aff-cta{display:flex;justify-content:center;align-items:center;gap:10px;margin:16px 0 18px;flex-wrap:wrap}
-.aff-cta a{display:inline-block;padding:14px 28px;min-width:220px;text-align:center;border-radius:999px;font-weight:700;text-decoration:none;transition:all .22s ease;cursor:pointer}
-.aff-cta a.btn-primary{background:#2563eb;color:#fff;box-shadow:0 4px 10px rgba(37,99,235,.25)}
-.aff-cta a.btn-primary:hover{background:#1e40af;transform:translateY(-2px);box-shadow:0 6px 14px rgba(37,99,235,.35)}
+.aff-cta{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 14px}
+/* 쿠팡 CTA는 기존 레이아웃 유지 */
+.aff-cta a{display:inline-block;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700}
+.aff-cta a.btn-primary{background:#2563eb;color:#fff}
+.aff-cta a.btn-primary:hover{opacity:.95}
 .aff-cta a.btn-secondary{background:#fff;color:#2563eb;border:2px solid #2563eb}
-.aff-cta a.btn-secondary:hover{background:#eff6ff;transform:translateY(-2px)}
+.aff-cta a.btn-secondary:hover{background:#eff6ff}
 .aff-cta a.btn-tertiary{background:#0f172a;color:#fff;border:0}
-.aff-cta a.btn-tertiary:hover{opacity:.92;transform:translateY(-2px)}
-
-/* 본문 */
+.aff-cta a.btn-tertiary:hover{opacity:.92}
 .aff-section h2{margin:28px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
 .aff-section h3{margin:18px 0 10px;font-size:1.12rem}
 .aff-section p{line-height:1.9;margin:0 0 14px;color:#222}
@@ -517,31 +578,33 @@ def _cta_html(url_main:str, url_alt:str, category_url:str, category_name:str)->s
     u1 = html.escape(url_main or "#")
     u2 = html.escape(url_alt or url_main or "#")
     uc = html.escape(category_url or "#")
-    return (
-f"""
+    return f"""
   <div class="aff-cta">
     <a class="btn-primary" href="{u1}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn1}">{btn1}</a>
     <a class="btn-secondary" href="{u2}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn2}">{btn2}</a>
     <a class="btn-tertiary" href="{uc}" aria-label="{btn3}">{btn3}</a>
   </div>
-""").rstrip()
+""".rstrip()
 
-# ===== 본문 템플릿 =====
 def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str="쇼핑")->str:
     disc = html.escape(DISCLOSURE_TEXT)
     kw_esc = html.escape(keyword)
     url_alt = BUTTON2_URL if BUTTON2_URL else url
     category_url = _category_url_for(category_name)
+
     img_html = ""
     if image and USE_IMAGE:
         img_html = f'<figure style="margin:0 0 18px"><img src="{html.escape(image)}" alt="{kw_esc}" loading="lazy" decoding="async" style="max-width:100%;height:auto;border-radius:12px"></figure>'
+
     top_block = f"""
   <p class="aff-disclosure"><strong>{disc}</strong></p>
   {_adsense_block()}
   {_cta_html(url, url_alt, category_url, category_name)}
   {img_html}
 """.rstrip()
+
     mid_ads = _adsense_block()
+
     return f"""
 {_css_block()}
 <div class="aff-wrap aff-section">
@@ -604,7 +667,7 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
 
 # ===== TITLE ENTRY POINT =====
 def build_title(keyword:str)->str:
-    t=hook_aff_title(keyword)
+    t = hook_aff_title(keyword)
     return _sanitize_title_text(t)[:AFF_TITLE_MAX]
 
 # ===== ROTATE & RUN =====
