@@ -1,4 +1,4 @@
-﻿# .github/workflows/autopost.yml  (rebase 경고 제거용 stash 추가)
+﻿# .github/workflows/autopost.yml
 name: run
 on:
   workflow_dispatch:
@@ -17,10 +17,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 1 }
+        with:
+          fetch-depth: 1
 
       - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+        with:
+          python-version: "3.11"
 
       - name: Install deps
         run: |
@@ -30,13 +32,73 @@ jobs:
       - name: Write .env from secrets
         run: |
           cat > .env << 'EOF'
-          # ... (생략: 기존과 동일, AD_SHORTCODE=[ads_top] 유지)
+          # ===== WordPress =====
+          WP_URL=${{ secrets.WP_URL }}
+          WP_USER=${{ secrets.WP_USER }}
+          WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
+          WP_TLS_VERIFY=true
+          # ===== OpenAI =====
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL=
+          OPENAI_MODEL_LONG=
+          MAX_TOKENS_BODY=900
+          # ===== Coupang Partners =====
+          COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
+          COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
+          COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
+          COUPANG_SUBID_PREFIX=auto
+          REQUIRE_COUPANG_API=1
+          # ===== Posting / Taxonomy =====
+          POST_STATUS=future
+          KEYWORDS_CSV=keywords_general.csv
+          ALLOW_CREATE_TERMS=1
+          EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
+          # ===== Affiliate Content =====
+          PRODUCTS_SEED_CSV=products_seed.csv
+          DEFAULT_CATEGORY=정보
+          DEFAULT_TAGS=
+          AFFILIATE_CATEGORY=쇼핑
+          AFFILIATE_TAGS=
+          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.
+          # ===== Ads =====
+          AD_SHORTCODE=[ads_top]
+          AD_METHOD=
+          AD_INSERT_MIDDLE=
+          # ===== Keywords =====
+          NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
+          NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
+          KEYWORDS_K=50
+          BAN_KEYWORDS=
+          BACKUP_OLD_KEYWORDS=1
+          USER_AGENT=gpt-blog-keywords/1.3
+          # ===== Cache / Logs =====
+          USAGE_DIR=.usage
+          CACHE_DIR=.cache
+          LLM_LOG_FILENAME=llm.log
+          CACHE_TTL_DEFAULT=86400
+          CACHE_MAX_FILES=500
+          CACHE_DISABLE=0
+          # ===== Switches =====
+          KEYWORD_PICK_MODE=
+          SEED_PICK_MODE=
+          USE_IMAGE=
+          BUTTON_TEXT=
+          # ===== Picker guards & fallbacks =====
+          PERSIST_USAGE=1
+          AFF_USED_BLOCK_DAYS=30
+          NO_REPEAT_TODAY=1
+          AFF_FALLBACK_KEYWORDS=
+          # ===== Affiliate Slots (KST) =====
+          AFFILIATE_TIMES_KST=12:00,16:00,18:00
           EOF
+
+          # export to env for later steps
           python - << 'PY'
           import os
           from dotenv import dotenv_values
-          env=dotenv_values(".env")
-          with open(os.environ["GITHUB_ENV"],"a",encoding="utf-8") as f:
+          env = dotenv_values(".env")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               for k,v in env.items():
                   if v is None: continue
                   f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
@@ -60,33 +122,25 @@ jobs:
           echo "== keywords_shopping.csv ==" && head -n 5 keywords_shopping.csv || true
           echo "== keywords_general.csv ==" && head -n 5 keywords_general.csv || true
 
-    - name: Build product seeds (safe even without Coupang/API)
-      run: |
-        # 이 스텝만 -e 완화해서 빈 명령/비정상 종료가 전체 잡을 끊지 않게 함
-        set +e
-
-        # 파일명/스위치 안전 기본값
-        : "${PRODUCTS_SEED_CSV:=products_seed.csv}"
-        : "${REQUIRE_COUPANG_API:=1}"
-
-        # 소문자 정규화
-        v="$(printf '%s' "$REQUIRE_COUPANG_API" | tr '[:upper:]' '[:lower:]')"
-
-        if [ -f build_products_seed.py ]; then
-          if [[ "$v" =~ ^(1|true|yes|y|on)$ ]] && [ -n "${COUPANG_ACCESS_KEY:-}" ] && [ -n "${COUPANG_SECRET_KEY:-}" ]; then
-            # API 키가 있을 때만 실제 검색
-            python build_products_seed.py || echo "[build_products_seed] WARN: non-zero exit (ignored)"
+      - name: Build product seeds (safe even without Coupang/API)
+        run: |
+          # 완충 스텝: 이 스텝만 오류가 잡 전체 실패로 번지지 않도록
+          set +e
+          : "${PRODUCTS_SEED_CSV:=products_seed.csv}"
+          : "${REQUIRE_COUPANG_API:=1}"
+          v="$(printf '%s' "$REQUIRE_COUPANG_API" | tr '[:upper:]' '[:lower:]')"
+          if [ -f build_products_seed.py ]; then
+            if [[ "$v" =~ ^(1|true|yes|y|on)$ ]] && [ -n "${COUPANG_ACCESS_KEY:-}" ] && [ -n "${COUPANG_SECRET_KEY:-}" ]; then
+              python build_products_seed.py || echo "[build_products_seed] WARN: non-zero exit (ignored)"
+            else
+              echo "[build_products_seed] SKIP: no API keys or REQUIRE_COUPANG_API=off"
+            fi
           else
-            echo "[build_products_seed] SKIP: no API keys or REQUIRE_COUPANG_API=off"
+            echo "[build_products_seed] SKIP: build_products_seed.py not found"
           fi
-        else
-          echo "[build_products_seed] SKIP: build_products_seed.py not found"
-        fi
-
-        # 비어있으면 헤더만이라도 만들어 다음 스텝이 안전하게 동작
-        if [ ! -s "$PRODUCTS_SEED_CSV" ]; then
-          printf "product_name,raw_url,pros,cons,keyword,title,url,image\n" > "$PRODUCTS_SEED_CSV" || true
-        fi
+          if [ ! -s "$PRODUCTS_SEED_CSV" ]; then
+            printf "product_name,raw_url,pros,cons,keyword,title,url,image\n" > "$PRODUCTS_SEED_CSV" || true
+          fi
 
       - name: Ensure usage dir
         run: |
