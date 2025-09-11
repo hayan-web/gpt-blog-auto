@@ -3,25 +3,25 @@
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *"  # 09:30 KST daily (UTC+9)
+    # 매일 KST 오전 09:35에 실행(= UTC 00:35). 필요 시 수정
+    - cron: "35 0 * * *"
 
 concurrency:
-  group: autopost
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    timeout-minutes: 20
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          fetch-tags: false
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -29,76 +29,79 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Write .env from secrets/vars
+      - name: Create .env from secrets
+        shell: bash
         run: |
           cat > .env << 'EOF'
           # ===== WordPress =====
           WP_URL=${{ secrets.WP_URL }}
           WP_USER=${{ secrets.WP_USER }}
           WP_APP_PASSWORD=${{ secrets.WP_APP_PASSWORD }}
-          WP_TLS_VERIFY=${{ secrets.WP_TLS_VERIFY }}
+          WP_TLS_VERIFY=true
           # ===== OpenAI =====
           OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL=${{ vars.OPENAI_MODEL }}
-          OPENAI_MODEL_LONG=${{ vars.OPENAI_MODEL_LONG }}
-          MAX_TOKENS_BODY=${{ vars.MAX_TOKENS_BODY || 900 }}
-          # ===== Coupang Partners =====
+          OPENAI_MODEL=
+          OPENAI_MODEL_LONG=
+          MAX_TOKENS_BODY=900
+          # ===== Coupang Partners (선택) =====
           COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
           COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
           COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
-          COUPANG_SUBID_PREFIX=${{ vars.COUPANG_SUBID_PREFIX || 'auto' }}
-          REQUIRE_COUPANG_API=${{ vars.REQUIRE_COUPANG_API || 1 }}
-          AFFILIATE_TIME_KST=${{ vars.AFFILIATE_TIME_KST || '13:00' }}
-          AFFILIATE_TIMES_KST=${{ vars.AFFILIATE_TIMES_KST || '12:00,16:00,18:00' }}
+          COUPANG_SUBID_PREFIX=auto
+          REQUIRE_COUPANG_API=1
           # ===== Posting / Taxonomy =====
-          POST_STATUS=${{ vars.POST_STATUS || 'future' }}
-          KEYWORDS_CSV=${{ vars.KEYWORDS_CSV || 'keywords.csv' }}
-          ALLOW_CREATE_TERMS=${{ vars.ALLOW_CREATE_TERMS || 1 }}
-          EXISTING_CATEGORIES=${{ vars.EXISTING_CATEGORIES || '뉴스,비공개,쇼핑,전체글,게시글,정보,취미' }}
+          POST_STATUS=future
+          KEYWORDS_CSV=keywords_general.csv
+          ALLOW_CREATE_TERMS=1
+          EXISTING_CATEGORIES=뉴스,비공개,쇼핑,전체글,게시글,정보,취미
           # ===== Affiliate Content =====
-          PRODUCTS_SEED_CSV=${{ vars.PRODUCTS_SEED_CSV || 'products_seed.csv' }}
-          DEFAULT_CATEGORY=${{ vars.DEFAULT_CATEGORY || '정보' }}
-          DEFAULT_TAGS=${{ vars.DEFAULT_TAGS }}
-          AFFILIATE_CATEGORY=${{ vars.AFFILIATE_CATEGORY || '쇼핑' }}
-          AFFILIATE_TAGS=${{ vars.AFFILIATE_TAGS }}
-          DISCLOSURE_TEXT=${{ vars.DISCLOSURE_TEXT || '이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.' }}
+          PRODUCTS_SEED_CSV=products_seed.csv
+          DEFAULT_CATEGORY=정보
+          DEFAULT_TAGS=
+          AFFILIATE_CATEGORY=쇼핑
+          AFFILIATE_TAGS=
+          DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.
           # ===== Ads =====
-          AD_METHOD=${{ vars.AD_METHOD }}
-          AD_SHORTCODE=${{ vars.AD_SHORTCODE }}
-          AD_INSERT_MIDDLE=${{ vars.AD_INSERT_MIDDLE }}
-          # ===== Keywords Auto Update =====
+          # autopost/affiliate 모두에서 보장: 비어있어도 [ads_top]가 들어가지만,
+          # affiliate의 구버전 테마 필터 대응을 위해 여기서도 폴백을 직접 넣어줌
+          AD_SHORTCODE=[ads_top]
+          AD_METHOD=
+          AD_INSERT_MIDDLE=
+          # ===== Keywords =====
           NEWSAPI_KEY=${{ secrets.NEWSAPI_KEY }}
           NAVER_CLIENT_ID=${{ secrets.NAVER_CLIENT_ID }}
           NAVER_CLIENT_SECRET=${{ secrets.NAVER_CLIENT_SECRET }}
-          KEYWORDS_K=${{ vars.KEYWORDS_K || 10 }}
-          BAN_KEYWORDS=${{ vars.BAN_KEYWORDS }}
-          BACKUP_OLD_KEYWORDS=${{ vars.BACKUP_OLD_KEYWORDS || 1 }}
-          USER_AGENT=${{ vars.USER_AGENT || 'gpt-blog-keywords/1.2' }}
+          KEYWORDS_K=50
+          BAN_KEYWORDS=
+          BACKUP_OLD_KEYWORDS=1
+          USER_AGENT=gpt-blog-keywords/1.3
           # ===== Cache / Logs =====
           USAGE_DIR=.usage
           CACHE_DIR=.cache
           LLM_LOG_FILENAME=llm.log
           CACHE_TTL_DEFAULT=86400
           CACHE_MAX_FILES=500
-          CACHE_DISABLE=${{ vars.CACHE_DISABLE || 0 }}
+          CACHE_DISABLE=0
           # ===== Switches =====
-          KEYWORD_PICK_MODE=${{ vars.KEYWORD_PICK_MODE }}
-          SEED_PICK_MODE=${{ vars.SEED_PICK_MODE }}
-          USE_IMAGE=${{ vars.USE_IMAGE }}
-          BUTTON_TEXT=${{ vars.BUTTON_TEXT }}
+          KEYWORD_PICK_MODE=
+          SEED_PICK_MODE=
+          USE_IMAGE=
+          BUTTON_TEXT=
           # ===== Picker guards & fallbacks =====
           PERSIST_USAGE=1
-          AFF_USED_BLOCK_DAYS=${{ vars.AFF_USED_BLOCK_DAYS || 30 }}
+          AFF_USED_BLOCK_DAYS=30
           NO_REPEAT_TODAY=1
-          AFF_FALLBACK_KEYWORDS=${{ vars.AFF_FALLBACK_KEYWORDS }}
+          AFF_FALLBACK_KEYWORDS=
+          # ===== Affiliate Slots (KST) =====
+          AFFILIATE_TIMES_KST=12:00,16:00,18:00
           EOF
 
-      - name: Export .env to GITHUB_ENV
-        run: |
+          # Export to env
           python - << 'PY'
           import os
           from dotenv import dotenv_values
@@ -109,7 +112,8 @@ jobs:
                   f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
           PY
 
-      - name: Check Coupang keys
+      - name: Check Coupang keys presence (optional)
+        shell: bash
         run: |
           if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
             echo "[OK] Coupang keys are set."
@@ -117,21 +121,30 @@ jobs:
             echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> using fallback (no API deep-links)"
           fi
 
-      - name: Update keywords (general & shopping)
+      # ---------- 1) 키워드 업데이트(최신화) ----------
+      - name: Update keywords (Naver Search + DataLab + Shopping)
+        shell: bash
+        env:
+          # 필요 시 골든 비율 조정
+          K_ALL: "50"
+          GOLD_ALL: "20"
         run: |
           if [ -f update_keywords.py ]; then
-            python update_keywords.py --k 30 --gold 12 --shop-k 30 --shop-gold 12 --days 7 --parallel 8 || true
+            # 일반/쇼핑 각각 50개 수집, 골든 20개 선별 (필요 시 숫자 변경)
+            python update_keywords.py \
+              --k $K_ALL --gold $GOLD_ALL \
+              --shop-k $K_ALL --shop-gold $GOLD_ALL \
+              --days 7 --parallel 8 || true
           else
             echo "SKIP: update_keywords.py not found"
           fi
 
-      - name: Show heads
-        run: |
           echo "== golden_shopping_keywords.csv ==" && head -n 5 golden_shopping_keywords.csv || true
           echo "== keywords_shopping.csv ==" && head -n 5 keywords_shopping.csv || true
           echo "== keywords_general.csv ==" && head -n 5 keywords_general.csv || true
 
-      - name: Build products seed (optional)
+      - name: Build products seed via Coupang API (optional)
+        shell: bash
         run: |
           if [ -f build_products_seed.py ]; then
             v="${REQUIRE_COUPANG_API:-1}"
@@ -145,18 +158,20 @@ jobs:
             echo "SKIP: build_products_seed.py not found"
           fi
 
-      - name: Ensure products_seed.csv header
-        run: |
+          # 보조 생성(없을 때 헤더만)
           if [ ! -s "${PRODUCTS_SEED_CSV}" ]; then
             echo "product_name,raw_url,pros,cons,keyword,title,url,image" > "${PRODUCTS_SEED_CSV}"
           fi
 
       - name: Ensure usage dir
+        shell: bash
         run: |
           mkdir -p .usage
           [ -f .usage/.gitkeep ] || touch .usage/.gitkeep
 
-      - name: Post two general articles (10:00 & 17:00 KST)
+      # ---------- 2) 일상글(autopost) 2개 예약 ----------
+      - name: Auto post (two posts)
+        shell: bash
         run: |
           if [ -f auto_wp_gpt.py ]; then
             python auto_wp_gpt.py --mode=two-posts
@@ -164,29 +179,37 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      - name: Affiliate posts at 12/16/18 KST
+      # ---------- 3) 쿠팡글(affiliate) 3개 예약 ----------
+      - name: Affiliate posts (3 time slots in KST)
+        shell: bash
         run: |
           set -o pipefail
           if [ -f affiliate_post.py ]; then
-            AFFILIATE_TIME_KST=12:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
-            AFFILIATE_TIME_KST=16:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
-            AFFILIATE_TIME_KST=18:00 python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
+            IFS=',' read -r -a TIMES <<< "$AFFILIATE_TIMES_KST"
+            for t in "${TIMES[@]}"; do
+              echo "[AFFILIATE] slot=$t"
+              AFFILIATE_TIME_KST="$t" python affiliate_post.py 2>&1 | tee -a /tmp/affiliate_out.txt || true
+            done
           else
             echo "SKIP: affiliate_post.py not found"
           fi
+
           echo "---- Affiliate tail ----"
           tail -n 200 /tmp/affiliate_out.txt || true
           echo "---- used_shopping tail ----"
           tail -n 50 .usage/used_shopping.txt || true
 
-      - name: Persist rotated keywords & usage logs
-        if: env.PERSIST_USAGE == '1'
+      # ---------- 4) 키워드 회전 & 로그 커밋 ----------
+      - name: Commit rotated keywords & usage logs
+        shell: bash
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
+
           git add -f golden_shopping_keywords.csv keywords_shopping.csv || true
           git add -f .usage/used_shopping.txt .usage/used_general.txt .usage/.gitkeep || true
+
           if git diff --cached --quiet; then
             echo "[INFO] nothing to commit"
           else
