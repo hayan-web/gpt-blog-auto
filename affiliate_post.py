@@ -531,15 +531,26 @@ def _css_block()->str:
 <style>
 .aff-wrap{font-family:inherit}
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #ef4444;background:#fff1f2;color:#991b1b;font-weight:700;border-radius:10px}
-.aff-cta{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 14px}
-/* 쿠팡 CTA는 기존 레이아웃 유지 */
-.aff-cta a{display:inline-block;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700}
-.aff-cta a.btn-primary{background:#2563eb;color:#fff}
-.aff-cta a.btn-primary:hover{opacity:.95}
-.aff-cta a.btn-secondary{background:#fff;color:#2563eb;border:2px solid #2563eb}
-.aff-cta a.btn-secondary:hover{background:#eff6ff}
+
+/* ⬇⬇⬇ 버튼 중앙 정렬·가로확장·호버 보강 */
+.aff-cta{
+  display:flex;gap:12px;flex-wrap:wrap;
+  justify-content:center;align-items:center;
+  margin:12px auto 14px;max-width:100%;text-align:center
+}
+.aff-cta a{
+  display:inline-block;padding:14px 22px;border-radius:9999px;
+  text-decoration:none;font-weight:700;min-width:240px;text-align:center;
+  transition:transform .18s ease,box-shadow .18s ease,opacity .18s ease
+}
+.aff-cta a.btn-primary{background:#16a34a;color:#fff;box-shadow:0 6px 16px rgba(22,163,74,.2)}
+.aff-cta a.btn-primary:hover{transform:translateY(-2px);box-shadow:0 10px 22px rgba(22,163,74,.28)}
+.aff-cta a.btn-secondary{background:#fff;color:#16a34a;border:2px solid #16a34a}
+.aff-cta a.btn-secondary:hover{background:#f0fdf4}
 .aff-cta a.btn-tertiary{background:#0f172a;color:#fff;border:0}
 .aff-cta a.btn-tertiary:hover{opacity:.92}
+/* ⬆⬆⬆ */
+
 .aff-section h2{margin:28px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
 .aff-section h3{margin:18px 0 10px;font-size:1.12rem}
 .aff-section p{line-height:1.9;margin:0 0 14px;color:#222}
@@ -551,24 +562,6 @@ def _css_block()->str:
 .aff-note{font-style:italic;color:#334155;margin-top:6px}
 .aff-ad{margin:12px 0 22px}
 </style>
-""".strip()
-
-def _adsense_block()->str:
-    return """
-<div class="aff-ad">
-<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7409421510734308"
-     crossorigin="anonymous"></script>
-<!-- 25.06.03 -->
-<ins class="adsbygoogle"
-     style="display:block"
-     data-ad-client="ca-pub-7409421510734308"
-     data-ad-slot="9228101213"
-     data-ad-format="auto"
-     data-full-width-responsive="true"></ins>
-<script>
-     (adsbygoogle = window.adsbygoogle || []).push({});
-</script>
-</div>
 """.strip()
 
 def _cta_html(url_main:str, url_alt:str, category_url:str, category_name:str)->str:
