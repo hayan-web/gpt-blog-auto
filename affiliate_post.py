@@ -532,24 +532,28 @@ def _css_block()->str:
 .aff-wrap{font-family:inherit}
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #ef4444;background:#fff1f2;color:#991b1b;font-weight:700;border-radius:10px}
 
-/* ⬇⬇⬇ 버튼 중앙 정렬·가로확장·호버 보강 */
+/* CTA: 가운데 정렬 + 큰 버튼 + 충분한 간격 */
 .aff-cta{
-  display:flex;gap:12px;flex-wrap:wrap;
-  justify-content:center;align-items:center;
-  margin:12px auto 14px;max-width:100%;text-align:center
+  display:flex;flex-wrap:wrap;justify-content:center;align-items:center;
+  gap:16px; margin:16px auto 24px; max-width:860px; text-align:center
 }
 .aff-cta a{
-  display:inline-block;padding:14px 22px;border-radius:9999px;
-  text-decoration:none;font-weight:700;min-width:240px;text-align:center;
-  transition:transform .18s ease,box-shadow .18s ease,opacity .18s ease
+  display:inline-block; box-sizing:border-box;
+  padding:16px 28px; border-radius:9999px; text-decoration:none; font-weight:800;
+  min-width:300px; font-size:1.06rem; line-height:1.15; text-align:center;
+  transition:transform .18s ease, box-shadow .18s ease, opacity .18s ease
 }
-.aff-cta a.btn-primary{background:#16a34a;color:#fff;box-shadow:0 6px 16px rgba(22,163,74,.2)}
-.aff-cta a.btn-primary:hover{transform:translateY(-2px);box-shadow:0 10px 22px rgba(22,163,74,.28)}
+.aff-cta a.btn-primary{background:#16a34a;color:#fff;box-shadow:0 6px 16px rgba(22,163,74,.22)}
+.aff-cta a.btn-primary:hover{transform:translateY(-2px);box-shadow:0 10px 22px rgba(22,163,74,.30)}
 .aff-cta a.btn-secondary{background:#fff;color:#16a34a;border:2px solid #16a34a}
 .aff-cta a.btn-secondary:hover{background:#f0fdf4}
 .aff-cta a.btn-tertiary{background:#0f172a;color:#fff;border:0}
 .aff-cta a.btn-tertiary:hover{opacity:.92}
-/* ⬆⬆⬆ */
+@media (max-width:480px){
+  .aff-cta{gap:14px;margin:14px auto 22px}
+  .aff-cta a{min-width:100%}
+}
+/* /CTA */
 
 .aff-section h2{margin:28px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
 .aff-section h3{margin:18px 0 10px;font-size:1.12rem}
@@ -565,7 +569,7 @@ def _css_block()->str:
 """.strip()
 
 def _adsense_block()->str:
-    # 내부 광고 블록 (쿠팡/일상 동일 슬롯 사용)
+    # 내부 광고 블록
     return """
 <div class="aff-ad">
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7409421510734308" crossorigin="anonymous"></script>
