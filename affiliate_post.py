@@ -443,19 +443,34 @@ def _consume_col_csv(path:str, kw:str)->bool:
 def pick_affiliate_keyword()->str:
     used_today = _load_used_set(1) if NO_REPEAT_TODAY else set()
     used_block = _load_used_set(AFF_USED_BLOCK_DAYS)
-    gold=_read_col_csv("golden_shopping_keywords.csv")
-    shop=_read_col_csv("keywords_shopping.csv")
-    pool=[k for k in gold+shop if k and (k not in used_block)]
+
+    gold = _read_col_csv("golden_shopping_keywords.csv")
+    shop = _read_col_csv("keywords_shopping.csv")
+
+    # 1) 기본 풀: 30일 차단 + (옵션) 오늘 차단
+    pool = [k for k in (gold + shop) if k]
+    pool = [k for k in pool if k not in used_block]
     if NO_REPEAT_TODAY:
-        removed=[k for k in pool if k in used_today]
-        if removed: print(f"[FILTER] removed (used today): {removed[:8]}")
-        pool=[k for k in pool if k not in used_today]
-    if pool: return pool[0].strip()
-    fb=[x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
-    if fb:
-        print(f"[AFFILIATE] fallback -> '{fb[0]}'")
-        return fb[0]
-    return "휴대용 선풍기"
+        pool = [k for k in pool if k not in used_today]
+
+    if pool:
+        return pool[0].strip()
+
+    # 2) 풀이 비면, 오늘 쓴 건 절대 금지하며 대체 후보에서 선택
+    env_fb = [x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
+    default_fb = ["미니 가습기", "핸디 청소기", "전기포트", "보조배터리", "니트 원피스", "가을 니트"]
+    cands = [k for k in (env_fb + default_fb) if k and (k not in used_today)]
+
+    if cands:
+        # 오늘 중복 방지 우선, 그래도 일관성 유지 위해 날짜 기반 시드 섞기
+        rnd = random.Random(int(datetime.utcnow().strftime("%Y%m%d")))
+        rnd.shuffle(cands)
+        return cands[0]
+
+    # 3) 그래도 없으면 default에서 랜덤 (최소한 선풍기 고정은 피함)
+    rnd = random.Random(int(datetime.utcnow().strftime("%Y%m%d")))
+    return rnd.choice(default_fb)
+
 
 def resolve_product_url(keyword:str)->str:
     if os.path.exists(PRODUCTS_SEED_CSV):
@@ -534,13 +549,17 @@ def _css_block()->str:
 
 /* CTA: 가운데 정렬 + 큰 버튼 + 충분한 간격 */
 .aff-cta{
-  display:flex;flex-wrap:wrap;justify-content:center;align-items:center;
-  gap:16px; margin:16px auto 24px; max-width:860px; text-align:center
+  display:flex; flex-wrap:wrap; justify-content:center; align-items:center;
+  gap:20px;               /* ↑ 버튼 사이 간격 확대 */
+  margin:18px auto 26px;  /* ↑ 위아래 여백 확대 */
+  max-width:860px; text-align:center
 }
 .aff-cta a{
   display:inline-block; box-sizing:border-box;
-  padding:16px 28px; border-radius:9999px; text-decoration:none; font-weight:800;
-  min-width:300px; font-size:1.06rem; line-height:1.15; text-align:center;
+  padding:18px 30px;      /* ↑ 버튼 크기 확대 */
+  border-radius:9999px; text-decoration:none; font-weight:800;
+  min-width:320px;        /* ↑ 버튼 폭 확대 (모바일 1열) */
+  font-size:1.08rem; line-height:1.18; text-align:center;
   transition:transform .18s ease, box-shadow .18s ease, opacity .18s ease
 }
 .aff-cta a.btn-primary{background:#16a34a;color:#fff;box-shadow:0 6px 16px rgba(22,163,74,.22)}
@@ -550,7 +569,7 @@ def _css_block()->str:
 .aff-cta a.btn-tertiary{background:#0f172a;color:#fff;border:0}
 .aff-cta a.btn-tertiary:hover{opacity:.92}
 @media (max-width:480px){
-  .aff-cta{gap:14px;margin:14px auto 22px}
+  .aff-cta{gap:16px;margin:16px auto 24px}
   .aff-cta a{min-width:100%}
 }
 /* /CTA */
