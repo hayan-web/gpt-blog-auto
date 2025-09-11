@@ -6,6 +6,7 @@ affiliate_post.py — Coupang Partners 글 자동 포스팅 (상단 고지문/CT
 - 하단 CTA 2개 + 카테고리 이동 버튼
 - URL 없을 때 쿠팡 검색 페이지 폴백
 - 골든키워드 회전/사용로그/예약 충돌 회피(기존 유지)
+- NEW: 제목 생성 개선 (고정 문구 제거, 길이/가독성 최적화, LLM+템플릿), 제품명 요약
 """
 import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
@@ -13,23 +14,26 @@ from zoneinfo import ZoneInfo
 from typing import List
 import requests
 from dotenv import load_dotenv
-from urllib.parse import quote  # 카테고리 폴백 URL용
+from urllib.parse import quote, quote_plus  # 카테고리/검색 폴백 URL용
 load_dotenv()
 
-# ===== Diverse title (LLM + Template) =====
+# ========= OpenAI (optional) =========
 try:
     from openai import OpenAI, BadRequestError
 except Exception:
     OpenAI = None
     BadRequestError = Exception
 
-AFF_TITLE_MIN  = int(os.getenv("AFF_TITLE_MIN",  "14"))
-AFF_TITLE_MAX  = int(os.getenv("AFF_TITLE_MAX",  "26"))
+_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+_OPENAI_MODEL = (os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
+_oai = OpenAI(api_key=_OPENAI_API_KEY) if (_OPENAI_API_KEY and OpenAI) else None
+
+# ===== Affiliate title options =====
+AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "14"))
+AFF_TITLE_MAX = int(os.getenv("AFF_TITLE_MAX", "26"))
+# llm-then-template | template | llm
 AFF_TITLE_MODE = (os.getenv("AFF_TITLE_MODE") or "llm-then-template").lower()
-AFF_BANNED_PHRASES = (
-    "제대로 써보고 알게 된 포인트",
-    "써보고 알게 된 포인트",
-)
+AFF_BANNED_PHRASES = ("제대로 써보고 알게 된 포인트","써보고 알게 된 포인트")
 
 AFF_TITLE_TEMPLATES = [
     "{name}, 한눈에 핵심만",
@@ -46,13 +50,11 @@ AFF_TITLE_TEMPLATES = [
     "{name} 핵심만 쏙 정리",
 ]
 
-_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-_OPENAI_MODEL   = (os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
-_oai = OpenAI(api_key=_OPENAI_API_KEY) if (_OPENAI_API_KEY and OpenAI) else None
-
 def _normalize_title(s: str) -> str:
     s = (s or "").strip()
-    s = html.unescape(s).replace("“","").replace("”","").replace("‘","").replace("’","").strip('"\' ')
+    s = html.unescape(s)
+    s = s.replace("“","").replace("”","").replace("‘","").replace("’","").strip('"\' ')
+    s = re.sub(r"\s+"," ",s)
     return s
 
 def _bad_aff_title(t: str) -> bool:
@@ -63,26 +65,29 @@ def _bad_aff_title(t: str) -> bool:
     return False
 
 def _aff_title_from_templates(name: str, kw: str) -> str:
-    # 날짜 기반 씨드 → 같은 상품도 매일 다르게
+    # 하루 단위로 씨드 고정 → 같은 상품이라도 매일 다른 제목
     seed = abs(hash(f"{name}|{kw}|{datetime.utcnow().date()}")) % (2**32)
     random.seed(seed)
-    for _ in range(4):
+    for _ in range(6):
         cand = _normalize_title(random.choice(AFF_TITLE_TEMPLATES).format(name=name.strip()))
-        if not _bad_aff_title(cand): return cand
-    fallback = f"{name.strip()} 핵심 체크"
-    return fallback if not _bad_aff_title(fallback) else name.strip()
+        if not _bad_aff_title(cand):
+            return cand
+    # 최후의 보루
+    fallback = _normalize_title(f"{name.strip()} 핵심 체크")
+    return fallback if not _bad_aff_title(fallback) else _normalize_title(name.strip())
 
 def _aff_title_from_llm(name: str, kw: str) -> str:
-    if not _oai: return ""
+    if not _oai:
+        return ""
     try:
         sys_p = "너는 한국어 카피라이터다. 쇼핑 포스트용 짧고 담백한 제목 1개만 출력한다."
-        usr = f"""상품명: {name}
-키워드: {kw}
+        usr = f"""상품명(요약): {name}
+원 키워드: {kw}
 조건:
 - 길이 {AFF_TITLE_MIN}~{AFF_TITLE_MAX}자
 - 금지문구: {", ".join(AFF_BANNED_PHRASES)}
 - 과장/낚시 금지(최저가/역대급 등)
-- '~써보고 알게 된 포인트' 같은 반복 패턴 금지
+- 반복 패턴 금지
 - 출력은 제목 1줄(순수 텍스트)"""
         r = _oai.chat.completions.create(
             model=_OPENAI_MODEL,
@@ -98,15 +103,19 @@ def _aff_title_from_llm(name: str, kw: str) -> str:
         print(f"[AFF-TITLE][WARN] {type(e).__name__}: {e}")
         return ""
 
-def hook_aff_title(product_name: str, keyword: str) -> str:
+def hook_aff_title(product_name_short: str, keyword: str) -> str:
     title = ""
+    mode_used = "template"
     if AFF_TITLE_MODE in ("llm","llm-then-template"):
-        title = _aff_title_from_llm(product_name, keyword)
+        title = _aff_title_from_llm(product_name_short, keyword)
+        mode_used = "llm"
     if not title:
-        title = _aff_title_from_templates(product_name, keyword)
+        t2 = _aff_title_from_templates(product_name_short, keyword)
+        if t2: title = t2; mode_used = "template"
+    print(f"[AFF-TITLE] mode={mode_used}, name='{product_name_short}', title='{title}'")
     return title
 
-# ===== ENV =====
+# ========= ENV =========
 WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
 WP_USER=os.getenv("WP_USER") or ""
 WP_APP_PASSWORD=os.getenv("WP_APP_PASSWORD") or ""
@@ -117,7 +126,6 @@ DEFAULT_CATEGORY=(os.getenv("AFFILIATE_CATEGORY") or "쇼핑").strip() or "쇼�
 DEFAULT_TAGS=(os.getenv("AFFILIATE_TAGS") or "").strip()
 DISCLOSURE_TEXT=(os.getenv("DISCLOSURE_TEXT") or "이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.").strip()
 
-# CTA 문구/링크 (2개)
 BUTTON_TEXT=(os.getenv("BUTTON_TEXT") or "쿠팡에서 최저가 확인하기").strip()
 BUTTON2_TEXT=(os.getenv("BUTTON2_TEXT") or "제품 보러가기").strip()
 BUTTON2_URL=(os.getenv("BUTTON2_URL") or "").strip()
@@ -125,7 +133,7 @@ BUTTON2_URL=(os.getenv("BUTTON2_URL") or "").strip()
 USE_IMAGE=((os.getenv("USE_IMAGE") or "").strip().lower() in ("1","true","y","yes","on"))
 AFFILIATE_TIME_KST=(os.getenv("AFFILIATE_TIME_KST") or "13:00").strip()
 
-USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.8"
+USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.9"
 USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
 USED_FILE=os.path.join(USAGE_DIR,"used_shopping.txt")
 
@@ -133,7 +141,6 @@ NO_REPEAT_TODAY=(os.getenv("NO_REPEAT_TODAY") or "1").lower() in ("1","true","y"
 AFF_USED_BLOCK_DAYS=int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")
 
 PRODUCTS_SEED_CSV=(os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv")
-FALLBACK_KWS=os.getenv("AFF_FALLBACK_KEYWORDS") or "휴대용 선풍기, 제습기, 무선 청소기"
 
 REQ_HEADERS={
     "User-Agent": USER_AGENT,
@@ -141,7 +148,7 @@ REQ_HEADERS={
     "Content-Type": "application/json; charset=utf-8",
 }
 
-# ===== TIME / SLOT =====
+# ========= TIME / SLOT =========
 def _now_kst():
     return datetime.now(ZoneInfo("Asia/Seoul"))
 
@@ -186,7 +193,7 @@ def _slot_affiliate()->str:
     print(f"[SLOT] scheduled UTC = {final}")
     return final
 
-# ===== USED LOG =====
+# ========= USED LOG =========
 def _ensure_usage_dir(): os.makedirs(USAGE_DIR, exist_ok=True)
 
 def _load_used_set(days:int=30)->set:
@@ -211,7 +218,7 @@ def _mark_used(kw:str):
     with open(USED_FILE,"a",encoding="utf-8") as f:
         f.write(f"{datetime.utcnow().date():%Y-%m-%d}\t{kw.strip()}\n")
 
-# ===== CSV =====
+# ========= CSV =========
 def _read_col_csv(path:str)->List[str]:
     if not os.path.exists(path): return []
     out=[]
@@ -238,23 +245,18 @@ def _consume_col_csv(path:str, kw:str)->bool:
         csv.writer(f).writerows(new_rows)
     return True
 
-# ===== KEYWORD / URL =====
+# ========= KEYWORD / URL =========
 def pick_affiliate_keyword()->str:
-    used_today = _load_used_set(1) if NO_REPEAT_TODAY else set()
+    NO_REPEAT = (_load_used_set(1) if NO_REPEAT_TODAY else set())
     used_block = _load_used_set(AFF_USED_BLOCK_DAYS)
     gold=_read_col_csv("golden_shopping_keywords.csv")
     shop=_read_col_csv("keywords_shopping.csv")
     pool=[k for k in gold+shop if k and (k not in used_block)]
     if NO_REPEAT_TODAY:
-        removed=[k for k in pool if k in used_today]
-        if removed: print(f"[FILTER] removed (used today): {removed[:8]}")
-        pool=[k for k in pool if k not in used_today]
+        pool=[k for k in pool if k not in NO_REPEAT]
     if pool: return pool[0].strip()
     fb=[x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
-    if fb:
-        print(f"[AFFILIATE] fallback -> '{fb[0]}'")
-        return fb[0]
-    return "휴대용 선풍기"
+    return fb[0] if fb else "휴대용 선풍기"
 
 def resolve_product_url(keyword:str)->str:
     # 1) products_seed.csv 우선
@@ -272,10 +274,9 @@ def resolve_product_url(keyword:str)->str:
         except Exception as e:
             print(f"[SEED][WARN] read error: {e}")
     # 2) 안전 폴백: 쿠팡 검색
-    from urllib.parse import quote_plus
     return f"https://www.coupang.com/np/search?q={quote_plus(keyword)}"
 
-# ===== WP =====
+# ========= WP =========
 def _ensure_term(kind:str, name:str)->int:
     r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}", params={"search":name,"per_page":50,"context":"edit"},
                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
@@ -296,17 +297,14 @@ def _category_url_for(name:str)->str:
         )
         r.raise_for_status()
         items = r.json()
-        # 완전 일치 우선
         for it in items:
             if (it.get("name") or "").strip() == name:
                 link = (it.get("link") or "").strip()
                 if link: return link
-        # 아무거나 있으면 첫번째
         if items and (items[0].get("link") or "").strip():
             return items[0]["link"].strip()
     except Exception as e:
         print(f"[CAT][WARN] fallback category url for '{name}': {type(e).__name__}: {e}")
-    # 폴백: 인코딩 포함
     return f"{WP_URL}/category/{quote(name)}/"
 
 def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict:
@@ -331,7 +329,7 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
     r.raise_for_status(); return r.json()
 
-# ===== TEMPLATE =====
+# ========= TEMPLATE =========
 def _css_block()->str:
     return """
 <style>
@@ -359,7 +357,6 @@ def _css_block()->str:
 """.strip()
 
 def _adsense_block()->str:
-    # 내부광고(애드센스): 요청하신 코드 그대로 삽입
     return """
 <div class="aff-ad">
 <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7409421510734308"
@@ -402,7 +399,6 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
     if image and USE_IMAGE:
         img_html = f'<figure style="margin:0 0 18px"><img src="{html.escape(image)}" alt="{kw_esc}" loading="lazy" decoding="async" style="max-width:100%;height:auto;border-radius:12px"></figure>'
 
-    # 상단: 고지문 → 내부광고 → CTA(2+카테고리)
     top_block = f"""
   <p class="aff-disclosure"><strong>{disc}</strong></p>
   {_adsense_block()}
@@ -472,14 +468,78 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
 </div>
 """.strip()
 
-# ===== TITLE (patched) =====
-def build_title(keyword:str)->str:
-    # 제품명을 별도로 모르므로 keyword를 제품명으로 사용
-    title = hook_aff_title(keyword, keyword)
-    print(f"[AFF-TITLE] → {title}")
-    return title[:90]
+# ========= NAME SHORTENER (new) =========
+_STOP = set("""
+가을 겨울 봄 여름 간절기 데일리 여성 남성 유니섹스 오버 루즈 레귤러 클래식 베이직
+부드러운 도톰 얇은 따뜻한 가벼운 경량 프리미엄 심플 트렌디 인기 신상 기본
+단추 버튼 라운드 브이넥 반목 반폴라 폴라 목터틀 7부 반소매 긴팔 반팔
+화이트 아이보리 아이보리색 블랙 네이비 그레이 베이지 브라운 카키
+미니 소형 대형 100 1000 2000 M L XL XXL 55 66 77 S
+""".split())
+# 핵심 명사 우선순위(있으면 최대 2개까지 유지)
+_CORE_NOUNS = ["니트","가디건","전기포트","전기주전자","가습기","케이프","판초","숄","티","후드","코트","자켓","점퍼","청소기","제습기","선풍기"]
 
-# ===== ROTATE & RUN =====
+_SEASON_CODES = re.compile(r"(?i)\b(?:\d{2,4}(?:fw|ss)|fw|f\/w|s\/s)\b")
+_NUMLIKE = re.compile(r"^\d+[a-z가-힣]*$", re.I)
+
+def _tokenize(s: str) -> List[str]:
+    toks = re.split(r"[,\s/+\-·\|]+", (s or "").strip())
+    return [t for t in toks if t]
+
+def shorten_keyword_for_title(kw: str) -> str:
+    # 0) 시즌 코드 제거
+    s = _SEASON_CODES.sub("", kw)
+    toks = _tokenize(s)
+
+    # 1) 불용/색상/숫자성 토큰 제거
+    cleaned=[]
+    for t in toks:
+        if t in _STOP: continue
+        if _NUMLIKE.match(t): continue
+        if len(t) <= 1: continue
+        cleaned.append(t)
+
+    # 2) 핵심명사/브랜드 선별
+    core=[t for t in cleaned if any(n in t for n in _CORE_NOUNS)]
+    brand=""
+    for t in cleaned:
+        if t in core: continue
+        # 브랜드 후보: 한글 2~6자 또는 영문/영문+한글 조합, 숫자 미포함
+        if not any(ch.isdigit() for ch in t):
+            brand = t
+            break
+
+    # 3) 조합 규칙: [브랜드] + 핵심명사(최대2) or 핵심명사만
+    out=[]
+    if brand: out.append(brand)
+    if core:
+        # 중복 제거 & 길이 짧은 순
+        seen=set()
+        for t in core:
+            base = next((n for n in _CORE_NOUNS if n in t), t)
+            if base in seen: continue
+            seen.add(base)
+            out.append(base)
+            if len(out) >= 3: break
+
+    # 4) 최후 보루: 불용어 제거된 앞에서 3~4개
+    if not out:
+        out = cleaned[:3] if cleaned else _tokenize(kw)[:2]
+
+    # 5) 길이 제한 (너무 길면 뒤에서 컷)
+    name = " ".join(out).strip()
+    if len(name) > 18:
+        # 뒤에서부터 토막
+        cut = []
+        acc = 0
+        for t in out:
+            if acc + len(t) + (1 if cut else 0) > 18: break
+            cut.append(t); acc += len(t) + (1 if cut else 0)
+        name = " ".join(cut) if cut else out[0][:18]
+
+    return re.sub(r"\s+"," ",name).strip()
+
+# ========= RUN =========
 def rotate_sources(kw:str):
     changed=False
     if _consume_col_csv("golden_shopping_keywords.csv",kw):
@@ -494,11 +554,23 @@ def run_once():
     kw = pick_affiliate_keyword()
     url = resolve_product_url(kw)
     when_gmt = _slot_affiliate()
-    title = hook_aff_title(product_name=kw, keyword=kw)
+
+    # NEW: 제품명 요약 + 동적 제목
+    short_name = shorten_keyword_for_title(kw)
+    title = hook_aff_title(product_name_short=short_name, keyword=kw)
+
     body = render_affiliate_html(kw, url, image="", category_name=DEFAULT_CATEGORY)
     res = post_wp(title, body, when_gmt, category=DEFAULT_CATEGORY, tag=kw)
     link = res.get("link")
-    print(json.dumps({"post_id":res.get("id") or res.get("post") or 0, "link": link, "status":res.get("status"), "date_gmt":res.get("date_gmt"), "title": title, "keyword": kw}, ensure_ascii=False))
+    print(json.dumps({
+        "post_id":res.get("id") or res.get("post") or 0,
+        "link": link,
+        "status":res.get("status"),
+        "date_gmt":res.get("date_gmt"),
+        "title": title,
+        "keyword": kw,
+        "short_name": short_name
+    }, ensure_ascii=False))
     _mark_used(kw)
     rotate_sources(kw)
 
