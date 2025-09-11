@@ -1,273 +1,459 @@
 # -*- coding: utf-8 -*-
 """
-update_keywords.py — 일반/쇼핑 키워드 자동 수집·클린·선별
-- 일반/쇼핑 각각 최대 K개(기본 30) 수집 후 정제/점수화 → CSV 2종 + golden 2종 작성
-  * 일반: keywords_general.csv, golden_keywords.csv
-  * 쇼핑: keywords_shopping.csv, golden_shopping_keywords.csv
-- HTML 엔티티/태그/퍼블리셔 꼬리/연도-only/짧은 토큰/&quot 등 쓰레기 제거
-- 'Namespace is not subscriptable' 오류 수정(모든 args는 속성 접근)
-- 외부 API(NEWSAPI, NAVER) 실패 시에도 안전 폴백
+update_keywords.py
+- 네이버 검색 API + 네이버 데이터랩(검색어트렌드/쇼핑인사이트) + (옵션) NewsAPI
+- 최대 50개 후보 키워드 수집 후 스코어링 → 황금 키워드 선별
+- 결과 파일:
+  - keywords_general.csv, keywords.csv (동일, 일상글용)
+  - keywords_shopping.csv (쿠팡글 후보)
+  - golden_shopping_keywords.csv (쿠팡글 우선)
+환경변수(.env):
+  NAVER_CLIENT_ID, NAVER_CLIENT_SECRET (필수-네이버)
+  NEWSAPI_KEY (선택)
+  # 수집 개수/기간
+  KEYWORDS_K=50          # 일반 후보 수
+  KEYWORDS_GOLD=18       # 일반 황금 (참고: 현재는 사용 안 함, 형식 유지)
+  SHOP_K=50              # 쇼핑 후보 수
+  SHOP_GOLD=18           # 쇼핑 황금 개수
+  DAYS=7                 # 데이터랩 집계 구간
+  # 사용 스위치(기본 온)
+  USE_NAVER_SEARCH=1
+  USE_NAVER_DATALAB_SEARCH=1
+  USE_NAVER_DATALAB_SHOP=1
+  # 쇼핑인사이트 카테고리(선택): "50000006:가전,50000003:패션" 형식
+  NAVER_SHOP_CATEGORIES=
+  # 필터/사용로그
+  USAGE_DIR=.usage
+  USER_AGENT=gpt-blog-keywords/2.0
 """
-
-from __future__ import annotations
-import os, re, csv, html, time, json
-from datetime import datetime, timedelta, timezone
-from typing import Iterable, List, Tuple
+import os, re, csv, json, time, random
+from datetime import datetime, timedelta, date
+from pathlib import Path
+from typing import List, Dict, Tuple
 import requests
 from dotenv import load_dotenv
+
 load_dotenv()
 
-# ===== ENV =====
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
-NAVER_CLIENT_ID = os.getenv("NAVER_CLIENT_ID", "")
-NAVER_CLIENT_SECRET = os.getenv("NAVER_CLIENT_SECRET", "")
+UA = os.getenv("USER_AGENT") or "gpt-blog-keywords/2.0"
+HEADERS = {"User-Agent": UA, "Accept": "application/json"}
 
-USER_AGENT = os.getenv("USER_AGENT", "gpt-blog-keywords/1.3")
-HEADERS = {"User-Agent": USER_AGENT, "Accept": "application/json; charset=utf-8"}
+# ===== 파라미터 =====
+K_GENERAL  = int(os.getenv("KEYWORDS_K"   , "50"))
+K_GOLD_GEN = int(os.getenv("KEYWORDS_GOLD", "18"))
+K_SHOP     = int(os.getenv("SHOP_K"       , os.getenv("KEYWORDS_K","50")))
+K_GOLD_SH  = int(os.getenv("SHOP_GOLD"    , os.getenv("KEYWORDS_GOLD","18")))
+DAYS_RANGE = int(os.getenv("DAYS"         , "7"))
 
-# ===== I/O =====
-GEN_OUT = "keywords_general.csv"
-GEN_GOLD = "golden_keywords.csv"
-SHOP_OUT = "keywords_shopping.csv"
-SHOP_GOLD = "golden_shopping_keywords.csv"
+USE_NAVER_SEARCH          = (os.getenv("USE_NAVER_SEARCH"         ,"1").lower() in ("1","true","y","on"))
+USE_NAVER_DATALAB_SEARCH  = (os.getenv("USE_NAVER_DATALAB_SEARCH" ,"1").lower() in ("1","true","y","on"))
+USE_NAVER_DATALAB_SHOP    = (os.getenv("USE_NAVER_DATALAB_SHOP"   ,"1").lower() in ("1","true","y","on"))
 
-# ===== Helpers =====
-def _write_col_csv(path: str, items: List[str]) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["keyword"])
-        for k in items:
-            w.writerow([k])
+NAVER_ID     = os.getenv("NAVER_CLIENT_ID") or ""
+NAVER_SECRET = os.getenv("NAVER_CLIENT_SECRET") or ""
+NEWSAPI_KEY  = os.getenv("NEWSAPI_KEY") or ""
 
-def _norm_text(s: str) -> str:
-    if not s: return ""
-    s = html.unescape(s)
-    s = re.sub(r"<[^>]+>", " ", s)                  # strip tags
-    s = re.sub(r"[\|\-–—~·•●▶▷›»]+.*$", "", s)      # cut publisher tail "제목 | 언론사"
-    s = re.sub(r"\s+", " ", s).strip()
-    # remove leading quotes/ticks
-    s = s.strip(" \"'“”‘’`")
+USAGE_DIR  = os.getenv("USAGE_DIR") or ".usage"
+USED_FILE  = Path(USAGE_DIR) / "used_shopping.txt"
+
+# 선택 입력: "50000006:가전,50000003:패션" → [(code, name), ...]
+def _parse_shop_categories(s: str) -> List[Tuple[str,str]]:
+    out=[]
+    for part in (s or "").split(","):
+        part=part.strip()
+        if not part: continue
+        if ":" in part:
+            code, name = part.split(":",1)
+            out.append((code.strip(), name.strip()))
+        else:
+            out.append((part.strip(), part.strip()))
+    return out
+NAVER_SHOP_CATS = _parse_shop_categories(os.getenv("NAVER_SHOP_CATEGORIES",""))
+
+# ===== 사전/토큰 =====
+SHOP_CATS  = [
+  "가습기","미니 가습기","초음파 가습기","가열식 가습기",
+  "청소기","무선 청소기","핸디 청소기","물걸레 청소기",
+  "전기포트","전기주전자","보조배터리",
+  "히터","전기요","제습기","서큘레이터","선풍기",
+  "니트","가디건","스웨터","케이프","숄","니트 원피스"
+]
+ADJ = ["미니","무선","휴대용","초음파","가열식","가을","겨울","브이넥","라운드","오버핏","크롭","롱","반팔","폴라","하이넥","레이스"]
+
+STOPWORDS = set("단독 속보 인터뷰 사진 영상 전문 기자 안내 공지 모집 이벤트 할인 세일 특가 혜택 역대급 클릭 바로가기 썸네일 LIVE 생중계 생방송 무료 체험".split())
+DROP_TOK  = set("공식 무상 정품 신상 인기 베스트 새상품 리뷰 후기 사용기 광고 예약됨 최저가 역대급 100% 필구 대박".split())
+
+# ===== 공용 유틸 =====
+def norm(s:str)->str:
+    s=(s or "").strip()
+    s=re.sub(r"[“”‘’\"\'\[\]\(\)\|]", " ", s)
+    s=re.sub(r"\s+", " ", s)
     return s
 
-def _is_bad_token(s: str) -> bool:
-    if not s: return True
-    if any(ent in s for ent in ["&quot", "&amp", "&lt", "&gt", "&#", ";"]): return True
-    if re.fullmatch(r"\d{2,4}(년|월|일)?", s): return True      # year/month/day only
-    if len(s) < 2 or len(s) > 30: return True
-    if re.fullmatch(r"[A-Za-z0-9 _\-]+", s) and len(s) < 5: return True  # too plain ascii short
-    # generic/잡음 단어들
-    ban = ["속보", "인사이트", "지디넷코리아", "오피니언", "기고", "사설", "단독", "기획", "종합", "오늘", "영상"]
-    if s in ban: return True
-    # 끝이 기호
-    if re.search(r"[^\w가-힣)]$", s): return True
-    # url-like
-    if "http" in s or "www." in s: return True
-    return False
+def tokenize_ko(s:str)->List[str]:
+    s=re.sub(r"[^가-힣a-zA-Z0-9\s]", " ", s)
+    return [t for t in s.split() if t]
 
-def _dedup_keep_order(items: Iterable[str]) -> List[str]:
-    seen, out = set(), []
-    for x in items:
-        if not x or x in seen: continue
-        seen.add(x); out.append(x)
-    return out
+def write_col_csv(path:Path, items:List[str], header:str="keyword"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow([header])
+        for it in items:
+            it=it.strip()
+            if it: w.writerow([it])
 
-def _split_candidates(title: str) -> List[str]:
-    t = _norm_text(title)
-    if not t: return []
-    # split by separators, keep first meaningful part
-    parts = re.split(r"[|\-–—:~]", t)
-    parts = [p.strip() for p in parts if p.strip()]
-    cands = []
-    for p in parts:
-        # strip trailing publisher-like tokens (예: "네이버 뉴스", "조선일보")
-        p = re.sub(r"(네이버|다음|카카오|뉴스|일보|신문|TV|지디넷코리아|한겨레|중앙일보|조선일보|경향신문)$", "", p).strip()
-        # trail brackets/quotes
-        p = re.sub(r"^[\(\[]|[\)\]]$", "", p)
-        if not _is_bad_token(p): cands.append(p)
-    return cands[:2]  # 과분할 방지
+def load_used_recent(n_days:int=30)->List[str]:
+    try:
+        if not USED_FILE.exists(): return []
+        cutoff = datetime.utcnow().date() - timedelta(days=n_days)
+        out=[]
+        for line in USED_FILE.read_text("utf-8").splitlines():
+            line=line.strip()
+            if not line or "\t" not in line: 
+                continue
+            d,kw = line.split("\t",1)
+            try:
+                if datetime.strptime(d,"%Y-%m-%d").date() >= cutoff:
+                    out.append(kw.strip())
+            except Exception:
+                out.append(kw.strip())
+        return out[-200:]
+    except Exception:
+        return []
 
-def _score_general(s: str) -> float:
-    score = 0.0
-    # 길이 보너스(적당한 길이)
-    L = len(s)
-    if 7 <= L <= 18: score += 2.0
-    elif 5 <= L <= 22: score += 1.0
-    # 한글 포함 가점
-    if re.search(r"[가-힣]", s): score += 1.5
-    # 숫자 과다 패널티
-    if re.search(r"\d{3,}", s): score -= 1.0
-    # 클린 여부 가점
-    if not _is_bad_token(s): score += 0.5
-    return score
-
-def _score_shopping(s: str, month: int) -> float:
-    score = 0.0
-    # 기본 길이/가독성
-    L = len(s)
-    if 6 <= L <= 20: score += 1.2
-    if re.search(r"[가-힣]", s): score += 1.0
-    # 계절 보정
-    seasonal = {
-        12: ["히터","전기장판","가습기","패딩","온열","핫팩","크리스마스"],
-        1:  ["히터","전기장판","가습기","패딩","온열","핫팩"],
-        2:  ["가습기","제습기","난방","온열","패딩"],
-        3:  ["공기청정기","미세먼지","자외선","봄코트","우산"],
-        4:  ["우산","우비","바람막이","운동화","피크닉","모기"],
-        5:  ["선풍기","쿨링","모기","캠핑","여행가방"],
-        6:  ["선풍기","휴대용 선풍기","쿨링","샤워필터","모기","썬케어"],
-        7:  ["에어컨","선풍기","쿨링","모기","여름이불","워터파크"],
-        8:  ["에어컨","쿨링","아이스팩","쿨매트","휴가"],
-        9:  ["가을 니트","가을 이불","전기포트","가습기","트렌치코트"],
-        10: ["전기장판","가습기","가을 니트","코트","무선청소기"],
-        11: ["전기장판","히터","가습기","김장","코트","블랙프라이데이"],
-    }
-    for w in seasonal.get(month, []):
-        if w in s: score += 2.0
-    # 쇼핑 냄새 가점(제품 카테고리성 명사)
-    if re.search(r"(선풍기|가습기|전기장판|히터|청소기|에어컨|이불|니트|코트|패딩|가방|키보드|마우스|헤드폰|충전기)", s):
-        score += 1.5
-    # 과도한 모델명/숫자 패널티
-    if re.search(r"[A-Za-z]+[-\s]?\d{2,}", s):
-        score -= 0.8
-    return score
-
-def _newsapi_titles(query: str, days: int, size: int = 50) -> List[str]:
+# ===== 소스: NewsAPI (선택) =====
+def fetch_newsapi(q:str, from_days:int=7, size:int=60)->List[Dict]:
     if not NEWSAPI_KEY: return []
     url = "https://newsapi.org/v2/everything"
-    frm = (datetime.utcnow() - timedelta(days=max(1, days))).strftime("%Y-%m-%d")
+    params = {
+        "apiKey": NEWSAPI_KEY,
+        "q": q, "language": "ko",
+        "from": (datetime.utcnow()-timedelta(days=from_days)).date().isoformat(),
+        "sortBy": "publishedAt",
+        "pageSize": size
+    }
     try:
-        r = requests.get(url, params={
-            "apiKey": NEWSAPI_KEY, "q": query, "from": frm, "language": "ko",
-            "pageSize": min(100, size), "sortBy": "publishedAt"
-        }, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        return [a.get("title","") or "" for a in data.get("articles", [])]
+        r = requests.get(url, params=params, headers=HEADERS, timeout=15); r.raise_for_status()
+        return r.json().get("articles", [])
     except Exception as e:
         print(f"[NEWSAPI][WARN] {type(e).__name__}: {e}")
         return []
 
-def _naver_search_news(query: str, display: int = 30) -> List[str]:
-    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET): return []
-    url = "https://openapi.naver.com/v1/search/news.json"
-    headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
+# ===== 소스: 네이버 검색 API =====
+def _naver_get(url:str, params:dict)->dict:
+    if not (NAVER_ID and NAVER_SECRET): 
+        return {}
+    headers = {**HEADERS, "X-Naver-Client-Id": NAVER_ID, "X-Naver-Client-Secret": NAVER_SECRET}
     try:
-        r = requests.get(url, params={"query": query, "display": min(100, display), "sort": "date"},
-                         headers={**HEADERS, **headers}, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        R = []
-        for it in data.get("items", []):
-            R.append(it.get("title","") or "")
-        return R
+        r = requests.get(url, params=params, headers=headers, timeout=12); r.raise_for_status()
+        return r.json()
     except Exception as e:
-        print(f"[NAVER][WARN] {type(e).__name__}: {e}")
-        return []
+        print(f"[NAVER][WARN] GET {url.split('/')[-1]}: {type(e).__name__}: {e}")
+        return {}
 
-def _naver_search_shop(query: str, display: int = 30) -> List[str]:
-    if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET): return []
-    url = "https://openapi.naver.com/v1/search/shop.json"
-    headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
+def naver_search_news(q:str, display:int=50)->List[Dict]:
+    if not USE_NAVER_SEARCH: return []
+    js = _naver_get("https://openapi.naver.com/v1/search/news.json",
+                    {"query": q, "display": display, "sort":"date"})
+    return js.get("items", []) if js else []
+
+def naver_search_web(q:str, display:int=50)->List[Dict]:
+    if not USE_NAVER_SEARCH: return []
+    js = _naver_get("https://openapi.naver.com/v1/search/webkr",
+                    {"query": q, "display": display})
+    return js.get("items", []) if js else []
+
+def harvest_texts()->List[str]:
+    pool=[]
+    # 1) 네이버 뉴스/웹
+    queries = ["트렌드", "출시", "신제품", "업데이트", "가을", "겨울", "핫", "행사", "프로모션"]
+    for q in queries:
+        for it in naver_search_news(q, display=50):
+            pool += [it.get("title",""), it.get("description","")]
+        for it in naver_search_web(q, display=30):
+            pool += [it.get("title",""), it.get("description","")]
+        time.sleep(0.15)
+    # 2) (옵션) NewsAPI 보강
+    if NEWSAPI_KEY:
+        for q in ["트렌드", "이슈", "발표", "업데이트"]:
+            for art in fetch_newsapi(q, from_days=DAYS_RANGE, size=40):
+                pool += [art.get("title",""), art.get("description","")]
+            time.sleep(0.15)
+    return [norm(t) for t in pool if t]
+
+# ===== 소스: 네이버 데이터랩 (검색어트렌드) =====
+def _naver_post(url:str, payload:dict)->dict:
+    if not (NAVER_ID and NAVER_SECRET):
+        return {}
+    headers = {**HEADERS, "X-Naver-Client-Id": NAVER_ID, "X-Naver-Client-Secret": NAVER_SECRET, "Content-Type":"application/json"}
     try:
-        r = requests.get(url, params={"query": query, "display": min(100, display)},
-                         headers={**HEADERS, **headers}, timeout=15)
+        r = requests.post(url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, timeout=15)
         r.raise_for_status()
-        data = r.json()
-        return [it.get("title","") or "" for it in data.get("items", [])]
+        return r.json()
     except Exception as e:
-        print(f"[NAVERSHOP][WARN] {type(e).__name__}: {e}")
+        print(f"[NAVER][WARN] POST {url.split('/')[-1]}: {type(e).__name__}: {e}")
+        return {}
+
+def chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
+
+def datalab_search_trends(groups:List[Dict], days:int=7, time_unit:str="date",
+                          device:str="", gender:str="", ages:List[str]=None)->Dict[str, float]:
+    """
+    groups: [{"groupName":"가습기","keywords":["가습기","미니 가습기"]}, ...]
+    return: {groupName: momentum_score}
+    """
+    if not USE_NAVER_DATALAB_SEARCH or not groups:
+        return {}
+    start = (date.today() - timedelta(days=max(7, days*2))).isoformat()
+    end   = date.today().isoformat()
+    result={}
+    for pack in chunk(groups, 5):  # API 제약: 그룹 최대 5개/호출
+        payload = {
+            "startDate": start, "endDate": end, "timeUnit": time_unit,
+            "keywordGroups": pack
+        }
+        if device: payload["device"]=device
+        if gender: payload["gender"]=gender
+        if ages:   payload["ages"]=ages
+        js = _naver_post("https://openapi.naver.com/v1/datalab/search", payload)
+        if not js: 
+            time.sleep(0.2); 
+            continue
+        try:
+            for series in js.get("results", []):
+                name = series.get("title") or series.get("keyword") or series.get("keywords",[None])[0]
+                data = series.get("data", [])
+                if not data: 
+                    continue
+                # momentum: 최근 N일 평균 - 그 이전 N일 평균
+                vals = [float(x.get("ratio",0.0)) for x in data]
+                if len(vals) < 6: 
+                    score = sum(vals[-3:]) / max(1, len(vals[-3:]))
+                else:
+                    recent = vals[-days:]
+                    prev   = vals[-(2*days):-days] if len(vals) >= 2*days else vals[:-days]
+                    score = (sum(recent)/max(1,len(recent))) - (sum(prev)/max(1,len(prev)))
+                result[norm(name)] = result.get(norm(name), 0.0) + score
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return result
+
+# ===== 소스: 네이버 데이터랩 (쇼핑인사이트) =====
+def datalab_shopping_keywords(category_code:str, start:str, end:str, time_unit:str="date",
+                               device:str="", gender:str="", ages:List[str]=None)->List[Tuple[str,float]]:
+    """
+    카테고리별 연관 키워드(인기도) 수집.
+    참고: 일부 계정/권한에서 미지원일 수 있어 실패시 빈 리스트 반환.
+    """
+    if not USE_NAVER_DATALAB_SHOP or not category_code:
         return []
+    payload = {"startDate": start, "endDate": end, "timeUnit": time_unit, "category": category_code}
+    if device: payload["device"]=device
+    if gender: payload["gender"]=gender
+    if ages:   payload["ages"]=ages
+    js = _naver_post("https://openapi.naver.com/v1/datalab/shopping/category/keywords", payload)
+    out=[]
+    try:
+        for it in js.get("results", []):
+            kw  = norm(it.get("keyword") or it.get("title") or "")
+            val = float(it.get("ratio", 0.0))
+            if kw: out.append((kw, val))
+    except Exception:
+        # 일부 스펙에서 다른 필드 구조를 반환 → 포용적으로 파싱
+        try:
+            for series in js.get("results", []):
+                for row in series.get("data", []):
+                    kw  = norm(row.get("title") or row.get("keyword") or "")
+                    val = float(row.get("ratio", 0.0))
+                    if kw: out.append((kw, val))
+        except Exception:
+            return []
+    return out
 
-# ===== Builders =====
-def build_general(k: int = 30, gold: int = 12, days: int = 7) -> Tuple[List[str], List[str]]:
-    seed_q = ["트렌드", "이슈", "심층", "분석", "관찰", "통찰", "연구", "데이터", "변화", "정책"]
-    titles: List[str] = []
-    for q in seed_q:
-        titles += _newsapi_titles(q, days, size=60)
-        titles += _naver_search_news(q, display=40)
-        time.sleep(0.2)
+# ===== 키워드 추출/분리/스코어링 =====
+def extract_phrases(texts:List[str])->List[str]:
+    """가벼운 규칙 기반 한국어 구문 추출."""
+    cands=set()
+    for t in texts:
+        toks = tokenize_ko(t)
+        toks = [x for x in toks if x not in STOPWORDS and x not in DROP_TOK]
+        n=len(toks)
+        for win in (2,3,4):
+            for i in range(0, max(0,n-win+1)):
+                seg=" ".join(toks[i:i+win])
+                if len(seg) < 4: continue
+                cands.add(seg)
+        for x in toks:
+            if 2 < len(x) < 10 and re.search(r"[가-힣]", x):
+                cands.add(x)
+    return list(cands)
 
-    cands: List[str] = []
-    for t in titles:
-        cands += _split_candidates(t)
+def expand_shopping_base()->List[str]:
+    base=set(SHOP_CATS)
+    for cat in SHOP_CATS:
+        for a in ADJ:
+            if a not in cat:
+                base.add(f"{a} {cat}")
+    return list(base)
 
-    # 클린 + dedup
-    cands = [c for c in cands if not _is_bad_token(c)]
-    cands = _dedup_keep_order(cands)
-    # 점수화
-    scored = sorted([(c, _score_general(c)) for c in cands], key=lambda x: x[1], reverse=True)
-    picked = [c for c,_ in scored][:k]
-    golds = [c for c,_ in scored][:max(1, min(gold, len(picked)))]
+def split_shop_general(cands:List[str])->Tuple[List[str], List[str]]:
+    shop, general=[], []
+    shop_words = set([w for cat in SHOP_CATS for w in cat.split()])
+    for s in cands:
+        if any(c in s for c in SHOP_CATS) or any(w in s for w in shop_words):
+            shop.append(s)
+        else:
+            general.append(s)
+    return shop, general
 
-    print(f"[GENERAL] {len(picked)} collected → write {len(picked)} (gold {len(golds)})")
-    _write_col_csv(GEN_OUT, picked)
-    _write_col_csv(GEN_GOLD, golds)
-    return picked, golds
+def score_keyword(s:str, is_shop:bool, source_freq:Dict[str,int], recent_block:set,
+                  dl_momentum:Dict[str,float], shop_boost:Dict[str,float])->float:
+    base = source_freq.get(s, 1)
+    length=len(s)
+    score = base
+    if 6 <= length <= 16: score += 1.2
+    elif 4 <= length <= 22: score += 0.6
+    else: score -= 0.6
+    # 데이터랩 모멘텀(최근 상승) 반영
+    if s in dl_momentum:
+        score += dl_momentum[s] * 0.12
+    # 쇼핑 인사이트 연관 키워드 가중
+    if is_shop and s in shop_boost:
+        score += shop_boost[s] * 0.04
+    # 형용사 + 품목 보너스
+    if is_shop and any(a in s for a in ADJ): score += 0.6
+    if is_shop and any(c in s for c in SHOP_CATS): score += 0.7
+    # 최근 사용 감점
+    if s in recent_block: score -= 2.0
+    # 날짜 고정 난수로 경미한 다양성
+    rnd = random.Random(abs(hash(f"{date.today()}|{s}")))
+    score += rnd.uniform(-0.25, 0.25)
+    return score
 
-def build_shopping(shop_k: int = 30, shop_gold: int = 12, days: int = 7) -> Tuple[List[str], List[str]]:
-    # 계절 시드 + 범용 시드
-    month = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).month
-    season_seeds = {
-        12: ["히터", "전기장판", "가습기", "핫팩", "겨울 이불"],
-        1:  ["히터", "전기장판", "가습기", "패딩", "핫팩"],
-        2:  ["가습기", "온열", "전기요", "난방 텐트"],
-        3:  ["공기청정기", "봄코트", "자외선 차단"],
-        4:  ["우산", "바람막이", "운동화", "피크닉 매트"],
-        5:  ["선풍기", "쿨링 타월", "모기 퇴치기", "캠핑 의자"],
-        6:  ["휴대용 선풍기", "쿨매트", "모기장", "샤워필터"],
-        7:  ["에어컨", "아이스박스", "워터파크 준비물", "여름 이불"],
-        8:  ["휴가 준비물", "쿨러백", "아이스팩", "썬케어"],
-        9:  ["가을 니트", "무선청소기", "가습기", "전기포트"],
-        10: ["전기장판", "가습기", "코트", "김장 용품"],
-        11: ["블랙프라이데이", "히터", "전기장판", "가습기"],
-    }
-    base_seeds = ["베스트셀러", "가성비", "프리미엄", "신상품", "추천템"]
+def pick_top(cands:List[str], k:int, is_shop:bool, recent_block:set,
+             dl_momentum:Dict[str,float], shop_boost:Dict[str,float])->List[str]:
+    # 출현 빈도
+    freq={}
+    for c in cands: freq[c]=freq.get(c,0)+1
+    # 정제/중복 제거
+    seen=set(); dedup=[]
+    for c in cands:
+        cc=norm(c)
+        if not cc or cc in seen: continue
+        seen.add(cc); dedup.append(cc)
+    # 스코어
+    scored=[(score_keyword(c, is_shop, freq, recent_block, dl_momentum, shop_boost), c) for c in dedup]
+    scored.sort(key=lambda x:x[0], reverse=True)
+    out=[c for _,c in scored[:k*2]]  # 1차 넉넉히 가져옴
+    # 과도한 편중 방지(품목 버킷)
+    balanced=[]; bucket={}
+    for w in out:
+        key=None
+        for cat in SHOP_CATS:
+            if cat in w or cat.split()[0] in w:
+                key=cat.split()[0]; break
+        if key:
+            if bucket.get(key,0)>= max(1, k//10): 
+                continue
+            bucket[key]=bucket.get(key,0)+1
+        balanced.append(w)
+        if len(balanced)>=k: break
+    return balanced[:k]
 
-    titles: List[str] = []
-    for q in season_seeds.get(month, []) + base_seeds:
-        titles += _naver_search_shop(q, display=40)
-        titles += _naver_search_news(q, display=20)
-        time.sleep(0.2)
+def choose_golden(full:List[str], g:int)->List[str]:
+    if not full: return []
+    head=full[:max(8,g)]
+    tail=full[max(8,g):max(40,len(full))]
+    rnd = random.Random(abs(hash(date.today().isoformat())))
+    rnd.shuffle(tail)
+    pool=(head+tail)[:max(g*2, g+6)]
+    out=[]
+    for s in pool:
+        if any((s in x) or (x in s) for x in out):
+            continue
+        out.append(s)
+        if len(out)>=g: break
+    return out[:g]
 
-    cands: List[str] = []
-    for t in titles:
-        cands += _split_candidates(t)
-
-    # 클린
-    def _shop_clean(s: str) -> str:
-        s = re.sub(r"\b(무료배송|정품|공식|행사|특가|세일|쿠폰|핫딜|가격)\b", "", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        return s
-
-    cands = [_shop_clean(c) for c in cands if not _is_bad_token(c)]
-    cands = [c for c in cands if len(c) >= 3]
-    cands = _dedup_keep_order(cands)
-
-    month_now = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=9))).month
-    scored = sorted([(c, _score_shopping(c, month_now)) for c in cands], key=lambda x: x[1], reverse=True)
-    picked = [c for c,_ in scored][:shop_k]
-    golds  = [c for c,_ in scored][:max(1, min(shop_gold, len(picked)))]
-
-    print(f"[SHOPPING] {len(picked)} collected → write {len(picked)} (gold {len(golds)})")
-    _write_col_csv(SHOP_OUT, picked)
-    _write_col_csv(SHOP_GOLD, golds)
-    return picked, golds
-
-# ===== CLI =====
+# ===== 실행 =====
 def main():
-    import argparse
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--k", type=int, default=30)
-    ap.add_argument("--gold", type=int, default=12)
-    ap.add_argument("--shop-k", type=int, default=30)
-    ap.add_argument("--shop-gold", type=int, default=12)
-    ap.add_argument("--days", type=int, default=7)
-    ap.add_argument("--parallel", type=int, default=8)  # dummy (미사용) — 인터페이스 유지
-    args = ap.parse_args()
+    print(f"[KW] collect start (days={DAYS_RANGE}, K_GEN={K_GENERAL}, K_SHOP={K_SHOP})")
+    texts = harvest_texts()
 
-    build_general(k=args.k, gold=args.gold, days=args.days)
-    build_shopping(shop_k=args.shop_k, shop_gold=args.shop_gold, days=args.days)
+    # 1) 규칙 추출 + 쇼핑 기본 확장
+    phrases = extract_phrases(texts)
+    phrases += expand_shopping_base()
 
+    # 2) 데이터랩 검색어트렌드 모멘텀
+    dl_momentum={}
+    if USE_NAVER_DATALAB_SEARCH and NAVER_ID and NAVER_SECRET:
+        groups=[]
+        for cat in SHOP_CATS:
+            kw = [cat]
+            for a in ADJ:
+                if a not in cat: kw.append(f"{a} {cat}")
+            groups.append({"groupName": cat, "keywords": kw[:5]})  # 그룹 내 키워드 1~5개
+        # 과도 호출 방지: 상위 N 그룹만 사용
+        groups = groups[:50]
+        dl_momentum = datalab_search_trends(groups, days=DAYS_RANGE, time_unit="date")
+
+    # 3) 데이터랩 쇼핑인사이트(카테고리 연관 키워드) → boost 테이블
+    shop_boost={}
+    if USE_NAVER_DATALAB_SHOP and NAVER_SHOP_CATS and NAVER_ID and NAVER_SECRET:
+        start = (date.today() - timedelta(days=max(7,DAYS_RANGE*2))).isoformat()
+        end   = date.today().isoformat()
+        for code, name in NAVER_SHOP_CATS:
+            rows = datalab_shopping_keywords(code, start, end, time_unit="date")
+            for kw, val in rows:
+                shop_boost[kw] = shop_boost.get(kw, 0.0) + float(val)
+            time.sleep(0.2)
+
+    # 4) 분리
+    shop_cands, general_cands = split_shop_general(phrases)
+
+    # 5) 최근 사용 차단(쇼핑만)
+    recent_block=set(load_used_recent(30))
+
+    # 6) 선별
+    top_general = pick_top(general_cands, K_GENERAL, is_shop=False, recent_block=set(),
+                           dl_momentum=dl_momentum, shop_boost={})
+    top_shop    = pick_top(shop_cands   , K_SHOP   , is_shop=True , recent_block=recent_block,
+                           dl_momentum=dl_momentum, shop_boost=shop_boost)
+    golden_shop = choose_golden(top_shop, K_GOLD_SH)
+
+    # 7) 저장
+    write_col_csv(Path("keywords_general.csv"), top_general)
+    write_col_csv(Path("keywords.csv"      ), top_general)    # 호환
+    write_col_csv(Path("keywords_shopping.csv"), top_shop)
+    write_col_csv(Path("golden_shopping_keywords.csv"), golden_shop)
+
+    # 8) 로그
+    print(f"[GENERAL] {len(top_general)} → keywords_general.csv (head={top_general[:5]})")
+    print(f"[SHOP]    {len(top_shop)} → keywords_shopping.csv (gold={len(golden_shop)})")
+    print(f"[GOLD]    {golden_shop[:8]} …")
+    if shop_boost:
+        print(f"[SHOP-INSIGHT] categories={len(NAVER_SHOP_CATS)} boost_keys={len(shop_boost)}")
+    if dl_momentum:
+        print(f"[DATALAB-SEARCH] groups={min(50,len(dl_momentum))} (momentum keys)")
+
+# --- CLI flags 호환 래퍼 (기존 워크플로 인자 사용 가능) ---
 if __name__ == "__main__":
+    import argparse, os
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--k", type=int)
+    p.add_argument("--gold", type=int)
+    p.add_argument("--shop-k", type=int, dest="shop_k")
+    p.add_argument("--shop-gold", type=int, dest="shop_gold")
+    p.add_argument("--days", type=int)
+    p.add_argument("--parallel", type=int)  # 무시용
+    args, _ = p.parse_known_args()
+    if args.k:         os.environ["KEYWORDS_K"] = str(args.k)
+    if args.gold:      os.environ["KEYWORDS_GOLD"] = str(args.gold)
+    if args.shop_k:    os.environ["SHOP_K"] = str(args.shop_k)
+    if args.shop_gold: os.environ["SHOP_GOLD"] = str(args.shop_gold)
+    if args.days:      os.environ["DAYS"] = str(args.days)
     main()
