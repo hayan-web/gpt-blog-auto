@@ -7,6 +7,7 @@ affiliate_post.py — Coupang Partners 글 자동 포스팅
 - URL 없을 때 쿠팡 검색 페이지 폴백
 - 골든키워드 회전/사용로그/예약 충돌 회피
 - ✨ 제목 생성 로직: 사람 말투 '미니 스토리' → (LLM) → 템플릿 폴백
+- ✨ 한국어 후처리(비문/중복/접속어 과다)로 자연스러운 한 문장 보장
 """
 import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
@@ -87,7 +88,6 @@ def _normalize_title(s: str) -> str:
 
 def _sanitize_title_text(s: str) -> str:
     s = _normalize_title(s)
-    # 금지 문구/군더더기 제거
     for ban in AFF_BANNED_PHRASES:
         s = s.replace(ban, "")
     s = re.sub(r"\s+", " ", s).strip(" ,.-·")
@@ -105,7 +105,7 @@ def _bad_aff_title(t: str) -> bool:
         return True
     return False
 
-# ===== 한글 조사 보정 =====
+# ===== 한국어 조사 보정 =====
 def _has_jong(ch: str) -> bool:
     code = ord(ch) - 0xAC00
     return 0 <= code <= 11171 and (code % 28) != 0
@@ -129,10 +129,6 @@ def _tokenize_ko(s: str) -> List[str]:
     return toks
 
 def _compress_keyword(keyword: str) -> Tuple[str, str]:
-    """
-    키워드에서 군더더기를 덜고 '수식어 0~2 + 카테고리' 형태의 핵심 문구 생성.
-    return (core, normalized_keyword)
-    """
     toks = _tokenize_ko(keyword)
     kept_adj, cat = [], None
 
@@ -179,8 +175,53 @@ def _core_phrase_by_cat(cat: str, src: str) -> str:
     if cat == "kettle":       return "전기포트"
     if cat == "knit_dress":   return "니트 원피스"
     if cat == "knit":         return "니트"
-    # general
     return _compress_keyword(src)[0] or "아이템"
+
+# ===== 한국어 제목 후처리 (핵심) =====
+_BAD_LEADS = [
+    r"^하루 종일\s+선풍기(는|가)\s*",
+    r"^요즘\s+선풍기(는|가)\s*",
+]
+_BAD_PHRASE_MAP = {
+    "그래서 계속 손이 가요": "",
+    "손이 자꾸 가요": "손이 가요",
+    "확실히 편해졌어요": "편해졌어요",
+}
+def _dedupe_phrases(title: str) -> str:
+    parts = [p.strip() for p in re.split(r"[,\u2026]+", title) if p.strip()]
+    seen, out = set(), []
+    for p in parts:
+        k = re.sub(r"\s+", " ", p)
+        if k not in seen:
+            seen.add(k); out.append(p)
+    return ", ".join(out)
+
+def _collapse_repeats(title: str) -> str:
+    t = re.sub(r"(..+?)\s*\1", r"\1", title)   # 구 반복
+    t = re.sub(r"\s{2,}", " ", t)
+    return t.strip()
+
+def postprocess_korean_title(title: str) -> str:
+    t = _sanitize_title_text(title)
+
+    for bad, rep in _BAD_PHRASE_MAP.items():
+        t = t.replace(bad, rep).strip(" ,")
+
+    for pat in _BAD_LEADS:
+        t = re.sub(pat, "", t, flags=re.IGNORECASE).strip()
+
+    t = re.sub(r"(,?\s*(그래서|그러니|그리고))+\s*", ", ", t).strip(" ,")
+
+    t = _dedupe_phrases(t)
+    t = _collapse_repeats(t)
+
+    t = re.sub(r"\s+([,])", r"\1", t)
+    t = re.sub(r"\s{2,}", " ", t).strip()
+
+    t = re.sub(r"(요){2,}$", "요", t)
+    t = re.sub(r"(그래서|그러니|그리고)$", "", t).strip(" ,")
+
+    return t
 
 # ===== 스토리 톤 문구 풀 =====
 TIME_PHRASES = {
@@ -210,11 +251,11 @@ BENEFITS = {
     "kettle":       ["티타임이 빨라져요", "라면 준비가 금방이에요", "홈카페가 쉬워졌어요"],
     "knit":         ["핏이 단정하게 떨어져요", "가볍게 따뜻하더라고요", "아침이 덜 바빠요"],
     "knit_dress":   ["라인이 예쁘게 살아나요", "코디가 5분 만에 끝나요", "움직일 때 실루엣이 예뻐요"],
-    "general":      ["손이 자꾸 가요", "확실히 편해졌어요", "쓰면 이유를 알아요"],
+    "general":      ["손이 가요", "편해졌어요", "쓰면 이유를 알아요"],
 }
 
+# “그래서 …” 꼬리 문구는 제거(비문/광고톤 방지)
 TAILS = [
-    "그래서 계속 손이 가요",
     "이젠 이걸로 정착했어요",
     "한 번 써보면 이유를 알게 돼요",
     "돌려보면 차이가 나요",
@@ -261,12 +302,12 @@ def _story_candidates(core: str, cat: str) -> List[str]:
         f"{t} {core_iraseo} {b}",
         f"{core} 켜두면 {b}",
         f"한 번 써보면 {core_iga} 왜 편한지 알게 돼요",
-        f"{b}, 그래서 {core}로 갈아탔어요",
-        f"{t} {core_eunneun} {b}, 그래서 계속 손이 가요",
+        f"{b}, {core}로 갈아탔어요",
         f"{t} {core_eunneun} {b}, {tail}",
     ]
     out=[]
     for s in cands:
+        s = postprocess_korean_title(s)
         s = _sanitize_title_text(s)
         if len(s) < AFF_TITLE_MIN - 2:
             s += " 좋아요"
@@ -278,9 +319,8 @@ def _story_candidates(core: str, cat: str) -> List[str]:
 def _aff_title_from_story(keyword: str) -> str:
     src = _sanitize_title_text(keyword)
     cat = _detect_category_from_text(src)
-    # core은 키워드 기반보다 카테고리 코어 우선
     core = _core_phrase_by_cat(cat, src)
-    # 날짜+키워드 기반 시드 → 하루에 과도 반복 방지하면서 재현성 확보
+
     seed = abs(hash(f"story|{core}|{src}|{datetime.utcnow().date()}")) % (2**32)
     rnd = random.Random(seed)
 
@@ -289,8 +329,9 @@ def _aff_title_from_story(keyword: str) -> str:
 
     seen=set()
     for cand in pool:
+        cand = postprocess_korean_title(cand)
         cand = _sanitize_title_text(cand)
-        if not cand or cand in seen: 
+        if not cand or cand in seen:
             continue
         seen.add(cand)
         if not _bad_aff_title(cand):
@@ -303,7 +344,9 @@ def _aff_title_from_templates(core: str, kw: str) -> str:
     rnd = random.Random(seed)
     cands = rnd.sample(AFF_TITLE_TEMPLATES, k=min(6, len(AFF_TITLE_TEMPLATES)))
     for cand_tpl in cands:
-        cand = _sanitize_title_text(cand_tpl.format(core=core))
+        cand = cand_tpl.format(core=core)
+        cand = postprocess_korean_title(cand)
+        cand = _sanitize_title_text(cand)
         if _bad_aff_title(cand):
             continue
         a = re.sub(r"[^\w가-힣]", "", cand)
@@ -311,7 +354,8 @@ def _aff_title_from_templates(core: str, kw: str) -> str:
         if a == b:
             continue
         return cand
-    fallback = _sanitize_title_text(f"{core} 핵심만 쏙")
+    fallback = postprocess_korean_title(f"{core} 핵심만 쏙")
+    fallback = _sanitize_title_text(fallback)
     if not _bad_aff_title(fallback):
         return fallback
     return _sanitize_title_text(core)[:AFF_TITLE_MAX]
@@ -330,6 +374,8 @@ def _aff_title_from_llm(core: str, kw: str) -> str:
 - 제품명 그대로 쓰지 말고, {styles} 중 하나로 변주
 - 금지문구: {", ".join(AFF_BANNED_PHRASES)}
 - 과장/낚시 금지(최저가/역대 등)
+- 접속어 남발 금지(그래서/그러니/그리고 연속 사용 금지)
+- 같은 구절 반복 금지(예: '손이 가요' 2회)
 - 출력은 제목 1줄(순수 텍스트)만"""
         r = _oai.chat.completions.create(
             model=_OPENAI_MODEL,
@@ -338,6 +384,7 @@ def _aff_title_from_llm(core: str, kw: str) -> str:
             max_tokens=60,
         )
         cand = _sanitize_title_text(r.choices[0].message.content or "")
+        cand = postprocess_korean_title(cand)
         return "" if _bad_aff_title(cand) else cand
     except BadRequestError:
         return ""
@@ -691,10 +738,12 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
 # ===== TITLE ENTRY POINT =====
 def build_title(keyword:str)->str:
     """
-    최종 제목 생성: 스토리(사람 말투) → LLM → 템플릿
+    최종 제목 생성: 스토리(사람 말투) → LLM → 템플릿 → 한국어 후처리
     """
     t = hook_aff_title(keyword)
-    return _sanitize_title_text(t)[:AFF_TITLE_MAX]
+    t = postprocess_korean_title(t)
+    t = _sanitize_title_text(t)
+    return t[:AFF_TITLE_MAX]
 
 # ===== ROTATE & RUN =====
 def rotate_sources(kw:str):
