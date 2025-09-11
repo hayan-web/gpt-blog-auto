@@ -1,20 +1,10 @@
-﻿# auto_wp_gpt.py
+﻿# auto_wp_gpt.py  (일반 키워드 폴백 강화 + 제목 품질 보정)
 # -*- coding: utf-8 -*-
-"""
-auto_wp_gpt.py — 일상형 포스트 자동 발행 (SEO 구조/표/광고 반영, 1500자 내외)
-- 키워드 기반: keywords_general.csv 에서 선택 (없으면 안전 폴백 제목)
-- 본문: H2 부제목 + 개요(<=300자, 존댓말) + H3 섹션 6~8개 + 표 1개 이상 + 내부광고(상단/중간)
-- 태그는 키워드 1~2개에 맞춰 자동 생성
-- 워크플로에서 --mode=two-posts 등으로 호출 가능(기존 인터페이스 유지)
-- 워드프레스에 그대로 HTML로 들어가며 "요약글/본문1/본문2" 같은 안내 문구는 출력하지 않음
-"""
-
-import os, csv, json, html, random
+import os, csv, json, html, random, re
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import requests
 from dotenv import load_dotenv
-
 load_dotenv()
 
 WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
@@ -26,8 +16,13 @@ POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()
 DEFAULT_CATEGORY=(os.getenv("DEFAULT_CATEGORY") or "정보").strip() or "정보"
 DEFAULT_TAGS=(os.getenv("DEFAULT_TAGS") or "").strip()
 
-USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-daily/3.1"
+USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-daily/3.2"
 REQ_HEADERS={"User-Agent":USER_AGENT,"Accept":"application/json","Content-Type":"application/json; charset=utf-8"}
+
+GENERAL_FALLBACK = [
+    "아침 루틴","시간 관리","집 정리","하루 회고","주간 계획","작업 집중",
+    "산책 기록","홈카페","취미 기록","생활 루틴","작은 습관"
+]
 
 def _adsense_block()->str:
     sc=(os.getenv("AD_SHORTCODE") or "").strip()
@@ -81,7 +76,8 @@ def _read_col(path:str)->list[str]:
 
 def _pick_general_keyword()->str:
     ks=_read_col("keywords_general.csv")
-    return ks[0] if ks else "오늘의 기록"
+    if ks: return ks[0]
+    return random.choice(GENERAL_FALLBACK)
 
 def _slot_at(hour:int, minute:int)->str:
     now=datetime.now(ZoneInfo("Asia/Seoul"))
@@ -90,11 +86,12 @@ def _slot_at(hour:int, minute:int)->str:
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 def _title_from_kw(kw:str)->str:
-    s=kw.strip()
-    s=s.replace('"',"").replace("'","")
-    if len(s)<6: s=f"{s}에 대해 차분히 정리해 봤어요"
-    if len(s)>38: s=s[:38]+"…"
-    return s
+    base=(kw or "").strip().replace('"',"").replace("'","")
+    # 폴백/짧은 키워드면 클릭형으로 확장
+    if base in ("오늘의 기록","기록","일상") or len(base) < 8:
+        base=f"{base}에 대해 차분히 정리해 봤어요"
+    # 길이 20~30자 권장, 너무 길면 말줄임
+    return base if len(base)<=30 else base[:30]+"…"
 
 def _category_url(name:str)->str:
     try:
@@ -113,13 +110,29 @@ def _category_url(name:str)->str:
 def _mk_paragraph(txt:str)->str:
     return f"<p>{txt}</p>"
 
+def re_split_sentences(text:str)->list[str]:
+    chunks=[]; buf=""
+    for ch in text:
+        buf+=ch
+        if ch in "…?!.":
+            chunks.append(buf.strip()); buf=""
+    if buf.strip(): chunks.append(buf.strip())
+    out=[]; acc=""
+    for c in chunks:
+        if len(acc)+len(c) < 60:
+            acc=(acc+" "+c).strip()
+        else:
+            if acc: out.append(acc); acc=""
+            out.append(c)
+    if acc: out.append(acc)
+    return out
+
 def _html_daily(keyword:str)->str:
     k=html.escape(keyword)
     subtitle=f"{k} 핵심만 담아보기"
     summary=(f"{k}와 관련된 내용을 일상 맥락에서 자연스럽게 정리했습니다. "
-             f"누가·언제·어디서 쓰는지에 따라 포인트가 달라지므로, 사용 장면을 먼저 떠올리고 핵심만 빠르게 읽을 수 있도록 구성했어요.")
+             f"사용 장면을 먼저 떠올리고 핵심만 빠르게 읽을 수 있도록 구성했어요.")
 
-    # 4x5 표 한 개
     table=f"""
 <table class="daily-table">
   <thead><tr><th>구간</th><th>핵심</th><th>실수</th><th>대안</th></tr></thead>
@@ -132,92 +145,37 @@ def _html_daily(keyword:str)->str:
 </table>
 """.strip()
 
-    # 섹션 본문(1500자 근사치)
-    sec = []
-    sec.append((
-        "장면을 먼저 떠올리기",
-        "어디서 언제 누구와 사용할지부터 정리하면 선택이 쉬워집니다. 공간의 제약, 소음 허용치, 보관 위치 같은 현실 조건을 미리 적어두면 필요 이상으로 욕심내지 않게 되고, 사소해 보이는 불편을 줄일 수 있어요. 오늘 당장 쓰일 장면 한 가지만 확실히 잡아도 방향이 선명해집니다."
-    ))
-    sec.append((
-        "핵심 두세 가지에 집중",
-        "모든 기능을 잘 쓰려는 순간 복잡해집니다. 자주 쓰게 될 두세 기능만 정하고 그 외는 숨기는 편이 유지에 유리합니다. 처음 일주일은 일부러 단순한 설정으로 반복해 보세요. 몸에 익는 순간 루틴이 생기고, 자연스레 사용 빈도가 올라갑니다."
-    ))
-    sec.append((
-        "가성비를 좌우하는 요소",
-        "구매가보다 유지비가 체감을 좌우합니다. 소모품 가격, 교체 주기, 세척 시간, 전력 사용량을 같이 계산해 보면 값이 싸도 비싼 선택이 있고, 반대로 처음 값이 높아도 총비용이 낮은 경우가 뚜렷합니다. 장바구니에 담기 전 ‘유지비 합계’를 한 번만 적어보세요."
-    ))
-    sec.append((
-        "관리 루틴을 짧게",
-        "세척과 보관은 한 동선 안에 묶는 게 핵심입니다. ‘바로 닿는 자리’가 있으면 귀찮음이 크게 줄어들어요. 사용 직후 가볍게 털어내고 제자리로 돌려놓는 1분 루틴을 만들면, 제품 수명과 위생이 함께 좋아집니다."
-    ))
-    sec.append((
-        "작은 개선이 큰 차이",
-        "처음부터 완벽한 세팅을 만들려 하면 지칩니다. 지금 쓰는 방식에서 한 가지 불편만 줄여보세요. 예를 들어 전원 케이블을 정리하거나, 자주 쓰는 모드를 첫 화면에 두는 식의 작은 개선이 실제 만족도를 크게 바꿉니다."
-    ))
-    sec.append((
-        "상황별 체크포인트",
-        "가정용과 사무용, 개인과 공용은 기준이 달라야 합니다. 공용이라면 누구나 이해할 수 있는 간단한 안내와 표준 설정을 마련하고, 개인이라면 손에 익는 조작과 보관성을 더 우선하세요. 상황이 바뀌면 기준도 바뀌어야 합니다."
-    ))
-    sec.append((
-        "한 줄 결론",
-        "목적이 선명하면 선택은 빨라지고, 관리가 쉬우면 꾸준함이 만들어집니다. 그래서 작은 개선이 결국 가장 큰 결과를 만듭니다."
-    ))
+    sec=[
+        ("장면을 먼저 떠올리기","어디서 언제 누구와 사용할지부터 정리하면 선택이 쉬워집니다. 공간의 제약, 소음 허용치, 보관 위치 같은 현실 조건을 미리 적어두면 필요 이상으로 욕심내지 않게 되고, 사소해 보이는 불편을 줄일 수 있어요. 오늘 당장 쓰일 장면 한 가지만 확실히 잡아도 방향이 선명해집니다."),
+        ("핵심 두세 가지에 집중","모든 기능을 잘 쓰려는 순간 복잡해집니다. 자주 쓰게 될 두세 기능만 정하고 그 외는 숨기는 편이 유지에 유리합니다. 처음 일주일은 일부러 단순한 설정으로 반복해 보세요. 몸에 익는 순간 루틴이 생기고, 자연스레 사용 빈도가 올라갑니다."),
+        ("가성비를 좌우하는 요소","구매가보다 유지비가 체감을 좌우합니다. 소모품 가격, 교체 주기, 세척 시간, 전력 사용량을 같이 계산해 보면 값이 싸도 비싼 선택이 있고, 반대로 처음 값이 높아도 총비용이 낮은 경우가 뚜렷합니다. 장바구니에 담기 전 ‘유지비 합계’를 한 번만 적어보세요."),
+        ("관리 루틴을 짧게","세척과 보관은 한 동선 안에 묶는 게 핵심입니다. ‘바로 닿는 자리’가 있으면 귀찮음이 크게 줄어들어요. 사용 직후 가볍게 털어내고 제자리로 돌려놓는 1분 루틴을 만들면, 제품 수명과 위생이 함께 좋아집니다."),
+        ("작은 개선이 큰 차이","처음부터 완벽한 세팅을 만들려 하면 지칩니다. 지금 쓰는 방식에서 한 가지 불편만 줄여보세요. 예를 들어 전원 케이블을 정리하거나, 자주 쓰는 모드를 첫 화면에 두는 식의 작은 개선이 실제 만족도를 크게 바꿉니다."),
+        ("상황별 체크포인트","가정용과 사무용, 개인과 공용은 기준이 달라야 합니다. 공용이라면 누구나 이해할 수 있는 간단한 안내와 표준 설정을 마련하고, 개인이라면 손에 익는 조작과 보관성을 더 우선하세요. 상황이 바뀌면 기준도 바뀌어야 합니다."),
+        ("한 줄 결론","목적이 선명하면 선택은 빨라지고, 관리가 쉬우면 꾸준함이 만들어집니다. 그래서 작은 개선이 결국 가장 큰 결과를 만듭니다.")
+    ]
 
-    # 광고 위치: 상단/중간
-    mid_index = len(sec)//2
-
-    cat_url=_category_url(DEFAULT_CATEGORY)
-
-    parts = [ _css(), '<div class="daily-wrap">', _adsense_block(),
-              f'<h2 class="daily-sub">{subtitle}</h2>',
-              _mk_paragraph(summary), '<hr class="daily-hr">']
-
-    # 섹션 렌더링
-    for idx, (h, p) in enumerate(sec):
+    mid_index=len(sec)//2
+    parts=[_css(),'<div class="daily-wrap">',_adsense_block(),
+           f'<h2 class="daily-sub">{subtitle}</h2>',
+           _mk_paragraph(summary),'<hr class="daily-hr">']
+    for idx,(h,p) in enumerate(sec):
         parts.append(f"<h3>{html.escape(h)}</h3>")
-        # 긴 문단을 두세 문장으로 나눠 가독성 확보
         for chunk in re_split_sentences(p):
             parts.append(_mk_paragraph(html.escape(chunk)))
-        # 표는 가성비 섹션 뒤에 삽입
-        if h.startswith("가성비"):
-            parts.append(table)
+        if h.startswith("가성비"): parts.append(table)
         parts.append('<hr class="daily-hr">')
-        if idx == mid_index:
-            parts.append(_adsense_block())
-
-    parts.append(f'<p style="margin:18px 0 0"><a href="{html.escape(cat_url)}">더 많은 글 보기</a></p>')
+        if idx==mid_index: parts.append(_adsense_block())
+    parts.append(f'<p style="margin:18px 0 0"><a href="{html.escape(_category_url(DEFAULT_CATEGORY))}">더 많은 글 보기</a></p>')
     parts.append("</div>")
     return "\n".join(parts).strip()
 
-def re_split_sentences(text:str)->list[str]:
-    # 아주 단순한 문장 분리: 마침표/물결/느낌표/물음표 기준
-    chunks=[]
-    buf=""
-    for ch in text:
-        buf+=ch
-        if ch in "…?!.":
-            chunks.append(buf.strip())
-            buf=""
-    if buf.strip():
-        chunks.append(buf.strip())
-    # 너무 짧으면 붙이기
-    out=[]
-    acc=""
-    for c in chunks:
-        if len(acc)+len(c) < 60:
-            acc = (acc+" "+c).strip()
-        else:
-            if acc: out.append(acc); acc=""
-            out.append(c)
-    if acc: out.append(acc)
-    return out
-
-def create_one(hour:int, minute:int)->dict:
+def create_one(hour:int,minute:int)->dict:
     kw=_pick_general_keyword()
     title=_title_from_kw(kw)
     when=_slot_at(hour,minute)
     body=_html_daily(kw)
-    tags=[kw] if kw and kw!="오늘의 기록" else []
+    tags=[kw] if kw else []
     res=post_wp(title, body, when, category=DEFAULT_CATEGORY, tags=tags)
     return {"id":res.get("id"),"title":title,"date_gmt":res.get("date_gmt"),"link":res.get("link")}
 
@@ -235,6 +193,6 @@ def main(mode:str="two-posts"):
 if __name__=="__main__":
     import sys
     mode="two-posts"
-    for i,a in enumerate(sys.argv):
+    for a in sys.argv:
         if a.startswith("--mode="): mode=a.split("=",1)[1]
     main(mode)
