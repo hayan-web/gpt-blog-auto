@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 affiliate_post.py — Coupang Partners 글 자동 포스팅
-- 상단 고지문(굵게/강조) + 상단 CTA 2개 + 카테고리 이동 버튼 + 내부광고(상단)
+- 상단 고지문(굵게/강조) + 상단 CTA(위계/반응형/점진적 공개) + 카테고리 버튼 + 내부광고
 - 본문 섹션: 고려요소 → 주요 특징 → 가격/가성비 → (내부광고) → 장단점 → 이런 분께 추천
-- 하단 CTA 2개 + 카테고리 이동 버튼
 - URL 없을 때 쿠팡 검색 페이지 폴백
 - 골든키워드 회전/사용로그/예약 충돌 회피
 
 제목 생성
 - 사람 말투 '미니 스토리' → (선택) LLM → 템플릿 폴백
 - 한국어 후처리(비문/중복/접속어 과다)로 자연스러운 한 문장 보장
-- 카테고리별 TIME/SITCH/BENEFITS/템플릿 확장
+- 코어별 TIME/SITCH/BENEFITS/템플릿 확장
 """
 import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
@@ -196,7 +195,7 @@ def _dedupe_phrases(title: str) -> str:
     return ", ".join(out)
 
 def _collapse_repeats(title: str) -> str:
-    t = re.sub(r"(..+?)\s*\1", r"\1", title)   # 같은 구 반복
+    t = re.sub(r"(..+?)\s*\1", r"\1", title)
     t = re.sub(r"\s{2,}", " ", t)
     return t.strip()
 
@@ -222,7 +221,7 @@ def postprocess_korean_title(title: str) -> str:
 
     return t
 
-# ===== 스토리 톤 문구 풀 (카테고리 확장) =====
+# ===== 스토리 톤 문구 풀 =====
 TIME_PHRASES = {
     "humidifier":   ["밤새", "아침마다", "환절기엔", "요즘", "취침 전엔"],
     "cleaner_mop":  ["저녁마다", "주말엔", "장봐오고 나면", "집들이 전엔", "요즘"],
@@ -295,7 +294,6 @@ BENEFITS = {
     ],
 }
 
-# 접속어 꼬리 최소화
 TAILS = [
     "이젠 이걸로 정착했어요",
     "한 번 써보면 이유를 알게 돼요",
@@ -656,42 +654,31 @@ def _category_url_for(name:str)->str:
         print(f"[CAT][WARN] fallback category url for '{name}': {type(e).__name__}: {e}")
     return f"{WP_URL}/category/{quote(name)}/"
 
-def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict:
-    cat_id=_ensure_term("categories", category or DEFAULT_CATEGORY)
-    tag_ids=[]
-    if tag:
-        try:
-            tid=_ensure_term("tags", tag); tag_ids=[tid]
-        except Exception:
-            pass
-    payload={
-        "title": title,
-        "content": html_body,
-        "status": POST_STATUS,
-        "categories": [cat_id],
-        "tags": tag_ids,
-        "comment_status": "closed",
-        "ping_status": "closed",
-        "date_gmt": when_gmt
-    }
-    r=requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
-                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
-    r.raise_for_status(); return r.json()
-
-# ===== TEMPLATE (본문) =====
+# ===== 스타일 (CTA 개편: 위계/점진적 공개/반응형) =====
 def _css_block()->str:
     return """
 <style>
 .aff-wrap{font-family:inherit}
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #ef4444;background:#fff1f2;color:#991b1b;font-weight:700;border-radius:10px}
-.aff-cta{display:flex;gap:10px;flex-wrap:wrap;margin:12px 0 14px}
-.aff-cta a{display:inline-block;padding:12px 18px;border-radius:999px;text-decoration:none;font-weight:700}
-.aff-cta a.btn-primary{background:#2563eb;color:#fff}
-.aff-cta a.btn-primary:hover{opacity:.95}
+
+/* CTA: 가운데 정렬 + 넓은 버튼 + 위계 + 반응형 + 모바일 '더 보기' */
+.aff-cta{display:flex;justify-content:center;align-items:center;gap:10px;margin:16px 0 18px;flex-wrap:wrap}
+.aff-cta a,.aff-cta button.aff-more{display:inline-block;padding:14px 28px;min-width:220px;text-align:center;border-radius:999px;font-weight:700;text-decoration:none;transition:all .22s ease;cursor:pointer}
+.aff-cta a.btn-primary{background:#2563eb;color:#fff;box-shadow:0 4px 10px rgba(37,99,235,.25)}
+.aff-cta a.btn-primary:hover{background:#1e40af;transform:translateY(-2px);box-shadow:0 6px 14px rgba(37,99,235,.35)}
 .aff-cta a.btn-secondary{background:#fff;color:#2563eb;border:2px solid #2563eb}
-.aff-cta a.btn-secondary:hover{background:#eff6ff}
+.aff-cta a.btn-secondary:hover{background:#eff6ff;transform:translateY(-2px)}
 .aff-cta a.btn-tertiary{background:#0f172a;color:#fff;border:0}
-.aff-cta a.btn-tertiary:hover{opacity:.92}
+.aff-cta a.btn-tertiary:hover{opacity:.92;transform:translateY(-2px)}
+.aff-cta button.aff-more{background:#f1f5f9;color:#0f172a;border:0}
+.aff-cta button.aff-more:hover{background:#e2e8f0;transform:translateY(-2px)}
+.aff-cta .aff-optional{display:flex;gap:10px;flex-wrap:wrap}
+@media (max-width:640px){
+  .aff-cta .aff-optional{display:none}
+  .aff-cta.is-open .aff-optional{display:flex}
+}
+
+/* 본문 */
 .aff-section h2{margin:28px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
 .aff-section h3{margin:18px 0 10px;font-size:1.12rem}
 .aff-section p{line-height:1.9;margin:0 0 14px;color:#222}
@@ -723,21 +710,107 @@ def _adsense_block()->str:
 </div>
 """.strip()
 
+# ===== CTA (모바일: Primary 먼저, '더 보기'로 나머지 노출) =====
 def _cta_html(url_main:str, url_alt:str, category_url:str, category_name:str)->str:
-    btn1 = html.escape(BUTTON_TEXT or "쿠팡에서 최저가 확인하기")
-    btn2 = html.escape(BUTTON2_TEXT or "제품 보러가기")
-    btn3 = html.escape(f"{category_name} 글 모아보기")
+    btn1 = html.escape(BUTTON_TEXT or "쿠팡에서 최저가 확인하기")   # Primary
+    btn2 = html.escape(BUTTON2_TEXT or "제품 보러가기")            # Secondary
+    btn3 = html.escape(f"{category_name} 글 모아보기")            # Category
+
     u1 = html.escape(url_main or "#")
     u2 = html.escape(url_alt or url_main or "#")
     uc = html.escape(category_url or "#")
+
     return f"""
-  <div class="aff-cta">
+  <div class="aff-cta" data-cta>
     <a class="btn-primary" href="{u1}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn1}">{btn1}</a>
-    <a class="btn-secondary" href="{u2}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn2}">{btn2}</a>
-    <a class="btn-tertiary" href="{uc}" aria-label="{btn3}">{btn3}</a>
+
+    <div class="aff-optional" id="more-ctas">
+      <a class="btn-secondary" href="{u2}" target="_blank" rel="nofollow sponsored noopener" aria-label="{btn2}">{btn2}</a>
+      <a class="btn-tertiary" href="{uc}" aria-label="{btn3}">{btn3}</a>
+    </div>
+
+    <button type="button" class="aff-more" aria-expanded="false" aria-controls="more-ctas">
+      더 보기
+    </button>
   </div>
+  <script>
+    (function(){
+      var wrap = document.currentScript.previousElementSibling;
+      if(!wrap || !wrap.matches(".aff-cta")) return;
+      var btn  = wrap.querySelector(".aff-more");
+      var opt  = wrap.querySelector(".aff-optional");
+      if(!btn || !opt) return;
+
+      var mql = window.matchMedia("(max-width: 640px)");
+      function sync(){
+        if(mql.matches){
+          btn.style.display = "inline-block";
+          if(!wrap.classList.contains("is-open")){
+            opt.style.display = "none";
+            btn.setAttribute("aria-expanded", "false");
+            btn.textContent = "더 보기";
+          }
+        } else {
+          btn.style.display = "none";
+          opt.style.display = "flex";
+          wrap.classList.remove("is-open");
+        }
+      }
+      mql.addEventListener ? mql.addEventListener("change", sync) : mql.addListener(sync);
+      sync();
+
+      btn.addEventListener("click", function(){
+        var open = wrap.classList.toggle("is-open");
+        opt.style.display = open ? "flex" : "none";
+        btn.setAttribute("aria-expanded", open ? "true" : "false");
+        btn.textContent = open ? "접기" : "더 보기";
+      });
+    })();
+  </script>
 """.rstrip()
 
+def _category_url_for(name:str)->str:
+    try:
+        r = requests.get(
+            f"{WP_URL}/wp-json/wp/v2/categories",
+            params={"search": name, "per_page": 50, "context":"view"},
+            headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=12
+        )
+        r.raise_for_status()
+        items = r.json()
+        for it in items:
+            if (it.get("name") or "").strip() == name:
+                link = (it.get("link") or "").strip()
+                if link: return link
+        if items and (items[0].get("link") or "").strip():
+            return items[0]["link"].strip()
+    except Exception as e:
+        print(f"[CAT][WARN] fallback category url for '{name}': {type(e).__name__}: {e}")
+    return f"{WP_URL}/category/{quote(name)}/"
+
+def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict:
+    cat_id=_ensure_term("categories", category or DEFAULT_CATEGORY)
+    tag_ids=[]
+    if tag:
+        try:
+            tid=_ensure_term("tags", tag); tag_ids=[tid]
+        except Exception:
+            pass
+    payload={
+        "title": title,
+        "content": html_body,
+        "status": POST_STATUS,
+        "categories": [cat_id],
+        "tags": tag_ids,
+        "comment_status": "closed",
+        "ping_status": "closed",
+        "date_gmt": when_gmt
+    }
+    r=requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
+                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
+    r.raise_for_status(); return r.json()
+
+# ===== 본문 템플릿 =====
 def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str="쇼핑")->str:
     disc = html.escape(DISCLOSURE_TEXT)
     kw_esc = html.escape(keyword)
@@ -819,9 +892,6 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
 
 # ===== TITLE ENTRY POINT =====
 def build_title(keyword:str)->str:
-    """
-    최종 제목 생성: 스토리(사람 말투) → LLM → 템플릿 → 한국어 후처리
-    """
     t = hook_aff_title(keyword)
     t = postprocess_korean_title(t)
     t = _sanitize_title_text(t)
@@ -836,6 +906,16 @@ def rotate_sources(kw:str):
         print(f"[ROTATE] removed '{kw}' from keywords_shopping.csv"); changed=True
     if not changed:
         print("[ROTATE] nothing removed (maybe already rotated)")
+
+def _ensure_term(kind:str, name:str)->int:
+    r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}", params={"search":name,"per_page":50,"context":"edit"},
+                   auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
+    r.raise_for_status()
+    for it in r.json():
+        if (it.get("name") or "").strip()==name: return int(it["id"])
+    r=requests.post(f"{WP_URL}/wp-json/wp/v2/{kind}", json={"name":name},
+                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
+    r.raise_for_status(); return int(r.json()["id"])
 
 def run_once():
     print(f"[USAGE] NO_REPEAT_TODAY={NO_REPEAT_TODAY}, AFF_USED_BLOCK_DAYS={AFF_USED_BLOCK_DAYS}")
