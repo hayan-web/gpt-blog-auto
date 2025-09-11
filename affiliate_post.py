@@ -8,6 +8,17 @@ affiliate_post.py — Coupang Partners 글 자동 포스팅
 - 골든키워드 회전/사용로그/예약 충돌 회피
 - ✨ 제목 생성 로직: 사람 말투 '미니 스토리' → (LLM) → 템플릿 폴백
 """
+
+def _adsense_block():
+    """
+    내부 광고 블록. 환경변수 AD_SHORTCODE 값이 있으면 그대로 삽입.
+    값이 비어있으면 아무 것도 넣지 않음(레이아웃 영향 X).
+    """
+    shortcode = os.getenv("AD_SHORTCODE", "").strip()
+    if shortcode:
+        return f'<div class="ads-wrap" style="margin:16px 0;">{shortcode}</div>'
+    return ""
+
 import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -553,12 +564,40 @@ def _css_block()->str:
 .aff-cta a + a{margin-top:0}
 
 /* Colors */
-.aff-cta .btn-primary{background:#10b981;color:#fff;border:2px solid #10b981;box-shadow:0 6px 14px rgba(16,185,129,.2)}
-.aff-cta .btn-primary:hover{opacity:.92;transform:translateY(-1px)}
-.aff-cta .btn-secondary{background:#fff;color:#059669;border:2px solid #10b981}
-.aff-cta .btn-secondary:hover{background:#ecfdf5}
-.aff-cta .btn-tertiary{background:#0f172a;color:#fff;border:2px solid #0f172a}
-.aff-cta .btn-tertiary:hover{opacity:.94}
+/* ⬇⬇⬇ 버튼 중앙 정렬·세로 배치·간격/사이즈 고정 (테마 오버라이드 대비) */
+.aff-cta {
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:20px;
+  width:100%;
+  margin:20px 0;
+}
+
+.aff-cta a {
+  display:inline-flex !important;
+  justify-content:center;
+  align-items:center;
+  text-align:center;
+  padding:14px 24px;
+  min-height:56px;
+  font-size:16px;
+  font-weight:700;
+  border-radius:999px;
+  width:clamp(280px, 80%, 420px) !important; /* 본문 폭 기준 중앙 고정 */
+  margin:0 auto;
+  text-decoration:none;
+  box-shadow:0 4px 12px rgba(0,0,0,0.08);
+}
+
+/* 데스크톱에서 버튼을 더 크게 */
+@media (min-width: 720px) {
+  .aff-cta a {
+    min-height:64px;
+    font-size:18px;
+  }
+}
 
 /* --- Tables (unchanged) --- */
 .aff-table{width:100%;border-collapse:collapse;margin:8px 0 14px}
