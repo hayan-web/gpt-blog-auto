@@ -1,210 +1,306 @@
-﻿import os, sys, json, re, datetime as dt
-from urllib.parse import urljoin
+﻿# -*- coding: utf-8 -*-
+"""
+auto_wp_gpt.py — 일상글 자동 포스팅(카테고리 CTA 1개만, 중앙/대형 버튼)
+구조:
+  1) 내부광고 → 2) 요약글 → 3) 버튼 → 4) 본문1(짧게)
+  6) 버튼 → 7) 내부광고 → 8) 본문2(나머지)
+
+- '홈으로 이동' 버튼 완전 제거 (요청사항)
+- 버튼은 항상 가운데 정렬 + 가로확장 + 호버 강조
+- 기본 카테고리: 환경변수 DEFAULT_CATEGORY(없으면 '정보')
+- 예약 슬롯: 환경변수 GENERAL_TIMES_KST="10:00,17:00" (없으면 이 기본값)
+- 충돌 회피: 같은 시각(±2분) 'future' 포스트 있으면 +1일 이월
+- 키워드: keywords_general.csv 1열 소비(헤더 'keyword' 감지)
+"""
+import os, csv, html, re, json
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from typing import List
 import requests
 from dotenv import load_dotenv
-from slugify import slugify
-from openai import OpenAI
 
 load_dotenv()
 
-WP_URL            = os.getenv("WP_URL","").rstrip("/")
-WP_USER           = os.getenv("WP_USER","")
-WP_APP_PASSWORD   = os.getenv("WP_APP_PASSWORD","")
-WP_TLS_VERIFY     = os.getenv("WP_TLS_VERIFY","true").lower() not in ("0","false","no")
+# ===== ENV =====
+WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
+WP_USER=os.getenv("WP_USER") or ""
+WP_APP_PASSWORD=os.getenv("WP_APP_PASSWORD") or ""
+WP_TLS_VERIFY=(os.getenv("WP_TLS_VERIFY") or "true").lower()!="false"
 
-OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY","")
-OPENAI_MODEL      = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-OPENAI_MODEL_LONG = os.getenv("OPENAI_MODEL_LONG") or OPENAI_MODEL
-MAX_TOKENS_BODY   = int(os.getenv("MAX_TOKENS_BODY", "900"))
+POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()  # 보통 'future'
+DEFAULT_CATEGORY=(os.getenv("DEFAULT_CATEGORY") or "정보").strip() or "정보"
 
-DEFAULT_CATEGORY  = os.getenv("DEFAULT_CATEGORY","정보")
-DEFAULT_TAGS      = [t for t in (os.getenv("DEFAULT_TAGS") or "").split(",") if t.strip()]
-POST_STATUS       = os.getenv("POST_STATUS","future")
+GENERAL_TIMES_KST=(os.getenv("GENERAL_TIMES_KST") or "10:00,17:00").strip()
+USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-general/2.0"
 
-KEYWORDS_CSV      = os.getenv("KEYWORDS_CSV","keywords_general.csv")
-AD_SHORTCODE      = os.getenv("AD_SHORTCODE","[ads_top]")
+USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
+KEYWORDS_CSV=(os.getenv("KEYWORDS_CSV") or "keywords_general.csv").strip()
 
-# 일상글 H3 전용 CSS (본문 상단 1회 삽입)
-DAILY_INLINE_CSS = """<style>
-.daily-sub{font-size:1.125rem;line-height:1.6;margin:1.75em 0 .75em 0;padding:.4em .6em;
-border-left:4px solid #111;background:linear-gradient(90deg,rgba(0,0,0,.06),rgba(0,0,0,0));}
-.diary-hr{border:none;border-top:1px solid rgba(0,0,0,.12);margin:1.25rem 0;}
+REQ_HEADERS={
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json",
+    "Content-Type": "application/json; charset=utf-8",
+}
+
+# ===== Utilities =====
+def _ensure_usage_dir():
+    os.makedirs(USAGE_DIR, exist_ok=True)
+
+def _read_col_csv(path:str)->List[str]:
+    if not os.path.exists(path): return []
+    out=[]
+    with open(path,"r",encoding="utf-8",newline="") as f:
+        rd=csv.reader(f)
+        for i,row in enumerate(rd):
+            if not row: continue
+            if i==0 and (row[0].strip().lower()=="keyword"): continue
+            if row[0].strip(): out.append(row[0].strip())
+    return out
+
+def _consume_col_csv(path:str, kw:str)->bool:
+    if not os.path.exists(path): return False
+    with open(path,"r",encoding="utf-8",newline="") as f:
+        rows=list(csv.reader(f))
+    if not rows: return False
+    has_header=rows[0] and rows[0][0].strip().lower()=="keyword"
+    body=rows[1:] if has_header else rows[:]
+    before=len(body)
+    body=[r for r in body if (r and r[0].strip()!=kw)]
+    if len(body)==before: return False
+    new_rows=([rows[0]] if has_header else [])+[[r[0].strip()] for r in body]
+    with open(path,"w",encoding="utf-8",newline="") as f:
+        csv.writer(f).writerows(new_rows)
+    return True
+
+def _normalize(s:str)->str:
+    s=(s or "").strip()
+    s=html.unescape(s)
+    s=re.sub(r"\s+"," ",s)
+    s=s.strip(" \"'“”‘’·,.-")
+    return s
+
+# ===== WP helpers =====
+def _ensure_term(kind:str, name:str)->int:
+    r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}", params={"search":name,"per_page":50,"context":"edit"},
+                   auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
+    r.raise_for_status()
+    for it in r.json():
+        if (it.get("name") or "").strip()==name: return int(it["id"])
+    r=requests.post(f"{WP_URL}/wp-json/wp/v2/{kind}", json={"name":name},
+                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
+    r.raise_for_status(); return int(r.json()["id"])
+
+def _category_url_for(name:str)->str:
+    try:
+        r=requests.get(f"{WP_URL}/wp-json/wp/v2/categories",
+                       params={"search":name,"per_page":50,"context":"view"},
+                       headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD),
+                       verify=WP_TLS_VERIFY, timeout=12)
+        r.raise_for_status()
+        for it in r.json():
+            if (it.get("name") or "").strip()==name:
+                link=(it.get("link") or "").strip()
+                if link: return link
+        if r.json():
+            link=(r.json()[0].get("link") or "").strip()
+            if link: return link
+    except Exception:
+        pass
+    from urllib.parse import quote
+    return f"{WP_URL}/category/{quote(name)}/"
+
+def post_wp(title:str, html_body:str, when_gmt:str, category:str)->dict:
+    cat_id=_ensure_term("categories", category or DEFAULT_CATEGORY)
+    payload={
+        "title": title,
+        "content": html_body,
+        "status": POST_STATUS,
+        "categories": [cat_id],
+        "comment_status": "closed",
+        "ping_status": "closed",
+        "date_gmt": when_gmt
+    }
+    r=requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
+                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
+    r.raise_for_status(); return r.json()
+
+# ===== Slot / schedule =====
+def _now_kst():
+    return datetime.now(ZoneInfo("Asia/Seoul"))
+
+def _wp_future_exists_around(when_gmt_dt: datetime, tol_min: int = 2) -> bool:
+    url = f"{WP_URL}/wp-json/wp/v2/posts"
+    try:
+        r = requests.get(
+            url, params={"status":"future","per_page":100,"orderby":"date","order":"asc","context":"edit"},
+            headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20
+        ); r.raise_for_status()
+        items = r.json()
+    except Exception:
+        return False
+    tgt = when_gmt_dt.astimezone(timezone.utc)
+    win = timedelta(minutes=max(1,int(tol_min)))
+    lo, hi = tgt - win, tgt + win
+    for it in items:
+        d=(it.get("date_gmt") or "").strip()
+        if not d: continue
+        try:
+            dt=datetime.fromisoformat(d.replace("Z","+00:00"))
+            dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+        if lo <= dt <= hi:
+            return True
+    return False
+
+def _parse_times_kst(times_csv:str)->List[str]:
+    out=[]
+    for t in times_csv.split(","):
+        t=t.strip()
+        if not t: continue
+        parts=(t.split(":")+["0"])[:2]
+        try:
+            hh, mm = int(parts[0]), int(parts[1])
+            out.append(f"{hh:02d}:{mm:02d}")
+        except Exception:
+            continue
+    return out or ["10:00","17:00"]
+
+def _slot_general(slot_idx:int)->str:
+    times=_parse_times_kst(GENERAL_TIMES_KST)
+    # slot_idx가 범위 밖이면 첫번째로
+    hh, mm=[int(x) for x in (times[slot_idx % len(times)].split(":")+["0"])[:2]]
+    now=_now_kst()
+    tgt=now.replace(hour=hh,minute=mm,second=0,microsecond=0)
+    if tgt <= now: tgt += timedelta(days=1)
+    # 최대 7일 이월
+    for _ in range(7):
+        utc=tgt.astimezone(timezone.utc)
+        if _wp_future_exists_around(utc, tol_min=2):
+            tgt+=timedelta(days=1); continue
+        break
+    final=tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    print(f"[SLOT] scheduled UTC = {final}")
+    return final
+
+# ===== Body / CSS / CTA =====
+def _css()->str:
+    return """
+<style>
+.gen-wrap{font-family:inherit}
+.gen-cta{display:flex;justify-content:center;align-items:center;margin:18px 0 10px}
+.gen-cta a{display:inline-block;padding:16px 24px;border-radius:9999px;text-decoration:none;font-weight:800;min-width:280px;text-align:center;transition:transform .18s ease,box-shadow .18s ease,opacity .18s ease}
+.gen-cta a.btn-prim{background:#16a34a;color:#fff;box-shadow:0 6px 16px rgba(22,163,74,.2)}
+.gen-cta a.btn-prim:hover{transform:translateY(-2px);box-shadow:0 10px 22px rgba(22,163,74,.28)}
+.gen-h2{margin:26px 0 12px;font-size:1.42rem;line-height:1.35;border-left:6px solid #22c55e;padding-left:10px}
+.gen-wrap p{line-height:1.9;margin:0 0 14px;color:#222}
+.gen-wrap ul{padding-left:22px;margin:8px 0}
+.gen-wrap li{margin:6px 0}
+.gen-note{font-style:italic;color:#334155;margin-top:6px}
+.gen-ad{margin:12px 0 22px}
 </style>
-"""
+""".strip()
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+def _adsense_block()->str:
+    return """
+<div class="gen-ad">
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7409421510734308" crossorigin="anonymous"></script>
+<ins class="adsbygoogle" style="display:block" data-ad-client="ca-pub-7409421510734308" data-ad-slot="9228101213" data-ad-format="auto" data-full-width-responsive="true"></ins>
+<script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+</div>
+""".strip()
 
-def wp_request(method, path, **kwargs):
-    url = urljoin(WP_URL, f"/wp-json/wp/v2/{path.lstrip('/')}")
-    auth = (WP_USER, WP_APP_PASSWORD)
-    resp = requests.request(method, url, auth=auth, verify=WP_TLS_VERIFY, timeout=30, **kwargs)
-    if not resp.ok:
-        raise RuntimeError(f"WP {method} {path}: {resp.status_code} {resp.text[:400]}")
-    return resp.json()
+def _cta(category_name:str)->str:
+    cat_url=_category_url_for(category_name)
+    return f"""
+<div class="gen-cta">
+  <a class="btn-prim" href="{html.escape(cat_url)}" aria-label="{html.escape(category_name)} 글 더 보기">{html.escape(category_name)} 글 더 보기</a>
+</div>
+""".strip()
 
-def ensure_term(kind, name):
-    name = name.strip()
-    if not name:
-        return None
-    q = wp_request("GET", f"{kind}", params={"search": name})
-    for t in q:
-        if t.get("name") == name:
-            return t["id"]
-    return wp_request("POST", f"{kind}", json={"name": name})["id"]
+def _clean(s:str)->str:
+    return _normalize(s)
 
-def ensure_category(name):
-    return ensure_term("categories", name)
+def render_body(keyword:str, category:str)->str:
+    k=html.escape(_clean(keyword))
+    return f"""
+{_css()}
+<div class="gen-wrap">
+  <!-- 1. 내부광고 -->
+  {_adsense_block()}
 
-def ensure_tag(name):
-    return ensure_term("tags", name)
+  <!-- 2. 요약글 -->
+  <h2 class="gen-h2">요약글</h2>
+  <p>“{k}”에 대한 오늘의 요약을 한 단락으로 남깁니다. 맥락과 핵심만 간결하게 적어 두면 나중에 빠르게 복기할 수 있어요.</p>
 
-def schedule_times_utc(kst_hours=(10,13)):
-    # 오늘 KST 기준 특정 시간들 예약 → UTC 변환
-    now_utc = dt.datetime.utcnow()
-    kst = now_utc + dt.timedelta(hours=9)
-    dates = []
-    for hh in kst_hours:
-        local = kst.replace(hour=hh, minute=0, second=0, microsecond=0)
-        if local <= kst:
-            local = local + dt.timedelta(days=1)
-        utc = local - dt.timedelta(hours=9)
-        dates.append(utc)
-    return dates
+  <!-- 3. 버튼 -->
+  {_cta(category)}
 
-def read_keywords(path):
-    keys = []
-    if os.path.isfile(path):
-        with open(path,"r",encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i==0 and "keyword" in line:
-                    continue
-                w = line.strip().strip(",")
-                if w:
-                    keys.append(w)
-    if not keys:
-        # 폴백
-        keys = ["가계부","정리정돈","홈카페","주간 계획","하루 회고","시간 관리","집 정리","오늘의 기록"]
-    return keys
+  <!-- 4. 본문1 (짧게) -->
+  <h2 class="gen-h2">본문 1</h2>
+  <p>{k}와(과) 관련해 바로 적용 가능한 포인트를 짧게 정리합니다. 오늘 느낀 결론 또는 핵심 인사이트 2~3가지를 메모해 두세요.</p>
 
-PROMPT_DIARY = (
-"너는 한국어 블로그 작가. 아래 규칙으로 워드프레스에 바로 붙여넣을 ‘일상글’을 만들어라.\n"
-"제목은 20~30자 한 줄. 이어서 부제 1줄. 구분선. 300자 이내 개요. 구분선.\n"
-"H3 소제목은 6~8개. 각 섹션은 서로 다른 문체(대화체·서술·묘사 등)로 4~6문장. "
-"문장 길이와 단락 길이를 일부러 불규칙하게 섞어 가독성을 높인다. "
-"무분별한 과장·미확인 정보 금지. 브랜드 기능·추천 멘트 금지. 감정조작 금지.\n"
-"출력은 반드시 아래 형식의 ‘플레인 텍스트’ 스켈레톤을 준수한다. 단, 후처리에서 H3만 변환될 것이다.\n\n"
-"# 제목(20~30자)\n\n"
-"## 부제 한 줄\n\n"
-"---\n\n"
-"(개요 300자 이내, 존댓말)\n\n"
-"---\n\n"
-"### 소제목1\n본문\n---\n\n"
-"### 소제목2\n본문\n---\n\n"
-"### 소제목3\n본문\n---\n\n"
-"### 소제목4\n본문\n---\n\n"
-"### 소제목5\n본문\n---\n\n"
-"### 소제목6\n본문\n---\n\n"
-"### 소제목7\n본문\n---\n\n"
-"### 소제목8\n본문\n---\n\n"
-"(마지막에 해시태그 2줄: 1줄은 #태그 6개, 다음 줄은 ,로 구분된 키워드 5개)"
-)
+  <!-- 6. 버튼 -->
+  {_cta(category)}
 
-def llm_generate_diary(keyword):
-    sys_prompt = "당신은 블로그 SEO에 맞춰 자연스럽고 사람처럼 쓰는 한국어 작가입니다."
-    user_prompt = f"키워드: {keyword}\n위 규칙으로 작성."
-    r = client.chat.completions.create(
-        model=OPENAI_MODEL_LONG,
-        messages=[{"role":"system","content":sys_prompt},{"role":"user","content":PROMPT_DIARY+"\n\n"+user_prompt}],
-        temperature=0.8,
-        max_tokens=MAX_TOKENS_BODY
-    )
-    return r.choices[0].message.content.strip()
+  <!-- 7. 내부광고 -->
+  {_adsense_block()}
 
-def decorate_diary_html(text):
-    # 상단 광고 숏코드 + CSS
-    html = AD_SHORTCODE + "\n" + DAILY_INLINE_CSS
+  <!-- 8. 본문2 (나머지) -->
+  <h2 class="gen-h2">본문 2</h2>
+  <p>위에서 남긴 요약/포인트의 배경과 예시, 참고 링크를 덧붙입니다. 수치·체크리스트처럼 재사용 가능한 형식이면 더 좋아요.</p>
+</div>
+""".strip()
 
-    # H1/H2는 문단 처리, H3는 스타일 클래스 적용
-    lines = text.splitlines()
-    out = []
-    for ln in lines:
-        ln = ln.rstrip()
-        if ln.startswith("### "):
-            title = ln[4:].strip()
-            out.append(f'<h3 class="daily-sub">{title}</h3>')
-            continue
-        if ln.startswith("# "):
-            out.append(f"<h1>{ln[2:].strip()}</h1>")
-            continue
-        if ln.startswith("## "):
-            out.append(f"<h2>{ln[3:].strip()}</h2>")
-            continue
-        if ln.strip() == "---":
-            out.append('<hr class="diary-hr" />')
-            continue
-        # 해시태그 줄이면 p로 감싸되 본문 안쪽 공백 보존 최소화
-        if ln.strip():
-            out.append(f"<p>{ln}</p>")
-        else:
-            out.append("")
-    html += "\n" + "\n".join([s for s in out if s is not None])
-    return html
+# ===== Title / Keyword =====
+def pick_keyword()->str:
+    kws=_read_col_csv(KEYWORDS_CSV)
+    if kws:
+        return kws[0]
+    return "오늘의 기록"
 
-def create_post(title, content_html, categories=None, tags=None, status="draft", date_gmt=None):
-    cat_ids = []
-    if categories:
-        for c in categories:
-            cid = ensure_category(c)
-            if cid: cat_ids.append(cid)
-    tag_ids = []
-    if tags:
-        for t in tags:
-            tid = ensure_tag(t)
-            if tid: tag_ids.append(tid)
+def consume_keyword(kw:str):
+    _consume_col_csv(KEYWORDS_CSV, kw)
 
-    payload = {"title": title, "content": content_html, "status": status}
-    if cat_ids: payload["categories"] = cat_ids
-    if tag_ids: payload["tags"] = tag_ids
-    if date_gmt:
-        payload["date_gmt"] = date_gmt.strftime("%Y-%m-%dT%H:%M:%S")
+def build_title(kw:str)->str:
+    s=_normalize(kw)
+    s=re.sub(r'^\[.*?\]\s*','',s)  # 뉴스형 괄호 제거
+    s=re.sub(r'^"+|"+$','',s)
+    s=s or "오늘의 기록"
+    # 너무 길면 자름(모바일 1~2줄)
+    if len(s)>36: s=s[:35].rstrip()+"…"
+    return s
 
-    return wp_request("POST", "posts", json=payload)
+# ===== Main routine =====
+def _post_one(slot_idx:int, category:str):
+    kw = pick_keyword()
+    title = build_title(kw)
+    when_gmt = _slot_general(slot_idx)
+    body = render_body(kw, category)
+    res = post_wp(title, body, when_gmt, category)
+    print(json.dumps({
+        "id": res.get("id"),
+        "title": title,
+        "category": category,
+        "date_gmt": res.get("date_gmt"),
+        "link": res.get("link")
+    }, ensure_ascii=False))
+    consume_keyword(kw)
 
 def main():
-    mode = None
-    for a in sys.argv[1:]:
-        if a.startswith("--mode="):
-            mode = a.split("=",1)[1]
+    if not (WP_URL and WP_USER and WP_APP_PASSWORD):
+        raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
+    import argparse
+    p=argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["single","two-posts"], default="two-posts")
+    p.add_argument("--category", default=DEFAULT_CATEGORY)
+    args=p.parse_args()
 
-    if mode != "two-posts":
-        print("[]")
-        return
+    if args.mode=="two-posts":
+        _post_one(0, args.category)
+        _post_one(1, args.category)
+    else:
+        _post_one(0, args.category)
 
-    keys = read_keywords(KEYWORDS_CSV)
-    # 같은 제목 연속 방지용 앞머리 바꿈
-    picked = keys[:2] if len(keys) >= 2 else keys * 2
-
-    times_utc = schedule_times_utc((10,13))  # KST 10시/13시
-    results = []
-    for i, kw in enumerate(picked[:2]):
-        raw = llm_generate_diary(kw)
-        # 혹시 중복 제목 패턴이면 간단히 치환
-        raw = re.sub(r"^#\s*오늘의 기록.*$", "# 가계부에 대해 차분히 정리해 봤어요", raw, flags=re.M)
-        html = decorate_diary_html(raw)
-
-        title_match = re.search(r"<h1>(.*?)</h1>", html, flags=re.S)
-        title = title_match.group(1).strip() if title_match else f"{kw}에 대해 차분히 정리해 봤어요"
-
-        post = create_post(
-            title=title,
-            content_html=html,
-            categories=[DEFAULT_CATEGORY] if DEFAULT_CATEGORY else None,
-            tags=DEFAULT_TAGS or None,
-            status=POST_STATUS,
-            date_gmt=times_utc[i] if POST_STATUS=="future" and i < len(times_utc) else None
-        )
-        results.append({"id": post["id"], "title": post["title"]["rendered"], "date_gmt": post.get("date_gmt"), "link": post.get("link")})
-    print(json.dumps(results, ensure_ascii=False))
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
