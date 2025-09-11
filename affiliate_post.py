@@ -6,7 +6,7 @@ affiliate_post.py — Coupang Partners 글 자동 포스팅
 - 하단 CTA 2개 + 카테고리 이동 버튼
 - URL 없을 때 쿠팡 검색 페이지 폴백
 - 골든키워드 회전/사용로그/예약 충돌 회피
-- ✨ 제목 생성 로직 대폭 개선(핵심 키워드 압축 + 다양 템플릿 + LLM 보조)
+- ✨ 제목 생성 로직: 사람 말투 '미니 스토리' → (LLM) → 템플릿 폴백
 """
 import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
@@ -25,15 +25,19 @@ except Exception:
     BadRequestError = Exception
 
 # ===== Title config =====
-AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "12"))   # 더 짧게 허용
-AFF_TITLE_MAX = int(os.getenv("AFF_TITLE_MAX", "24"))   # 모바일 2줄 이내 목표
-AFF_TITLE_MODE = (os.getenv("AFF_TITLE_MODE") or "llm-then-template").lower()
+# 살짝 더 길고 자연스럽게(모바일 1~2줄)
+AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "22"))
+AFF_TITLE_MAX = int(os.getenv("AFF_TITLE_MAX", "42"))
+# 기본은 story-then-template (LLM key 있으면 story-then-llm-then-template 처럼 동작)
+AFF_TITLE_MODE = (os.getenv("AFF_TITLE_MODE") or "story-then-template").lower()
 
-# 반복 금지 문구(절대 금지)
+# 반복/과장 금지 문구
 AFF_BANNED_PHRASES = (
     "제대로 써보고 알게 된 포인트",
     "써보고 알게 된 포인트",
-    "총정리 가이드",   # 과도한 관성 제거
+    "총정리 가이드",
+    "사용기", "리뷰", "후기",
+    "광고", "테스트", "예약됨",
 )
 
 _OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -77,10 +81,16 @@ REQ_HEADERS={
 def _normalize_title(s: str) -> str:
     s = (s or "").strip()
     s = html.unescape(s)
-    # 따옴표/양쪽 공백 제거
     s = s.replace("“","").replace("”","").replace("‘","").replace("’","").strip('"\' ')
-    # WP 리스트에서 보기 좋은 수준 공백 정리
     s = re.sub(r"\s+", " ", s)
+    return s
+
+def _sanitize_title_text(s: str) -> str:
+    s = _normalize_title(s)
+    # 금지 문구/군더더기 제거
+    for ban in AFF_BANNED_PHRASES:
+        s = s.replace(ban, "")
+    s = re.sub(r"\s+", " ", s).strip(" ,.-·")
     return s
 
 def _bad_aff_title(t: str) -> bool:
@@ -91,22 +101,28 @@ def _bad_aff_title(t: str) -> bool:
     if any(p in t for p in AFF_BANNED_PHRASES):
         return True
     # 과도/낚시/금칙어
-    if any(x in t for x in ("최저가","역대급","무조건","100%","클릭","필구","대박","광고")):
+    if any(x in t for x in ("최저가","역대급","무조건","100%","클릭","필구","대박")):
         return True
-    # 상품명 그대로(거의 동일) 방지: 띄어쓰기/기호 제외 후 비교는 호출측에서 처리
     return False
 
+# ===== 한글 조사 보정 =====
+def _has_jong(ch: str) -> bool:
+    code = ord(ch) - 0xAC00
+    return 0 <= code <= 11171 and (code % 28) != 0
+
+def _josa(word: str, pair=("이","가")) -> str:
+    return pair[0] if word and _has_jong(word[-1]) else pair[1]
+
+def _iraseo(word: str) -> str:
+    return "이라서" if word and _has_jong(word[-1]) else "라서"
+
 # ===== 핵심 키워드 압축 =====
-# 불필요 토큰(색상/수치/마케팅 수식어)
 _COLOR_WORDS = {"화이트","블랙","아이보리","핑크","레드","블루","네이비","브라운","베이지","하늘색","그레이","회색","카키","민트"}
 _DROP_TOKENS = {"여성","남성","남녀","3컬러","2컬러","25fw","fw","ss","가을니트","겨울니트","여름","봄","가을겨울","신상","인기","베스트","새상품","정품"}
-# 허용 수식어(앞에 1~2개만 유지)
 _KEEP_ADJ = {"가을","겨울","간절기","울","캐시미어","브이넥","라운드","오버핏","루즈핏","크롭","롱","퍼프","반팔","폴라","반목","하이넥","레이스","케이블","아가일","데일리","포근","경량","무선","가열식","초음파","미니"}
-# 카테고리/핵심명사
-_CATS = ["니트","스웨터","가디건","케이프","숄","머플러","가습기","전기포트","주전자","선풍기","청소기","보조배터리","전기요","히터","제습기"]
+_CATS = ["니트","스웨터","가디건","케이프","숄","머플러","가습기","전기포트","주전자","선풍기","청소기","보조배터리","전기요","히터","제습기","원피스"]
 
 def _tokenize_ko(s: str) -> List[str]:
-    # 단순 공백 기반 토큰화
     s = re.sub(r"[^\w가-힣\s\-]", " ", s)
     s = s.replace("  ", " ")
     toks = [t for t in s.strip().split() if t]
@@ -114,15 +130,13 @@ def _tokenize_ko(s: str) -> List[str]:
 
 def _compress_keyword(keyword: str) -> Tuple[str, str]:
     """
-    키워드에서 브랜드/색상/군더더기를 덜고 '수식어 0~2 + 카테고리' 형태의 핵심 문구 생성.
+    키워드에서 군더더기를 덜고 '수식어 0~2 + 카테고리' 형태의 핵심 문구 생성.
     return (core, normalized_keyword)
     """
     toks = _tokenize_ko(keyword)
-    kept_adj = []
-    cat = None
+    kept_adj, cat = [], None
 
     for t in toks:
-        low = t.lower()
         if t in _COLOR_WORDS or t in _DROP_TOKENS:
             continue
         if any(c.isdigit() for c in t):
@@ -131,27 +145,82 @@ def _compress_keyword(keyword: str) -> Tuple[str, str]:
             kept_adj.append(t); continue
         if (t in _CATS) and not cat:
             cat = t
-        # 브랜드/고유명사는 버림(너무 길어짐). 다만 카테고리 못 찾았으면 끝에 사용
+
     if not cat:
-        # 마지막 보루: '니트/스웨터/가습기' 등 포함된 단어 탐색
         for c in _CATS:
             if c in keyword:
                 cat = c; break
-    # 구성
+
     if cat:
         core = " ".join(kept_adj + [cat]).strip()
     else:
-        # 정말 못 찾은 경우: 2~3개만 뽑아 짧게
         core = " ".join(toks[:3])
 
     core = re.sub(r"\s+", " ", core).strip()
-    # 너무 짧으면 보강
     if len(core) < 4 and "니트" in keyword:
         core = "가을 니트"
     return core, " ".join(toks)
 
-# ===== 템플릿 =====
-# 다양한 톤(후킹/상황/하우투/해결/추천형). 전부 12~24자 목표.
+# ===== 카테고리 감지 (스토리 톤 선택용) =====
+def _detect_category_from_text(text: str) -> str:
+    s = text
+    if ("물걸레" in s) or ("습건식" in s): return "cleaner_mop"
+    if "청소기" in s: return "cleaner_mini"
+    if "가습기" in s: return "humidifier"
+    if ("포트" in s) or ("주전자" in s): return "kettle"
+    if "원피스" in s: return "knit_dress"
+    if ("니트" in s) or ("스웨터" in s) or ("가디건" in s): return "knit"
+    return "general"
+
+def _core_phrase_by_cat(cat: str, src: str) -> str:
+    if cat == "cleaner_mop":  return "물걸레 청소기"
+    if cat == "cleaner_mini": return "무선 미니 청소기" if ("미니" in src or "핸디" in src) else "핸디 청소기"
+    if cat == "humidifier":   return "미니 가습기" if "미니" in src else "가습기"
+    if cat == "kettle":       return "전기포트"
+    if cat == "knit_dress":   return "니트 원피스"
+    if cat == "knit":         return "니트"
+    # general
+    return _compress_keyword(src)[0] or "아이템"
+
+# ===== 스토리 톤 문구 풀 =====
+TIME_PHRASES = {
+    "cleaner_mop":  ["저녁마다", "주말엔", "요즘"],
+    "cleaner_mini": ["퇴근하고", "아침마다", "요즘"],
+    "humidifier":   ["밤새", "아침마다", "요즘"],
+    "kettle":       ["아침마다", "주말 브런치에", "요즘"],
+    "knit":         ["아침마다", "출근길에", "요즘"],
+    "knit_dress":   ["하루 종일", "약속 있는 날엔", "요즘"],
+    "general":      ["요즘", "아침마다", "하루 종일"],
+}
+
+SITCH = {
+    "cleaner_mop":  ["바닥 끈적임이 신경 쓰여서", "거실 물자국이 성가셔서", "주방 바닥이 거칠어서"],
+    "cleaner_mini": ["책상 위 먼지가 계속 보여서", "차 안이 금방 지저분해져서", "원룸이라 금세 쌓여서"],
+    "humidifier":   ["자꾸 목이 칼칼해서", "아침에 코가 건조해서", "방 공기가 텁텁해서"],
+    "kettle":       ["티타임을 자주 해서", "물 데우는 게 번거로워서", "라면이 자주 땡겨서"],
+    "knit":         ["아침 코디가 고민돼서", "큰 옷은 답답해서", "겉돌지 않는 걸 찾다 보니"],
+    "knit_dress":   ["코디가 번거로워서", "밋밋해 보여서", "라인이 무너져서"],
+    "general":      ["자잘한 불편이 쌓여서", "정리가 필요해서", "바로 쓰고 싶어서"],
+}
+
+BENEFITS = {
+    "cleaner_mop":  ["물자국이 안 남아요", "끈적임이 싹 사라져요", "발바닥이 보송해요"],
+    "cleaner_mini": ["틈새 먼지가 금방 사라져요", "차 안 청소가 쉬워졌어요", "책상 주변이 단정해져요"],
+    "humidifier":   ["아침에 목이 편해요", "공기가 부드러워져요", "밤새 촉촉하더라고요"],
+    "kettle":       ["티타임이 빨라져요", "라면 준비가 금방이에요", "홈카페가 쉬워졌어요"],
+    "knit":         ["핏이 단정하게 떨어져요", "가볍게 따뜻하더라고요", "아침이 덜 바빠요"],
+    "knit_dress":   ["라인이 예쁘게 살아나요", "코디가 5분 만에 끝나요", "움직일 때 실루엣이 예뻐요"],
+    "general":      ["손이 자꾸 가요", "확실히 편해졌어요", "쓰면 이유를 알아요"],
+}
+
+TAILS = [
+    "그래서 계속 손이 가요",
+    "이젠 이걸로 정착했어요",
+    "한 번 써보면 이유를 알게 돼요",
+    "돌려보면 차이가 나요",
+]
+
+# ===== 템플릿(폴백용) =====
 AFF_TITLE_TEMPLATES = [
     "{core}, 한 장이면 끝",
     "가을엔 역시 {core}",
@@ -173,50 +242,86 @@ AFF_TITLE_TEMPLATES = [
     "꾸안꾸의 정석 {core}",
     "레이어드 맛집 {core}",
     "포인트 주기 좋은 {core}",
-    "매일 입는 {core}",
-    "{core} 이렇게 좋다",
-    "간절기 필수, {core}",
-    "무난해서 더 좋은 {core}",
-    "가볍고 따뜻한 {core}",
-    "핏이 사는 {core}",
-    "부담 없는 {core}",
-    "손이 가는 {core}",
-    "{core} 이런 분께",
-    "담백하게 {core}",
 ]
 
+# ===== 스토리형 제목 생성 =====
+def _story_candidates(core: str, cat: str) -> List[str]:
+    t  = random.choice(TIME_PHRASES.get(cat, TIME_PHRASES["general"]))
+    s  = random.choice(SITCH.get(cat, SITCH["general"]))
+    b  = random.choice(BENEFITS.get(cat, BENEFITS["general"]))
+    tail = random.choice(TAILS)
+
+    core_eunneun = core + _josa(core, ("은","는"))
+    core_iga     = core + _josa(core, ("이","가"))
+    core_iraseo  = core + " " + _iraseo(core)
+
+    cands = [
+        f"{t} {s} {core} 쓰니 {b}",
+        f"{s} {core_eunneun} {b}",
+        f"{t} {core_iraseo} {b}",
+        f"{core} 켜두면 {b}",
+        f"한 번 써보면 {core_iga} 왜 편한지 알게 돼요",
+        f"{b}, 그래서 {core}로 갈아탔어요",
+        f"{t} {core_eunneun} {b}, 그래서 계속 손이 가요",
+        f"{t} {core_eunneun} {b}, {tail}",
+    ]
+    out=[]
+    for s in cands:
+        s = _sanitize_title_text(s)
+        if len(s) < AFF_TITLE_MIN - 2:
+            s += " 좋아요"
+        if len(s) > AFF_TITLE_MAX:
+            s = s[:AFF_TITLE_MAX-1].rstrip()+"…"
+        out.append(s)
+    return out
+
+def _aff_title_from_story(keyword: str) -> str:
+    src = _sanitize_title_text(keyword)
+    cat = _detect_category_from_text(src)
+    # core은 키워드 기반보다 카테고리 코어 우선
+    core = _core_phrase_by_cat(cat, src)
+    # 날짜+키워드 기반 시드 → 하루에 과도 반복 방지하면서 재현성 확보
+    seed = abs(hash(f"story|{core}|{src}|{datetime.utcnow().date()}")) % (2**32)
+    rnd = random.Random(seed)
+
+    pool = _story_candidates(core, cat)
+    rnd.shuffle(pool)
+
+    seen=set()
+    for cand in pool:
+        cand = _sanitize_title_text(cand)
+        if not cand or cand in seen: 
+            continue
+        seen.add(cand)
+        if not _bad_aff_title(cand):
+            return cand
+    return ""
+
+# ===== 템플릿/LLM =====
 def _aff_title_from_templates(core: str, kw: str) -> str:
-    # 하루 단위 시드 고정 → 같은 키워드도 매일 다양한 제목
     seed = abs(hash(f"{core}|{kw}|{datetime.utcnow().date()}")) % (2**32)
-    random.seed(seed)
-    cands = random.sample(AFF_TITLE_TEMPLATES, k=min(6, len(AFF_TITLE_TEMPLATES)))
+    rnd = random.Random(seed)
+    cands = rnd.sample(AFF_TITLE_TEMPLATES, k=min(6, len(AFF_TITLE_TEMPLATES)))
     for cand_tpl in cands:
-        cand = _normalize_title(cand_tpl.format(core=core))
+        cand = _sanitize_title_text(cand_tpl.format(core=core))
         if _bad_aff_title(cand):
             continue
-        # 키워드 원문과 거의 동일한지(기호/공백 제거 비교) 방어
         a = re.sub(r"[^\w가-힣]", "", cand)
         b = re.sub(r"[^\w가-힣]", "", kw)
         if a == b:
             continue
         return cand
-
-    # 최후 폴백(상품명 X) — 짧은 후킹 유지
-    fallback = _normalize_title(f"{core} 핵심만 쏙")
+    fallback = _sanitize_title_text(f"{core} 핵심만 쏙")
     if not _bad_aff_title(fallback):
         return fallback
-    # 정말 마지막
-    return core[:AFF_TITLE_MAX]
+    return _sanitize_title_text(core)[:AFF_TITLE_MAX]
 
 def _aff_title_from_llm(core: str, kw: str) -> str:
-    """LLM로 짧고 다양한 톤의 제목 1개 생성(실패 시 빈 문자열)."""
     if not _oai:
         return ""
     try:
         sys_p = "너는 한국어 카피라이터다. 쇼핑 포스트용 모바일 최적 제목을 1개만 출력한다."
-        styles = (
-            "후킹형, 상황형, 하우투형, 혜택·해결형, 담백한 문장형"
-        )
+        styles = "후킹형, 상황형, 하우투형, 혜택·해결형, 담백한 문장형"
         usr = f"""핵심 키워드(core): {core}
 원문 키워드(raw): {kw}
 
@@ -224,7 +329,7 @@ def _aff_title_from_llm(core: str, kw: str) -> str:
 - {AFF_TITLE_MIN}~{AFF_TITLE_MAX}자, 말맛 있는 1줄
 - 제품명 그대로 쓰지 말고, {styles} 중 하나로 변주
 - 금지문구: {", ".join(AFF_BANNED_PHRASES)}
-- 과장/낚시 금지(최저가/역대 등), 무난·안전한 톤
+- 과장/낚시 금지(최저가/역대 등)
 - 출력은 제목 1줄(순수 텍스트)만"""
         r = _oai.chat.completions.create(
             model=_OPENAI_MODEL,
@@ -232,7 +337,7 @@ def _aff_title_from_llm(core: str, kw: str) -> str:
             temperature=0.9,
             max_tokens=60,
         )
-        cand = _normalize_title(r.choices[0].message.content or "")
+        cand = _sanitize_title_text(r.choices[0].message.content or "")
         return "" if _bad_aff_title(cand) else cand
     except BadRequestError:
         return ""
@@ -242,10 +347,20 @@ def _aff_title_from_llm(core: str, kw: str) -> str:
 
 def hook_aff_title(keyword: str) -> str:
     core, _ = _compress_keyword(keyword)
-    # 1) LLM → 2) 템플릿
-    if AFF_TITLE_MODE in ("llm","llm-then-template"):
+
+    # 1) 스토리형(사람 말투)
+    if AFF_TITLE_MODE in ("story","story-first","story-then-template","story-then-llm"):
+        t = _aff_title_from_story(keyword)
+        if t:
+            return t
+
+    # 2) LLM (선택)
+    if AFF_TITLE_MODE in ("llm","llm-then-template","story-then-llm"):
         t = _aff_title_from_llm(core, keyword)
-        if t: return t
+        if t:
+            return t
+
+    # 3) 템플릿 폴백
     return _aff_title_from_templates(core, keyword)
 
 # ===== TIME / SLOT =====
@@ -576,10 +691,10 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
 # ===== TITLE ENTRY POINT =====
 def build_title(keyword:str)->str:
     """
-    최종 제목 생성: (핵심 압축 → LLM/템플릿 → 검증)
+    최종 제목 생성: 스토리(사람 말투) → LLM → 템플릿
     """
     t = hook_aff_title(keyword)
-    return _normalize_title(t)[:AFF_TITLE_MAX]
+    return _sanitize_title_text(t)[:AFF_TITLE_MAX]
 
 # ===== ROTATE & RUN =====
 def rotate_sources(kw:str):
