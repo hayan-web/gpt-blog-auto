@@ -6,8 +6,11 @@ affiliate_post.py — Coupang Partners 글 자동 포스팅
 - 하단 CTA 2개 + 카테고리 이동 버튼
 - URL 없을 때 쿠팡 검색 페이지 폴백
 - 골든키워드 회전/사용로그/예약 충돌 회피
-- ✨ 제목 생성 로직: 사람 말투 '미니 스토리' → (LLM) → 템플릿 폴백
-- ✨ 한국어 후처리(비문/중복/접속어 과다)로 자연스러운 한 문장 보장
+
+제목 생성
+- 사람 말투 '미니 스토리' → (선택) LLM → 템플릿 폴백
+- 한국어 후처리(비문/중복/접속어 과다)로 자연스러운 한 문장 보장
+- 카테고리별 TIME/SITCH/BENEFITS/템플릿 확장
 """
 import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
@@ -26,13 +29,10 @@ except Exception:
     BadRequestError = Exception
 
 # ===== Title config =====
-# 살짝 더 길고 자연스럽게(모바일 1~2줄)
-AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "22"))
+AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "22"))   # 모바일 1~2줄 최적
 AFF_TITLE_MAX = int(os.getenv("AFF_TITLE_MAX", "42"))
-# 기본은 story-then-template (LLM key 있으면 story-then-llm-then-template 처럼 동작)
 AFF_TITLE_MODE = (os.getenv("AFF_TITLE_MODE") or "story-then-template").lower()
 
-# 반복/과장 금지 문구
 AFF_BANNED_PHRASES = (
     "제대로 써보고 알게 된 포인트",
     "써보고 알게 된 포인트",
@@ -100,7 +100,6 @@ def _bad_aff_title(t: str) -> bool:
         return True
     if any(p in t for p in AFF_BANNED_PHRASES):
         return True
-    # 과도/낚시/금칙어
     if any(x in t for x in ("최저가","역대급","무조건","100%","클릭","필구","대박")):
         return True
     return False
@@ -157,7 +156,7 @@ def _compress_keyword(keyword: str) -> Tuple[str, str]:
         core = "가을 니트"
     return core, " ".join(toks)
 
-# ===== 카테고리 감지 (스토리 톤 선택용) =====
+# ===== 카테고리 감지 =====
 def _detect_category_from_text(text: str) -> str:
     s = text
     if ("물걸레" in s) or ("습건식" in s): return "cleaner_mop"
@@ -177,7 +176,7 @@ def _core_phrase_by_cat(cat: str, src: str) -> str:
     if cat == "knit":         return "니트"
     return _compress_keyword(src)[0] or "아이템"
 
-# ===== 한국어 제목 후처리 (핵심) =====
+# ===== 한국어 제목 후처리 =====
 _BAD_LEADS = [
     r"^하루 종일\s+선풍기(는|가)\s*",
     r"^요즘\s+선풍기(는|가)\s*",
@@ -197,7 +196,7 @@ def _dedupe_phrases(title: str) -> str:
     return ", ".join(out)
 
 def _collapse_repeats(title: str) -> str:
-    t = re.sub(r"(..+?)\s*\1", r"\1", title)   # 구 반복
+    t = re.sub(r"(..+?)\s*\1", r"\1", title)   # 같은 구 반복
     t = re.sub(r"\s{2,}", " ", t)
     return t.strip()
 
@@ -223,38 +222,80 @@ def postprocess_korean_title(title: str) -> str:
 
     return t
 
-# ===== 스토리 톤 문구 풀 =====
+# ===== 스토리 톤 문구 풀 (카테고리 확장) =====
 TIME_PHRASES = {
-    "cleaner_mop":  ["저녁마다", "주말엔", "요즘"],
-    "cleaner_mini": ["퇴근하고", "아침마다", "요즘"],
-    "humidifier":   ["밤새", "아침마다", "요즘"],
-    "kettle":       ["아침마다", "주말 브런치에", "요즘"],
-    "knit":         ["아침마다", "출근길에", "요즘"],
-    "knit_dress":   ["하루 종일", "약속 있는 날엔", "요즘"],
-    "general":      ["요즘", "아침마다", "하루 종일"],
+    "humidifier":   ["밤새", "아침마다", "환절기엔", "요즘", "취침 전엔"],
+    "cleaner_mop":  ["저녁마다", "주말엔", "장봐오고 나면", "집들이 전엔", "요즘"],
+    "cleaner_mini": ["퇴근하고", "아침마다", "차에서", "청소 시간이 없을 때", "요즘"],
+    "kettle":       ["아침마다", "주말 브런치에", "야식 땡길 때", "티타임마다", "요즘"],
+    "knit":         ["아침마다", "출근길에", "일교차 큰 날엔", "약속 있는 날엔", "요즘"],
+    "knit_dress":   ["하루 종일", "약속 있는 날엔", "사진 찍는 날엔", "출근 전 5분", "요즘"],
+    "general":      ["요즘", "아침마다", "하루 종일", "외출할 때마다", "급할 때"],
 }
 
 SITCH = {
-    "cleaner_mop":  ["바닥 끈적임이 신경 쓰여서", "거실 물자국이 성가셔서", "주방 바닥이 거칠어서"],
-    "cleaner_mini": ["책상 위 먼지가 계속 보여서", "차 안이 금방 지저분해져서", "원룸이라 금세 쌓여서"],
-    "humidifier":   ["자꾸 목이 칼칼해서", "아침에 코가 건조해서", "방 공기가 텁텁해서"],
-    "kettle":       ["티타임을 자주 해서", "물 데우는 게 번거로워서", "라면이 자주 땡겨서"],
-    "knit":         ["아침 코디가 고민돼서", "큰 옷은 답답해서", "겉돌지 않는 걸 찾다 보니"],
-    "knit_dress":   ["코디가 번거로워서", "밋밋해 보여서", "라인이 무너져서"],
-    "general":      ["자잘한 불편이 쌓여서", "정리가 필요해서", "바로 쓰고 싶어서"],
+    "humidifier":   [
+        "자꾸 목이 칼칼해서", "아침에 코가 건조해서", "방 공기가 텁텁해서",
+        "아이 방 습도가 낮아서", "피부가 당겨서"
+    ],
+    "cleaner_mop":  [
+        "바닥 끈적임이 신경 쓰여서", "거실 물자국이 성가셔서", "주방 바닥이 거칠어서",
+        "반려동물 발자국이 남아서", "먼지 자국이 금방 보여서"
+    ],
+    "cleaner_mini": [
+        "책상 위 먼지가 계속 보여서", "차 안이 금방 지저분해져서", "원룸이라 금세 쌓여서",
+        "키보드 틈새가 신경 쓰여서", "쇼파 틈 먼지가 거슬려서"
+    ],
+    "kettle":       [
+        "티타임을 자주 해서", "물 데우는 게 번거로워서", "라면이 자주 땡겨서",
+        "드립 커피가 취미라서", "보온이 오래가길 바라서"
+    ],
+    "knit":         [
+        "아침 코디가 고민돼서", "큰 옷은 답답해서", "겉돌지 않는 걸 찾다 보니",
+        "레이어드가 필요해서", "카라가 부담스러워서"
+    ],
+    "knit_dress":   [
+        "코디가 번거로워서", "밋밋해 보여서", "라인이 무너져서",
+        "편하지만 단정하게 입고 싶어서", "사진에 잘 남기고 싶어서"
+    ],
+    "general":      [
+        "자잘한 불편이 쌓여서", "정리가 필요해서", "바로 쓰고 싶어서",
+        "시간을 아끼고 싶어서", "가볍게 시작해보려고"
+    ],
 }
 
 BENEFITS = {
-    "cleaner_mop":  ["물자국이 안 남아요", "끈적임이 싹 사라져요", "발바닥이 보송해요"],
-    "cleaner_mini": ["틈새 먼지가 금방 사라져요", "차 안 청소가 쉬워졌어요", "책상 주변이 단정해져요"],
-    "humidifier":   ["아침에 목이 편해요", "공기가 부드러워져요", "밤새 촉촉하더라고요"],
-    "kettle":       ["티타임이 빨라져요", "라면 준비가 금방이에요", "홈카페가 쉬워졌어요"],
-    "knit":         ["핏이 단정하게 떨어져요", "가볍게 따뜻하더라고요", "아침이 덜 바빠요"],
-    "knit_dress":   ["라인이 예쁘게 살아나요", "코디가 5분 만에 끝나요", "움직일 때 실루엣이 예뻐요"],
-    "general":      ["손이 가요", "편해졌어요", "쓰면 이유를 알아요"],
+    "humidifier":   [
+        "아침에 목이 편해요", "공기가 부드러워져요", "밤새 촉촉하더라고요",
+        "코가 덜 막혀요", "피부 당김이 줄어요"
+    ],
+    "cleaner_mop":  [
+        "물자국이 안 남아요", "끈적임이 싹 사라져요", "발바닥이 보송해요",
+        "걸레 헹굼이 덜 번거로워요", "거실이 매끈해요"
+    ],
+    "cleaner_mini": [
+        "틈새 먼지가 금방 사라져요", "차 안 청소가 쉬워졌어요", "책상 주변이 단정해져요",
+        "필요할 때 바로 됩니다", "선 정리가 편해요"
+    ],
+    "kettle":       [
+        "티타임이 빨라져요", "라면 준비가 금방이에요", "홈카페가 쉬워졌어요",
+        "보온이 오래가요", "주방 동선이 편해요"
+    ],
+    "knit":         [
+        "핏이 단정하게 떨어져요", "가볍게 따뜻하더라고요", "아침이 덜 바빠요",
+        "레이어드가 쉬워요", "거울 앞에서 망설임이 줄어요"
+    ],
+    "knit_dress":   [
+        "라인이 예쁘게 살아나요", "코디가 5분 만에 끝나요", "움직일 때 실루엣이 예뻐요",
+        "편한데 단정해요", "체형 보완이 돼요"
+    ],
+    "general":      [
+        "손이 가요", "편해졌어요", "쓰면 이유를 알아요",
+        "자리 차지가 적어요", "정리가 쉬워요"
+    ],
 }
 
-# “그래서 …” 꼬리 문구는 제거(비문/광고톤 방지)
+# 접속어 꼬리 최소화
 TAILS = [
     "이젠 이걸로 정착했어요",
     "한 번 써보면 이유를 알게 돼요",
@@ -284,6 +325,47 @@ AFF_TITLE_TEMPLATES = [
     "레이어드 맛집 {core}",
     "포인트 주기 좋은 {core}",
 ]
+
+CATEGORY_TEMPLATES = {
+    "humidifier": [
+        "{core} 켜두면 밤새 촉촉해요",
+        "건조한 계절엔 {core}로 해결",
+        "아침마다 상쾌한 공기, {core}",
+        "{core} 하나로 방 공기가 달라져요",
+        "취침 전엔 조용한 {core}",
+    ],
+    "cleaner_mop": [
+        "{core}, 물자국 없는 거실의 비밀",
+        "끈적임이 사라지는 {core}",
+        "주방 바닥엔 {core}가 딱이에요",
+        "발자국·물자국 말끔히, {core}",
+    ],
+    "cleaner_mini": [
+        "틈새 먼지엔 {core}가 최고",
+        "차 안 청소는 {core} 하나면 충분",
+        "작지만 강한 {core}",
+        "원룸 살림의 필수템 {core}",
+        "책상·키보드 틈새엔 {core}",
+    ],
+    "kettle": [
+        "아침을 빠르게 여는 {core}",
+        "홈카페 시작은 {core}부터",
+        "라면 급할 땐 {core}",
+        "보온 오래가는 {core}",
+    ],
+    "knit": [
+        "꾸민 듯 안 꾸민 듯 {core}",
+        "가을 감성은 {core}로 완성",
+        "포근함을 더하는 {core}",
+        "{core} 하나면 오늘 코디 끝",
+    ],
+    "knit_dress": [
+        "5분 코디, {core}로 해결",
+        "약속 있는 날, {core} 하나로",
+        "라인을 살려주는 {core}",
+        "움직일 때 예쁜 실루엣 {core}",
+    ],
+}
 
 # ===== 스토리형 제목 생성 =====
 def _story_candidates(core: str, cat: str) -> List[str]:
@@ -320,7 +402,6 @@ def _aff_title_from_story(keyword: str) -> str:
     src = _sanitize_title_text(keyword)
     cat = _detect_category_from_text(src)
     core = _core_phrase_by_cat(cat, src)
-
     seed = abs(hash(f"story|{core}|{src}|{datetime.utcnow().date()}")) % (2**32)
     rnd = random.Random(seed)
 
@@ -339,10 +420,13 @@ def _aff_title_from_story(keyword: str) -> str:
     return ""
 
 # ===== 템플릿/LLM =====
-def _aff_title_from_templates(core: str, kw: str) -> str:
+def _aff_title_from_templates(core: str, kw: str, cat: str = "general") -> str:
     seed = abs(hash(f"{core}|{kw}|{datetime.utcnow().date()}")) % (2**32)
     rnd = random.Random(seed)
-    cands = rnd.sample(AFF_TITLE_TEMPLATES, k=min(6, len(AFF_TITLE_TEMPLATES)))
+    templates = list(AFF_TITLE_TEMPLATES)
+    if cat in CATEGORY_TEMPLATES:
+        templates += CATEGORY_TEMPLATES[cat]
+    cands = rnd.sample(templates, k=min(6, len(templates)))
     for cand_tpl in cands:
         cand = cand_tpl.format(core=core)
         cand = postprocess_korean_title(cand)
@@ -394,6 +478,7 @@ def _aff_title_from_llm(core: str, kw: str) -> str:
 
 def hook_aff_title(keyword: str) -> str:
     core, _ = _compress_keyword(keyword)
+    cat = _detect_category_from_text(keyword)
 
     # 1) 스토리형(사람 말투)
     if AFF_TITLE_MODE in ("story","story-first","story-then-template","story-then-llm"):
@@ -407,8 +492,8 @@ def hook_aff_title(keyword: str) -> str:
         if t:
             return t
 
-    # 3) 템플릿 폴백
-    return _aff_title_from_templates(core, keyword)
+    # 3) 템플릿 (카테고리 확장 포함)
+    return _aff_title_from_templates(core, keyword, cat)
 
 # ===== TIME / SLOT =====
 def _now_kst():
@@ -526,7 +611,6 @@ def pick_affiliate_keyword()->str:
     return "휴대용 선풍기"
 
 def resolve_product_url(keyword:str)->str:
-    # 1) products_seed.csv 우선
     if os.path.exists(PRODUCTS_SEED_CSV):
         try:
             with open(PRODUCTS_SEED_CSV,"r",encoding="utf-8") as f:
@@ -540,7 +624,6 @@ def resolve_product_url(keyword:str)->str:
                         return r["raw_url"].strip()
         except Exception as e:
             print(f"[SEED][WARN] read error: {e}")
-    # 2) 안전 폴백: 쿠팡 검색
     return f"https://www.coupang.com/np/search?q={quote_plus(keyword)}"
 
 # ===== WP =====
@@ -555,7 +638,6 @@ def _ensure_term(kind:str, name:str)->int:
     r.raise_for_status(); return int(r.json()["id"])
 
 def _category_url_for(name:str)->str:
-    """카테고리 링크를 WP API에서 찾고, 실패 시 /category/<이름>/ 로 폴백."""
     try:
         r = requests.get(
             f"{WP_URL}/wp-json/wp/v2/categories",
