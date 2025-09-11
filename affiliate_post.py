@@ -564,6 +564,16 @@ def _css_block()->str:
 </style>
 """.strip()
 
+def _adsense_block()->str:
+    # 내부 광고 블록 (쿠팡/일상 동일 슬롯 사용)
+    return """
+<div class="aff-ad">
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-7409421510734308" crossorigin="anonymous"></script>
+<ins class="adsbygoogle" style="display:block" data-ad-client="ca-pub-7409421510734308" data-ad-slot="9228101213" data-ad-format="auto" data-full-width-responsive="true"></ins>
+<script>(adsbygoogle = window.adsbygoogle || []).push({});</script>
+</div>
+""".strip()
+
 def _cta_html(url_main:str, url_alt:str, category_url:str, category_name:str)->str:
     btn1 = html.escape(BUTTON_TEXT or "쿠팡에서 최저가 확인하기")
     btn2 = html.escape(BUTTON2_TEXT or "제품 보러가기")
