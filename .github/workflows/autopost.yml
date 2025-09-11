@@ -60,14 +60,33 @@ jobs:
           echo "== keywords_shopping.csv ==" && head -n 5 keywords_shopping.csv || true
           echo "== keywords_general.csv ==" && head -n 5 keywords_general.csv || true
 
-      - name: Build products seed (optional)
-        run: |
-          if [ -f build_products_seed.py ]; then
-            v="${REQUIRE_COUPANG_API:-1}"; v="$(echo "$v" | tr '[:upper:]' '[:lower:]')"
-            if [[ "$v" =~ ^(1|true|yes|y|on)$ ]]; then python build_products_seed.py || true
-            else echo "[INFO] skip Coupang API"; fi
+    - name: Build product seeds (safe even without Coupang/API)
+      run: |
+        # 이 스텝만 -e 완화해서 빈 명령/비정상 종료가 전체 잡을 끊지 않게 함
+        set +e
+
+        # 파일명/스위치 안전 기본값
+        : "${PRODUCTS_SEED_CSV:=products_seed.csv}"
+        : "${REQUIRE_COUPANG_API:=1}"
+
+        # 소문자 정규화
+        v="$(printf '%s' "$REQUIRE_COUPANG_API" | tr '[:upper:]' '[:lower:]')"
+
+        if [ -f build_products_seed.py ]; then
+          if [[ "$v" =~ ^(1|true|yes|y|on)$ ]] && [ -n "${COUPANG_ACCESS_KEY:-}" ] && [ -n "${COUPANG_SECRET_KEY:-}" ]; then
+            # API 키가 있을 때만 실제 검색
+            python build_products_seed.py || echo "[build_products_seed] WARN: non-zero exit (ignored)"
+          else
+            echo "[build_products_seed] SKIP: no API keys or REQUIRE_COUPANG_API=off"
           fi
-          [ -s "${PRODUCTS_SEED_CSV}" ] || echo "product_name,raw_url,pros,cons,keyword,title,url,image" > "${PRODUCTS_SEED_CSV}"
+        else
+          echo "[build_products_seed] SKIP: build_products_seed.py not found"
+        fi
+
+        # 비어있으면 헤더만이라도 만들어 다음 스텝이 안전하게 동작
+        if [ ! -s "$PRODUCTS_SEED_CSV" ]; then
+          printf "product_name,raw_url,pros,cons,keyword,title,url,image\n" > "$PRODUCTS_SEED_CSV" || true
+        fi
 
       - name: Ensure usage dir
         run: |
