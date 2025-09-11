@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-affiliate_post.py — Coupang Partners 글 자동 포스팅 (상단 고지문/CTA x2, 하단 CTA x2, 템플릿 고정)
-- 상단 고지문(굵게/강조) + 상단 CTA 2개 + 카테고리 이동 버튼 + 내부광고(상단)
-- 본문 섹션: 고려요소 → 주요 특징 → 가격/가성비 → (내부광고) → 장단점 → 이런 분께 추천
-- 하단 CTA 2개 + 카테고리 이동 버튼
-- URL 없을 때 쿠팡 검색 페이지 폴백
-- 골든키워드 회전/사용로그/예약 충돌 회피(기존 유지)
-- NEW: 제목 생성 개선 (고정 문구 제거, 길이/가독성 최적화, LLM+템플릿), 제품명 요약
+affiliate_post.py — Coupang Partners 자동 포스팅
+- 상단 고지문 + 상단 CTA(2) + 카테고리 버튼 + 내부광고
+- 본문: 고려요소 → 주요 특징 → 가격/가성비 → (내부광고) → 장단점 → 이런 분께 추천
+- 하단 CTA(2) + 카테고리 버튼
+- URL 없을 때 쿠팡 검색 폴백
+- 골든키워드 회전/사용로그/예약 충돌 회피 유지
+- NEW:
+  * 제목 생성 전용 파이프라인 (풀네임 제거 → "큰 키워드" 요약 → 템플릿/LLM 제목화)
+  * 반복 문구(예: "제대로 써보고 알게 된 포인트") 영구 차단
+  * 제목 길이/가독성 강제 규칙
 """
 import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
@@ -14,10 +17,11 @@ from zoneinfo import ZoneInfo
 from typing import List
 import requests
 from dotenv import load_dotenv
-from urllib.parse import quote, quote_plus  # 카테고리/검색 폴백 URL용
+from urllib.parse import quote, quote_plus
+
 load_dotenv()
 
-# ========= OpenAI (optional) =========
+# ========= OpenAI (선택) =========
 try:
     from openai import OpenAI, BadRequestError
 except Exception:
@@ -28,26 +32,34 @@ _OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 _OPENAI_MODEL = (os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
 _oai = OpenAI(api_key=_OPENAI_API_KEY) if (_OPENAI_API_KEY and OpenAI) else None
 
-# ===== Affiliate title options =====
-AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "14"))
-AFF_TITLE_MAX = int(os.getenv("AFF_TITLE_MAX", "26"))
+# ========= 제목 정책 =========
+# (기본 길이를 다소 낮춰 더 경쾌하게)
+AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "12"))
+AFF_TITLE_MAX = int(os.getenv("AFF_TITLE_MAX", "24"))
 # llm-then-template | template | llm
 AFF_TITLE_MODE = (os.getenv("AFF_TITLE_MODE") or "llm-then-template").lower()
-AFF_BANNED_PHRASES = ("제대로 써보고 알게 된 포인트","써보고 알게 된 포인트")
 
+# 금지 문구(반복·낚시)
+AFF_BANNED_PHRASES = (
+    "제대로 써보고 알게 된 포인트",
+    "써보고 알게 된 포인트",
+    "100%",
+    "무조건",
+    "역대급",
+    "클릭",
+)
+
+# 템플릿(짧고 담백) — {name} = 요약 키워드(브랜드+핵심명사)
 AFF_TITLE_TEMPLATES = [
-    "{name}, 한눈에 핵심만",
-    "{name} 장단점 총정리",
-    "{name} 7일 써본 결론",
-    "{name} 실사용 팁 모음",
-    "{name} 이렇게 쓰니 편해요",
-    "{name} 쓰고 달라진 점",
-    "{name} 이런 분께 맞아요",
-    "{name} 아쉬운 점까지 솔직히",
-    "{name} 구매 전 체크리스트",
-    "{name} 첫인상부터 실전까지",
-    "{name} 놓치기 쉬운 포인트",
-    "{name} 핵심만 쏙 정리",
+    "{name} 한눈에 보기",
+    "{name} 핵심만 쏙",
+    "{name} 장단점 요약",
+    "{name} 구매 전 체크",
+    "{name} 빠른 가이드",
+    "{name} 첫 선택 가이드",
+    "{name} 실사용 포인트",
+    "{name} 추천 포인트",
+    "{name} 이것만 보면 됨",
 ]
 
 def _normalize_title(s: str) -> str:
@@ -59,35 +71,37 @@ def _normalize_title(s: str) -> str:
 
 def _bad_aff_title(t: str) -> bool:
     if not t: return True
-    if not (AFF_TITLE_MIN <= len(t) <= AFF_TITLE_MAX): return True
     if any(p in t for p in AFF_BANNED_PHRASES): return True
-    if any(x in t for x in ("최저가","역대급","무조건","100%","클릭")): return True
+    if not (AFF_TITLE_MIN <= len(t) <= AFF_TITLE_MAX): return True
     return False
 
 def _aff_title_from_templates(name: str, kw: str) -> str:
-    # 하루 단위로 씨드 고정 → 같은 상품이라도 매일 다른 제목
+    # 날짜 기반 시드 → 같은 상품도 매일 다른 제목
     seed = abs(hash(f"{name}|{kw}|{datetime.utcnow().date()}")) % (2**32)
     random.seed(seed)
-    for _ in range(6):
+    # 여러 번 시도해 길이/금지문구 조건 맞추기
+    for _ in range(8):
         cand = _normalize_title(random.choice(AFF_TITLE_TEMPLATES).format(name=name.strip()))
         if not _bad_aff_title(cand):
             return cand
-    # 최후의 보루
-    fallback = _normalize_title(f"{name.strip()} 핵심 체크")
-    return fallback if not _bad_aff_title(fallback) else _normalize_title(name.strip())
+    # 최후 보루: 길이 맞춰 잘라 붙이기
+    base = _normalize_title(f"{name.strip()} 가이드")
+    if len(base) < AFF_TITLE_MIN:
+        base = _normalize_title(f"{name.strip()} 핵심 가이드")
+    return base[:AFF_TITLE_MAX]
 
 def _aff_title_from_llm(name: str, kw: str) -> str:
     if not _oai:
         return ""
     try:
         sys_p = "너는 한국어 카피라이터다. 쇼핑 포스트용 짧고 담백한 제목 1개만 출력한다."
-        usr = f"""상품명(요약): {name}
+        usr = f"""요약 상품명: {name}
 원 키워드: {kw}
 조건:
 - 길이 {AFF_TITLE_MIN}~{AFF_TITLE_MAX}자
 - 금지문구: {", ".join(AFF_BANNED_PHRASES)}
-- 과장/낚시 금지(최저가/역대급 등)
-- 반복 패턴 금지
+- 과장/낚시 금지(최저가/역대급/무조건/100%/클릭 등)
+- 반복/상투적 표현 금지
 - 출력은 제목 1줄(순수 텍스트)"""
         r = _oai.chat.completions.create(
             model=_OPENAI_MODEL,
@@ -103,16 +117,16 @@ def _aff_title_from_llm(name: str, kw: str) -> str:
         print(f"[AFF-TITLE][WARN] {type(e).__name__}: {e}")
         return ""
 
-def hook_aff_title(product_name_short: str, keyword: str) -> str:
+def _hook_aff_title(product_name_short: str, keyword: str) -> str:
     title = ""
     mode_used = "template"
     if AFF_TITLE_MODE in ("llm","llm-then-template"):
         title = _aff_title_from_llm(product_name_short, keyword)
         mode_used = "llm"
     if not title:
-        t2 = _aff_title_from_templates(product_name_short, keyword)
-        if t2: title = t2; mode_used = "template"
-    print(f"[AFF-TITLE] mode={mode_used}, name='{product_name_short}', title='{title}'")
+        title = _aff_title_from_templates(product_name_short, keyword)
+        mode_used = "template"
+    print(f"[AFF-TITLE] mode={mode_used}, short='{product_name_short}', title='{title}'")
     return title
 
 # ========= ENV =========
@@ -133,7 +147,7 @@ BUTTON2_URL=(os.getenv("BUTTON2_URL") or "").strip()
 USE_IMAGE=((os.getenv("USE_IMAGE") or "").strip().lower() in ("1","true","y","yes","on"))
 AFFILIATE_TIME_KST=(os.getenv("AFFILIATE_TIME_KST") or "13:00").strip()
 
-USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-affiliate/1.9"
+USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-affiliate/2.0"
 USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
 USED_FILE=os.path.join(USAGE_DIR,"used_shopping.txt")
 
@@ -245,21 +259,20 @@ def _consume_col_csv(path:str, kw:str)->bool:
         csv.writer(f).writerows(new_rows)
     return True
 
-# ========= KEYWORD / URL =========
+# ========= 키워드 / URL =========
 def pick_affiliate_keyword()->str:
-    NO_REPEAT = (_load_used_set(1) if NO_REPEAT_TODAY else set())
+    used_today = _load_used_set(1) if NO_REPEAT_TODAY else set()
     used_block = _load_used_set(AFF_USED_BLOCK_DAYS)
     gold=_read_col_csv("golden_shopping_keywords.csv")
     shop=_read_col_csv("keywords_shopping.csv")
     pool=[k for k in gold+shop if k and (k not in used_block)]
     if NO_REPEAT_TODAY:
-        pool=[k for k in pool if k not in NO_REPEAT]
+        pool=[k for k in pool if k not in used_today]
     if pool: return pool[0].strip()
     fb=[x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
     return fb[0] if fb else "휴대용 선풍기"
 
 def resolve_product_url(keyword:str)->str:
-    # 1) products_seed.csv 우선
     if os.path.exists(PRODUCTS_SEED_CSV):
         try:
             with open(PRODUCTS_SEED_CSV,"r",encoding="utf-8") as f:
@@ -273,10 +286,9 @@ def resolve_product_url(keyword:str)->str:
                         return r["raw_url"].strip()
         except Exception as e:
             print(f"[SEED][WARN] read error: {e}")
-    # 2) 안전 폴백: 쿠팡 검색
     return f"https://www.coupang.com/np/search?q={quote_plus(keyword)}"
 
-# ========= WP =========
+# ========= WordPress =========
 def _ensure_term(kind:str, name:str)->int:
     r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}", params={"search":name,"per_page":50,"context":"edit"},
                    auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=15, headers=REQ_HEADERS)
@@ -288,7 +300,6 @@ def _ensure_term(kind:str, name:str)->int:
     r.raise_for_status(); return int(r.json()["id"])
 
 def _category_url_for(name:str)->str:
-    """카테고리 링크를 WP API에서 찾고, 실패 시 /category/<이름>/ 로 폴백."""
     try:
         r = requests.get(
             f"{WP_URL}/wp-json/wp/v2/categories",
@@ -329,7 +340,7 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
     r.raise_for_status(); return r.json()
 
-# ========= TEMPLATE =========
+# ========= 본문 템플릿 =========
 def _css_block()->str:
     return """
 <style>
@@ -468,78 +479,100 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
 </div>
 """.strip()
 
-# ========= NAME SHORTENER (new) =========
+# ========= 제목용 "큰 키워드" 요약기 =========
+# 불용/묘사/색상/계절/사이즈/숫자 제거
 _STOP = set("""
 가을 겨울 봄 여름 간절기 데일리 여성 남성 유니섹스 오버 루즈 레귤러 클래식 베이직
 부드러운 도톰 얇은 따뜻한 가벼운 경량 프리미엄 심플 트렌디 인기 신상 기본
-단추 버튼 라운드 브이넥 반목 반폴라 폴라 목터틀 7부 반소매 긴팔 반팔
-화이트 아이보리 아이보리색 블랙 네이비 그레이 베이지 브라운 카키
+단추 버튼 레이스 포인트 퍼프 슬림 와이드 롱 숏 크롭 무지 체크 스트라이프
+라운드 브이넥 반목 반폴라 터틀넥 목폴라 7부 반소매 긴팔 반팔 소매 반팔티
+화이트 아이보리 레드 블랙 네이비 그레이 베이지 브라운 카키 크림 차콜
 미니 소형 대형 100 1000 2000 M L XL XXL 55 66 77 S
 """.split())
-# 핵심 명사 우선순위(있으면 최대 2개까지 유지)
-_CORE_NOUNS = ["니트","가디건","전기포트","전기주전자","가습기","케이프","판초","숄","티","후드","코트","자켓","점퍼","청소기","제습기","선풍기"]
 
-_SEASON_CODES = re.compile(r"(?i)\b(?:\d{2,4}(?:fw|ss)|fw|f\/w|s\/s)\b")
-_NUMLIKE = re.compile(r"^\d+[a-z가-힣]*$", re.I)
+# 핵심 품목(우선 보존)
+_CORE = [
+    "니트","가디건","케이프","판초","숄","티","라운드","브이넥","전기포트","전기주전자",
+    "가습기","청소기","제습기","선풍기"
+]
+
+_SEASON_PAT = re.compile(r"(?i)\b(?:\d{2,4}(?:fw|ss)|fw|f\/w|s\/s)\b")
+_NUMERICISH = re.compile(r"^\d+[a-z가-힣]*$", re.I)
+
+def _pre_norm(s: str) -> str:
+    """연결어 분리: 예) 캐시미어니트 → 캐시미어 니트"""
+    s = _SEASON_PAT.sub("", s)
+    s = s.replace("캐시미어니트","캐시미어 니트").replace("라운드니트","라운드 니트").replace("브이넥니트","브이넥 니트")
+    s = re.sub(r"[·/|,+]+"," ",s)
+    s = re.sub(r"\s+"," ",s).strip()
+    return s
 
 def _tokenize(s: str) -> List[str]:
-    toks = re.split(r"[,\s/+\-·\|]+", (s or "").strip())
-    return [t for t in toks if t]
+    return [t for t in re.split(r"[,\s/+\-·\|]+", s) if t]
 
 def shorten_keyword_for_title(kw: str) -> str:
-    # 0) 시즌 코드 제거
-    s = _SEASON_CODES.sub("", kw)
+    # 0) 전처리
+    s = _pre_norm(kw)
     toks = _tokenize(s)
 
-    # 1) 불용/색상/숫자성 토큰 제거
+    # 1) 불용/숫자형 토큰 제거
     cleaned=[]
     for t in toks:
         if t in _STOP: continue
-        if _NUMLIKE.match(t): continue
+        if _NUMERICISH.match(t): continue
         if len(t) <= 1: continue
         cleaned.append(t)
 
-    # 2) 핵심명사/브랜드 선별
-    core=[t for t in cleaned if any(n in t for n in _CORE_NOUNS)]
+    if not cleaned:
+        cleaned = toks[:]
+
+    # 2) 핵심 품목 추출
+    cores=[t for t in cleaned if any(c in t for c in _CORE)]
+    # 3) 브랜드/고유명 후보(숫자 없음, 특수문자 없음, 2~6자 선호)
     brand=""
     for t in cleaned:
-        if t in core: continue
-        # 브랜드 후보: 한글 2~6자 또는 영문/영문+한글 조합, 숫자 미포함
-        if not any(ch.isdigit() for ch in t):
-            brand = t
-            break
+        if t in cores: continue
+        if any(ch.isdigit() for ch in t): continue
+        brand = t
+        break
 
-    # 3) 조합 규칙: [브랜드] + 핵심명사(최대2) or 핵심명사만
+    # 4) 조합: [브랜드] + [핵심 1~2] (중복 기준화)
     out=[]
     if brand: out.append(brand)
-    if core:
-        # 중복 제거 & 길이 짧은 순
+    if cores:
         seen=set()
-        for t in core:
-            base = next((n for n in _CORE_NOUNS if n in t), t)
+        for t in cores:
+            base = next((c for c in _CORE if c in t), t)
             if base in seen: continue
-            seen.add(base)
-            out.append(base)
+            seen.add(base); out.append(base)
             if len(out) >= 3: break
 
-    # 4) 최후 보루: 불용어 제거된 앞에서 3~4개
+    # 5) 보루: 불용어 제거 앞 2~3개
     if not out:
-        out = cleaned[:3] if cleaned else _tokenize(kw)[:2]
+        out = cleaned[:3]
 
-    # 5) 길이 제한 (너무 길면 뒤에서 컷)
     name = " ".join(out).strip()
-    if len(name) > 18:
-        # 뒤에서부터 토막
-        cut = []
-        acc = 0
-        for t in out:
-            if acc + len(t) + (1 if cut else 0) > 18: break
-            cut.append(t); acc += len(t) + (1 if cut else 0)
-        name = " ".join(cut) if cut else out[0][:18]
+
+    # 6) 최대 길이 강제: 너무 길면 뒤에서 컷
+    max_name_len = max(6, min(18, AFF_TITLE_MAX - 6))  # 템플릿 접미 고려
+    if len(name) > max_name_len:
+        parts = name.split()
+        cut=[]; acc=0
+        for p in parts:
+            next_len = acc + len(p) + (1 if cut else 0)
+            if next_len > max_name_len: break
+            cut.append(p); acc = next_len
+        if cut: name = " ".join(cut)
+        else: name = parts[0][:max_name_len]
+
+    # 7) 최소 정보 보루
+    if not any(c in name for c in _CORE):
+        # 품목명 하나 붙여 주기
+        name = (name + " 니트").strip()
 
     return re.sub(r"\s+"," ",name).strip()
 
-# ========= RUN =========
+# ========= 실행 =========
 def rotate_sources(kw:str):
     changed=False
     if _consume_col_csv("golden_shopping_keywords.csv",kw):
@@ -555,9 +588,9 @@ def run_once():
     url = resolve_product_url(kw)
     when_gmt = _slot_affiliate()
 
-    # NEW: 제품명 요약 + 동적 제목
+    # ✨ 요약 키워드 → 제목
     short_name = shorten_keyword_for_title(kw)
-    title = hook_aff_title(product_name_short=short_name, keyword=kw)
+    title = _hook_aff_title(product_name_short=short_name, keyword=kw)
 
     body = render_affiliate_html(kw, url, image="", category_name=DEFAULT_CATEGORY)
     res = post_wp(title, body, when_gmt, category=DEFAULT_CATEGORY, tag=kw)
