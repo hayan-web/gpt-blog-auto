@@ -1,10 +1,9 @@
-﻿# ↑↓↓ 이 줄 지우지 말고, 바로 아래 줄부터 YAML이 시작해야 합니다.
-name: run
+﻿name: run
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "30 0 * * *"  # 09:30 KST daily
+    - cron: "30 0 * * *"  # 09:30 KST daily (UTC+9)
 
 concurrency:
   group: autopost
@@ -157,7 +156,7 @@ jobs:
           mkdir -p .usage
           [ -f .usage/.gitkeep ] || touch .usage/.gitkeep
 
-      - name: Post two general articles
+      - name: Post two general articles (10:00 & 17:00 KST)
         run: |
           if [ -f auto_wp_gpt.py ]; then
             python auto_wp_gpt.py --mode=two-posts
@@ -194,5 +193,3 @@ jobs:
             git commit -m "chore: rotate keywords & persist usage logs (auto)"
             git push
           fi
-
-# (방금 위 코드블록 전체를 여기 사이에 그대로 붙여넣기)
