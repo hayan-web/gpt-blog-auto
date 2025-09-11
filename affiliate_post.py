@@ -23,6 +23,7 @@ import os, re, csv, json, html, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List, Tuple
+from pathlib import Path
 import requests
 from dotenv import load_dotenv
 from urllib.parse import quote, quote_plus
@@ -402,9 +403,10 @@ def _slot_affiliate()->str:
 def _ensure_usage_dir(): os.makedirs(USAGE_DIR, exist_ok=True)
 
 def _load_used_set(days:int=30)->set:
+    """KST 기준 최근 days일 동안 쓴 키워드 집합."""
     _ensure_usage_dir()
     if not os.path.exists(USED_FILE): return set()
-    cutoff=datetime.utcnow().date()-timedelta(days=days)
+    cutoff=datetime.now(ZoneInfo("Asia/Seoul")).date()-timedelta(days=days)
     used=set()
     with open(USED_FILE,"r",encoding="utf-8",errors="ignore") as f:
         for line in f:
@@ -431,8 +433,9 @@ def _read_recent_used(n:int=8)->list[str]:
 
 def _mark_used(kw:str):
     _ensure_usage_dir()
+    kst_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
     with open(USED_FILE,"a",encoding="utf-8") as f:
-        f.write(f"{datetime.utcnow().date():%Y-%m-%d}\t{kw.strip()}\n")
+        f.write(f"{kst_today:%Y-%m-%d}\t{kw.strip()}\n")
 
 # ===== CSV =====
 def _read_col_csv(path:str)->List[str]:
@@ -478,6 +481,7 @@ def pick_affiliate_keyword()->str:
     fb=[x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
     if fb: return fb[0]
     return "휴대용 선풍기"
+
 def resolve_product_url(keyword:str)->str:
     if os.path.exists(PRODUCTS_SEED_CSV):
         try:
@@ -558,13 +562,7 @@ def _css_block()->str:
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #e5e7eb;background:#f8fafc;color:#0f172a;border-radius:10px;font-size:.95rem}
 .aff-disclosure strong{color:#334155}
 
-/* --- CTA: vertical, centered, generous --- */
-.aff-cta{display:flex;flex-direction:column;align-items:center;gap:16px;margin:20px auto 14px;max-width:100%}
-.aff-cta a{display:block;width:clamp(260px,60%,420px);padding:16px 24px;border-radius:9999px;font-weight:700;letter-spacing:-.2px;text-align:center;line-height:1.2;text-decoration:none}
-.aff-cta a + a{margin-top:0}
-
-/* Colors */
-/* ⬇⬇⬇ 버튼 중앙 정렬·세로 배치·간격/사이즈 고정 (테마 오버라이드 대비) */
+/* --- CTA: 중앙 정렬 · 세로 배치 · 충분한 간격/사이즈 --- */
 .aff-cta {
   display:flex;
   flex-direction:column;
@@ -572,10 +570,9 @@ def _css_block()->str:
   justify-content:center;
   gap:20px;
   width:100%;
-  margin:20px 0;
+  margin:20px 0 14px;
 }
-
-.aff-cta a {
+.aff-cta a{
   display:inline-flex !important;
   justify-content:center;
   align-items:center;
@@ -585,18 +582,18 @@ def _css_block()->str:
   font-size:16px;
   font-weight:700;
   border-radius:999px;
-  width:clamp(280px, 80%, 420px) !important; /* 본문 폭 기준 중앙 고정 */
+  width:clamp(280px, 80%, 420px) !important;
   margin:0 auto;
   text-decoration:none;
   box-shadow:0 4px 12px rgba(0,0,0,0.08);
 }
+/* 색상 테마(녹색/화이트/다크) */
+.aff-cta .btn-primary{background:#16a34a;color:#fff}
+.aff-cta .btn-secondary{background:#fff;border:2px solid #16a34a;color:#0f172a}
+.aff-cta .btn-tertiary{background:#0f172a;color:#fff}
 
-/* 데스크톱에서 버튼을 더 크게 */
-@media (min-width: 720px) {
-  .aff-cta a {
-    min-height:64px;
-    font-size:18px;
-  }
+@media (min-width: 720px){
+  .aff-cta a{min-height:64px;font-size:18px}
 }
 
 /* --- Tables (unchanged) --- */
@@ -613,6 +610,7 @@ def _css_block()->str:
 }
 </style>
 """
+
 def _cta_html(url_main:str, url_alt:str, category_url:str, category_name:str)->str:
     btn1 = html.escape(BUTTON_TEXT or "쿠팡에서 최저가 확인하기")
     btn2 = html.escape(BUTTON2_TEXT or "제품 보러가기")
