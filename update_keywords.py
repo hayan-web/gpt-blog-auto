@@ -1,8 +1,9 @@
+# update_keywords.py
 # -*- coding: utf-8 -*-
 """
 update_keywords.py
 - 네이버 DataLab(검색어 트렌드) + (가능 시) DataLab 쇼핑 인사이트를 활용해
-  50개까지 키워드 수집 → 점수화(모멘텀/최근성) → 상위 N개 '황금 키워드' 선별
+  최대 50개 키워드 수집 → 점수화(모멘텀/최근성) → 상위 N개 '황금 키워드' 선별
 - 결과 파일
   1) keywords_general.csv         (일반/뉴스성 키워드)
   2) keywords_shopping.csv        (쇼핑성 키워드)
@@ -19,8 +20,8 @@ CLI 예:
   USER_AGENT           (기본 gpt-blog-keywords/1.3)
 """
 
-import os, re, csv, json, time, argparse, random
-from datetime import datetime, timedelta, timezone
+import os, re, csv, json, time, argparse
+from datetime import datetime, timedelta
 from typing import List, Dict, Tuple, Iterable
 import requests
 
@@ -37,7 +38,7 @@ OUT_GOLDEN   = "golden_shopping_keywords.csv"
 # 금지어
 BAN_KEYWORDS = [w.strip() for w in (os.getenv("BAN_KEYWORDS") or "").split(",") if w.strip()]
 
-# 기본 시드(쇼핑 중심 + 생활잡화) — 필요 시 자유롭게 보강
+# 기본 시드(쇼핑 중심 + 생활잡화)
 DEFAULT_SEEDS = [
     "니트", "니트 원피스", "가디건", "스웨터",
     "선풍기", "미니 선풍기", "휴대용 선풍기",
@@ -63,35 +64,34 @@ def _headers() -> Dict[str, str]:
 
 def _post_json(url: str, body: dict, timeout=12, retries=2) -> dict:
     """작고 안전한 재시도 래퍼 (429/5xx 시 소폭 대기, 총 시도 retries+1)"""
+    last = None
     for i in range(retries + 1):
         try:
             r = requests.post(url, headers=_headers(), json=body, timeout=timeout)
-            # 429는 살짝 쉬었다
             if r.status_code == 429 and i < retries:
-                time.sleep(0.8 + 0.3 * i); continue
+                time.sleep(0.9 + 0.4 * i); continue
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
-            # 권한/엔드포인트 이슈면 바로 포기
+            last = e
             if r is not None and r.status_code in (400, 401, 403, 404):
                 print(f"[NAVER][WARN] {url} -> {r.status_code}: {r.text[:180]}")
                 return {}
             if i < retries:
-                time.sleep(0.6 + 0.2 * i)
-            else:
-                print(f"[NAVER][WARN] HTTPError {getattr(r,'status_code',0)}: {e}")
+                time.sleep(0.6 + 0.3 * i)
         except Exception as e:
+            last = e
             if i < retries:
-                time.sleep(0.4 + 0.2 * i)
-            else:
-                print(f"[NAVER][WARN] {type(e).__name__}: {e}")
+                time.sleep(0.5 + 0.3 * i)
+    if last:
+        print(f"[NAVER][WARN] {type(last).__name__}: {last}")
     return {}
 
 # ===== 유틸 =====
 def _dedupe(seq: Iterable[str]) -> List[str]:
     seen, out = set(), []
     for s in seq:
-        k = s.strip()
+        k = (s or "").strip()
         if not k or k in seen: 
             continue
         seen.add(k)
@@ -101,9 +101,7 @@ def _dedupe(seq: Iterable[str]) -> List[str]:
 def _normalize_kw(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
-    # 너무 짧거나 기호/영문숫자만인 것 정리
-    if len(s) <= 1: return ""
-    return s
+    return s if len(s) > 1 else ""
 
 def _is_shopping_kw(kw: str) -> bool:
     return bool(SHOP_PAT.search(kw))
@@ -113,7 +111,6 @@ def _ban(kw: str) -> bool:
     if len(kw) > 40: return True
     if any(b and (b in kw) for b in BAN_KEYWORDS):
         return True
-    # 의미없는 파편/기호 위주
     if not re.search(r"[가-힣]", kw):
         return True
     return False
@@ -132,7 +129,6 @@ def _score_from_series(rows: List[Dict]) -> float:
         return 0.0
     n = len(ratios)
     last = ratios[-1]
-    # 최근 3 vs 그 전 3
     a = ratios[-3:] if n >= 3 else ratios[-n:]
     b = ratios[-6:-3] if n >= 6 else ratios[:max(0, n-3)]
     m1 = sum(a) / max(1, len(a))
@@ -152,10 +148,11 @@ def collect_datalab_search(seeds: List[str], days: int = 7) -> Dict[str, float]:
         return {}
     end = datetime.now().date()
     start = end - timedelta(days=max(1, days))
-    # 그룹 구성: 시드 키워드 하나당 동일 키워드만 묶어 최소 그룹으로
+
     groups = [{"groupName": s[:20] or "seed", "keywords": [s]} for s in _dedupe(seeds)]
-    # DataLab API는 최대 그룹 수 제한(≈20) → 나눠 요청
-    chunk_size = 20
+    # DataLab API: keywordGroups 최대 5개 제한 → 반드시 5로 청크
+    chunk_size = 5
+
     acc: Dict[str, float] = {}
     total_groups = 0
     for i in range(0, len(groups), chunk_size):
@@ -163,8 +160,7 @@ def collect_datalab_search(seeds: List[str], days: int = 7) -> Dict[str, float]:
             "startDate": start.strftime("%Y-%m-%d"),
             "endDate": end.strftime("%Y-%m-%d"),
             "timeUnit": "date",
-            "keywordGroups": groups[i:i+chunk_size],
-            # "device": "", "ages": [], "gender": ""
+            "keywordGroups": groups[i:i+chunk_size]
         }
         url = "https://openapi.naver.com/v1/datalab/search"
         data = _post_json(url, body)
@@ -179,47 +175,45 @@ def collect_datalab_search(seeds: List[str], days: int = 7) -> Dict[str, float]:
                 if not _ban(k):
                     acc[k] = max(acc.get(k, 0.0), sc)
         total_groups += len(body["keywordGroups"])
-        # 짧게 쉬며 API 부담 완화
-        time.sleep(0.15)
+        time.sleep(0.2)  # API 부담 완화
     print(f"[DATALAB-SEARCH] groups={total_groups} (momentum keys)")
     return acc
 
 # ===== DataLab: 쇼핑 인사이트 (있으면 사용, 없으면 패스) =====
 def collect_datalab_shopping_candidates(days: int = 7) -> Dict[str, float]:
     """
-    쇼핑 인사이트에서 '핫' 키워드가 나오는 엔드포인트는 계정/권한에 따라 다를 수 있음.
-    접근 실패(404/403/401 등) 시 빈 dict 반환.
+    일부 계정에서만 사용 가능. 접근 실패/스키마 불일치 시 빈 dict 반환.
+    카테고리 코드는 문자열 하나만 허용될 수 있어 안전하게 단일 호출들로 시도.
     """
     if not (NAVER_CLIENT_ID and NAVER_CLIENT_SECRET):
         return {}
     end = datetime.now().date()
     start = end - timedelta(days=max(1, days))
-    # 일부 계정에서 사용 가능한 키워드 엔드포인트 (없을 수 있음)
+
     url = "https://openapi.naver.com/v1/datalab/shopping/category/keywords"
-    body = {
-        "startDate": start.strftime("%Y-%m-%d"),
-        "endDate": end.strftime("%Y-%m-%d"),
-        "timeUnit": "date",
-        # 카테고리(디폴트: 가전/생활 카테고리들) — 권한 없으면 무시됨
-        "category": [{"name": "가전", "param": [50000003]}, {"name": "생활가전", "param": [50000005]}],
-        "device": "pc,mobile",
-        "gender": "",
-        "ages": []
-    }
-    data = _post_json(url, body)
+    categories = ["50000003", "50000005"]  # 가전, 생활가전 대표 카테고리 예시
+
     acc: Dict[str, float] = {}
-    try:
-        # 응답 형태가 계정에 따라 다름. 가장 단순한 형태 가정: {'results':[{'keywords':[{'keyword':..., 'ratio':...}, ...]}]}
-        for res in data.get("results", []):
-            for kv in res.get("keywords", []):
-                kw = _normalize_kw(kv.get("keyword") or "")
-                if _ban(kw): 
-                    continue
-                ratio = float(kv.get("ratio") or 0)
-                acc[kw] = max(acc.get(kw, 0.0), ratio)
-    except Exception:
-        # 구조가 다르면 조용히 패스
-        return {}
+    for c in categories:
+        body = {
+            "startDate": start.strftime("%Y-%m-%d"),
+            "endDate": end.strftime("%Y-%m-%d"),
+            "timeUnit": "date",
+            "category": c
+        }
+        data = _post_json(url, body)
+        try:
+            for res in data.get("results", []):
+                for kv in res.get("keywords", []):
+                    kw = _normalize_kw(kv.get("keyword") or "")
+                    if _ban(kw): 
+                        continue
+                    ratio = float(kv.get("ratio") or 0)
+                    acc[kw] = max(acc.get(kw, 0.0), ratio)
+        except Exception:
+            # 구조가 다르면 조용히 패스
+            return {}
+        time.sleep(0.15)
     if acc:
         print(f"[DATALAB-SHOP] candidates={len(acc)}")
     return acc
@@ -253,7 +247,7 @@ def main():
     ap.add_argument("--parallel", type=int, default=4, help="미사용(호환용 인자)")
     args = ap.parse_args()
 
-    # 시드 구성: 환경변수 AFF_FALLBACK_KEYWORDS 에 있으면 우선 사용
+    # 시드 구성: 환경변수 AFF_FALLBACK_KEYWORDS 우선 사용
     env_seeds = [s.strip() for s in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if s.strip()]
     seeds = _dedupe(env_seeds + DEFAULT_SEEDS)
 
@@ -266,7 +260,7 @@ def main():
     shop_boost = collect_datalab_shopping_candidates(days=args.days)
     if shop_boost:
         for kw, v in shop_boost.items():
-            scored[kw] = max(scored.get(kw, 0.0), v * 0.8)  # 가벼운 가중
+            scored[kw] = max(scored.get(kw, 0.0), v * 0.8)
 
     # 필터링 & 정리
     cleaned = {k: v for k, v in scored.items() if not _ban(k)}

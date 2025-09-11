@@ -1,10 +1,12 @@
-﻿# -*- coding: utf-8 -*-
+﻿# auto_wp_gpt.py
+# -*- coding: utf-8 -*-
 """
-auto_wp_gpt.py — 일상형 포스트 자동 발행 (SEO 구조/표/광고 반영)
-- 키워드 기반: keywords_general.csv 에서 선택
-- 본문: H2 부제목 + 요약(<=300자) + H3 섹션 6~8개 + 표 1개 이상 + 내부광고(상단/중간)
+auto_wp_gpt.py — 일상형 포스트 자동 발행 (SEO 구조/표/광고 반영, 1500자 내외)
+- 키워드 기반: keywords_general.csv 에서 선택 (없으면 안전 폴백 제목)
+- 본문: H2 부제목 + 개요(<=300자, 존댓말) + H3 섹션 6~8개 + 표 1개 이상 + 내부광고(상단/중간)
 - 태그는 키워드 1~2개에 맞춰 자동 생성
 - 워크플로에서 --mode=two-posts 등으로 호출 가능(기존 인터페이스 유지)
+- 워드프레스에 그대로 HTML로 들어가며 "요약글/본문1/본문2" 같은 안내 문구는 출력하지 않음
 """
 
 import os, csv, json, html, random
@@ -24,7 +26,7 @@ POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()
 DEFAULT_CATEGORY=(os.getenv("DEFAULT_CATEGORY") or "정보").strip() or "정보"
 DEFAULT_TAGS=(os.getenv("DEFAULT_TAGS") or "").strip()
 
-USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-daily/3.0"
+USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-daily/3.1"
 REQ_HEADERS={"User-Agent":USER_AGENT,"Accept":"application/json","Content-Type":"application/json; charset=utf-8"}
 
 def _adsense_block()->str:
@@ -34,14 +36,14 @@ def _adsense_block()->str:
 def _css()->str:
     return """
 <style>
-.daily-wrap{line-height:1.7}
+.daily-wrap{line-height:1.78;font-size:16px;color:#0f172a}
 .daily-sub{margin:10px 0 6px;font-size:1.2rem;color:#334155}
-.daily-hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0}
+.daily-hr{border:0;border-top:1px solid #e5e7eb;margin:18px 0}
 .daily-table{width:100%;border-collapse:collapse;margin:8px 0 14px}
 .daily-table th,.daily-table td{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}
 .daily-table thead th{background:#f8fafc}
 .daily-wrap h2{margin:18px 0 6px}
-.daily-wrap h3{margin:16px 0 6px}
+.daily-wrap h3{margin:18px 0 8px;font-size:1.05rem}
 </style>
 """
 
@@ -90,7 +92,7 @@ def _slot_at(hour:int, minute:int)->str:
 def _title_from_kw(kw:str)->str:
     s=kw.strip()
     s=s.replace('"',"").replace("'","")
-    if len(s)<10: s=f"{s}에 대해 차분히 정리해 봤어요"
+    if len(s)<6: s=f"{s}에 대해 차분히 정리해 봤어요"
     if len(s)>38: s=s[:38]+"…"
     return s
 
@@ -108,64 +110,107 @@ def _category_url(name:str)->str:
         pass
     return f"{WP_URL}/category/{name}/"
 
+def _mk_paragraph(txt:str)->str:
+    return f"<p>{txt}</p>"
+
 def _html_daily(keyword:str)->str:
     k=html.escape(keyword)
     subtitle=f"{k} 핵심만 담아보기"
     summary=(f"{k}와 관련된 내용을 일상 맥락에서 자연스럽게 정리했습니다. "
              f"누가·언제·어디서 쓰는지에 따라 포인트가 달라지므로, 사용 장면을 먼저 떠올리고 핵심만 빠르게 읽을 수 있도록 구성했어요.")
 
+    # 4x5 표 한 개
     table=f"""
 <table class="daily-table">
-  <thead><tr><th>구간</th><th>핵심</th><th>참고</th></tr></thead>
+  <thead><tr><th>구간</th><th>핵심</th><th>실수</th><th>대안</th></tr></thead>
   <tbody>
-    <tr><td>준비</td><td>용도/장소 정리</td><td>과투자 방지</td></tr>
-    <tr><td>사용</td><td>자주 쓰는 기능 위주</td><td>습관 붙이기</td></tr>
-    <tr><td>관리</td><td>세척/보관 루틴</td><td>유지비 체크</td></tr>
-    <tr><td>업그레이드</td><td>부족한 한 가지</td><td>단계적 전환</td></tr>
+    <tr><td>준비</td><td>용도·장소 정의</td><td>과투자</td><td>필수/옵션 분리</td></tr>
+    <tr><td>사용</td><td>두세 기능 집중</td><td>설정 과도화</td><td>프리셋 고정</td></tr>
+    <tr><td>관리</td><td>세척·보관 동선</td><td>방치</td><td>루틴 묶기</td></tr>
+    <tr><td>업그레이드</td><td>한 가지씩 보강</td><td>일괄 교체</td><td>단계 전환</td></tr>
   </tbody>
 </table>
 """.strip()
 
+    # 섹션 본문(1500자 근사치)
+    sec = []
+    sec.append((
+        "장면을 먼저 떠올리기",
+        "어디서 언제 누구와 사용할지부터 정리하면 선택이 쉬워집니다. 공간의 제약, 소음 허용치, 보관 위치 같은 현실 조건을 미리 적어두면 필요 이상으로 욕심내지 않게 되고, 사소해 보이는 불편을 줄일 수 있어요. 오늘 당장 쓰일 장면 한 가지만 확실히 잡아도 방향이 선명해집니다."
+    ))
+    sec.append((
+        "핵심 두세 가지에 집중",
+        "모든 기능을 잘 쓰려는 순간 복잡해집니다. 자주 쓰게 될 두세 기능만 정하고 그 외는 숨기는 편이 유지에 유리합니다. 처음 일주일은 일부러 단순한 설정으로 반복해 보세요. 몸에 익는 순간 루틴이 생기고, 자연스레 사용 빈도가 올라갑니다."
+    ))
+    sec.append((
+        "가성비를 좌우하는 요소",
+        "구매가보다 유지비가 체감을 좌우합니다. 소모품 가격, 교체 주기, 세척 시간, 전력 사용량을 같이 계산해 보면 값이 싸도 비싼 선택이 있고, 반대로 처음 값이 높아도 총비용이 낮은 경우가 뚜렷합니다. 장바구니에 담기 전 ‘유지비 합계’를 한 번만 적어보세요."
+    ))
+    sec.append((
+        "관리 루틴을 짧게",
+        "세척과 보관은 한 동선 안에 묶는 게 핵심입니다. ‘바로 닿는 자리’가 있으면 귀찮음이 크게 줄어들어요. 사용 직후 가볍게 털어내고 제자리로 돌려놓는 1분 루틴을 만들면, 제품 수명과 위생이 함께 좋아집니다."
+    ))
+    sec.append((
+        "작은 개선이 큰 차이",
+        "처음부터 완벽한 세팅을 만들려 하면 지칩니다. 지금 쓰는 방식에서 한 가지 불편만 줄여보세요. 예를 들어 전원 케이블을 정리하거나, 자주 쓰는 모드를 첫 화면에 두는 식의 작은 개선이 실제 만족도를 크게 바꿉니다."
+    ))
+    sec.append((
+        "상황별 체크포인트",
+        "가정용과 사무용, 개인과 공용은 기준이 달라야 합니다. 공용이라면 누구나 이해할 수 있는 간단한 안내와 표준 설정을 마련하고, 개인이라면 손에 익는 조작과 보관성을 더 우선하세요. 상황이 바뀌면 기준도 바뀌어야 합니다."
+    ))
+    sec.append((
+        "한 줄 결론",
+        "목적이 선명하면 선택은 빨라지고, 관리가 쉬우면 꾸준함이 만들어집니다. 그래서 작은 개선이 결국 가장 큰 결과를 만듭니다."
+    ))
+
+    # 광고 위치: 상단/중간
+    mid_index = len(sec)//2
+
     cat_url=_category_url(DEFAULT_CATEGORY)
 
-    body=f"""
-{_css()}
-<div class="daily-wrap">
-  {_adsense_block()}
-  <h2 class="daily-sub">{subtitle}</h2>
-  <p>{summary}</p>
-  <hr class="daily-hr">
+    parts = [ _css(), '<div class="daily-wrap">', _adsense_block(),
+              f'<h2 class="daily-sub">{subtitle}</h2>',
+              _mk_paragraph(summary), '<hr class="daily-hr">']
 
-  <h3>장면을 먼저 떠올리기</h3>
-  <p>“어디서, 언제, 누구와”가 정해지면 선택과 실행이 놀랄 만큼 빨라집니다. 필요한 요소만 남기고 나머지는 가볍게 두세요.</p>
-  <hr class="daily-hr">
+    # 섹션 렌더링
+    for idx, (h, p) in enumerate(sec):
+        parts.append(f"<h3>{html.escape(h)}</h3>")
+        # 긴 문단을 두세 문장으로 나눠 가독성 확보
+        for chunk in re_split_sentences(p):
+            parts.append(_mk_paragraph(html.escape(chunk)))
+        # 표는 가성비 섹션 뒤에 삽입
+        if h.startswith("가성비"):
+            parts.append(table)
+        parts.append('<hr class="daily-hr">')
+        if idx == mid_index:
+            parts.append(_adsense_block())
 
-  <h3>핵심 두세 가지에 집중</h3>
-  <p>모든 걸 다 하려 하지 않기. 자주 쓰는 기능 두세 가지가 루틴을 만듭니다. 익숙해지면 자동으로 손이 가요.</p>
-  <hr class="daily-hr">
+    parts.append(f'<p style="margin:18px 0 0"><a href="{html.escape(cat_url)}">더 많은 글 보기</a></p>')
+    parts.append("</div>")
+    return "\n".join(parts).strip()
 
-  <h3>가성비를 좌우하는 것</h3>
-  <p>구매가보다 유지비가 체감을 좌우합니다. 주기/소모품/시간을 한 번에 계산해 보세요.</p>
-  {table}
-  <hr class="daily-hr">
-
-  <h3>관리 루틴 짧게 만들기</h3>
-  <p>세척과 보관을 한 동선 안에 묶으면 피곤함이 확 줄어듭니다. ‘바로 닿는 자리’를 확보하세요.</p>
-  <hr class="daily-hr">
-
-  {_adsense_block()}
-
-  <h3>부담 없이 시작하는 방법</h3>
-  <p>처음부터 완벽함을 노리기보다, 지금 있는 것부터 가볍게. 쓰면서 필요한 한 가지를 발견하는 편이 현실적입니다.</p>
-  <hr class="daily-hr">
-
-  <h3>한 줄 결론</h3>
-  <p>목적이 선명하면 선택은 빨라지고, 관리가 쉬우면 꾸준함이 만들어집니다. 그래서 작은 개선이 가장 큽니다.</p>
-
-  <p style="margin:18px 0 0"><a href="{html.escape(cat_url)}">더 많은 글 보기</a></p>
-</div>
-""".strip()
-    return body
+def re_split_sentences(text:str)->list[str]:
+    # 아주 단순한 문장 분리: 마침표/물결/느낌표/물음표 기준
+    chunks=[]
+    buf=""
+    for ch in text:
+        buf+=ch
+        if ch in "…?!.":
+            chunks.append(buf.strip())
+            buf=""
+    if buf.strip():
+        chunks.append(buf.strip())
+    # 너무 짧으면 붙이기
+    out=[]
+    acc=""
+    for c in chunks:
+        if len(acc)+len(c) < 60:
+            acc = (acc+" "+c).strip()
+        else:
+            if acc: out.append(acc); acc=""
+            out.append(c)
+    if acc: out.append(acc)
+    return out
 
 def create_one(hour:int, minute:int)->dict:
     kw=_pick_general_keyword()

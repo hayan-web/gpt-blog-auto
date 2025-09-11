@@ -1,22 +1,21 @@
-﻿name: run
+﻿# .github/workflows/autopost.yml
+name: run
 
 on:
   workflow_dispatch:
   schedule:
-    # 매일 KST 오전 09:35에 실행(= UTC 00:35). 필요 시 수정
-    - cron: "35 0 * * *"
-
-concurrency:
-  group: ${{ github.workflow }}-main
-  cancel-in-progress: false
+    - cron: "30 0 * * *"   # 매일 KST 오전 9:30 ≈ UTC 00:30 (필요 시 조정)
 
 permissions:
   contents: write
 
+env:
+  K_ALL: "50"
+  GOLD_ALL: "20"
+
 jobs:
   run:
     runs-on: ubuntu-24.04
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Create .env from secrets
+      - name: Write .env from secrets
         shell: bash
         run: |
           cat > .env << 'EOF'
@@ -48,7 +47,7 @@ jobs:
           OPENAI_MODEL=
           OPENAI_MODEL_LONG=
           MAX_TOKENS_BODY=900
-          # ===== Coupang Partners (선택) =====
+          # ===== Coupang Partners =====
           COUPANG_ACCESS_KEY=${{ secrets.COUPANG_ACCESS_KEY }}
           COUPANG_SECRET_KEY=${{ secrets.COUPANG_SECRET_KEY }}
           COUPANG_CHANNEL_ID=${{ secrets.COUPANG_CHANNEL_ID }}
@@ -67,8 +66,6 @@ jobs:
           AFFILIATE_TAGS=
           DISCLOSURE_TEXT=이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.
           # ===== Ads =====
-          # autopost/affiliate 모두에서 보장: 비어있어도 [ads_top]가 들어가지만,
-          # affiliate의 구버전 테마 필터 대응을 위해 여기서도 폴백을 직접 넣어줌
           AD_SHORTCODE=[ads_top]
           AD_METHOD=
           AD_INSERT_MIDDLE=
@@ -101,7 +98,7 @@ jobs:
           AFFILIATE_TIMES_KST=12:00,16:00,18:00
           EOF
 
-          # Export to env
+          # export to env for later steps
           python - << 'PY'
           import os
           from dotenv import dotenv_values
@@ -112,38 +109,34 @@ jobs:
                   f.write(f"{k}<<__EOF__\n{v}\n__EOF__\n")
           PY
 
-      - name: Check Coupang keys presence (optional)
+      - name: Check Coupang keys
         shell: bash
         run: |
           if [ -n "$COUPANG_ACCESS_KEY" ] && [ -n "$COUPANG_SECRET_KEY" ]; then
             echo "[OK] Coupang keys are set."
           else
-            echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> using fallback (no API deep-links)"
+            echo "[WARN] COUPANG_ACCESS_KEY/SECRET_KEY empty -> fallback 모드"
           fi
 
-      # ---------- 1) 키워드 업데이트(최신화) ----------
-      - name: Update keywords (Naver Search + DataLab + Shopping)
+      - name: Update keywords (Naver DataLab)
         shell: bash
         env:
-          # 필요 시 골든 비율 조정
-          K_ALL: "50"
-          GOLD_ALL: "20"
+          K_ALL: ${{ env.K_ALL }}
+          GOLD_ALL: ${{ env.GOLD_ALL }}
         run: |
           if [ -f update_keywords.py ]; then
-            # 일반/쇼핑 각각 50개 수집, 골든 20개 선별 (필요 시 숫자 변경)
             python update_keywords.py \
-              --k $K_ALL --gold $GOLD_ALL \
-              --shop-k $K_ALL --shop-gold $GOLD_ALL \
+              --k "$K_ALL" --gold "$GOLD_ALL" \
+              --shop-k "$K_ALL" --shop-gold "$GOLD_ALL" \
               --days 7 --parallel 8 || true
           else
             echo "SKIP: update_keywords.py not found"
           fi
-
           echo "== golden_shopping_keywords.csv ==" && head -n 5 golden_shopping_keywords.csv || true
           echo "== keywords_shopping.csv ==" && head -n 5 keywords_shopping.csv || true
           echo "== keywords_general.csv ==" && head -n 5 keywords_general.csv || true
 
-      - name: Build products seed via Coupang API (optional)
+      - name: Build products seed (optional)
         shell: bash
         run: |
           if [ -f build_products_seed.py ]; then
@@ -157,8 +150,6 @@ jobs:
           else
             echo "SKIP: build_products_seed.py not found"
           fi
-
-          # 보조 생성(없을 때 헤더만)
           if [ ! -s "${PRODUCTS_SEED_CSV}" ]; then
             echo "product_name,raw_url,pros,cons,keyword,title,url,image" > "${PRODUCTS_SEED_CSV}"
           fi
@@ -169,8 +160,7 @@ jobs:
           mkdir -p .usage
           [ -f .usage/.gitkeep ] || touch .usage/.gitkeep
 
-      # ---------- 2) 일상글(autopost) 2개 예약 ----------
-      - name: Auto post (two posts)
+      - name: Post daily articles (general)
         shell: bash
         run: |
           if [ -f auto_wp_gpt.py ]; then
@@ -179,8 +169,7 @@ jobs:
             echo "SKIP: auto_wp_gpt.py not found"
           fi
 
-      # ---------- 3) 쿠팡글(affiliate) 3개 예약 ----------
-      - name: Affiliate posts (3 time slots in KST)
+      - name: Post affiliate articles (3 slots)
         shell: bash
         run: |
           set -o pipefail
@@ -193,14 +182,12 @@ jobs:
           else
             echo "SKIP: affiliate_post.py not found"
           fi
-
           echo "---- Affiliate tail ----"
           tail -n 200 /tmp/affiliate_out.txt || true
           echo "---- used_shopping tail ----"
           tail -n 50 .usage/used_shopping.txt || true
 
-      # ---------- 4) 키워드 회전 & 로그 커밋 ----------
-      - name: Commit rotated keywords & usage logs
+      - name: Commit rotated keywords & logs
         shell: bash
         run: |
           git config user.name  "github-actions[bot]"
