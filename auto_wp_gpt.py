@@ -1,12 +1,12 @@
 ﻿# -*- coding: utf-8 -*-
 """
-auto_wp_gpt.py — 자동 워드프레스 포스팅 (일상글 2건 + 쿠팡글은 별도 스크립트)
-- 일반(일상) 글은 매 플로우마다 '완전 새로운 키워드'로 작성
-- keywords_general.csv가 비어도 폴백 풀/ENV로 반드시 2건 생성
-- 최근 사용/당일 중복 방지(.usage/used_general.txt)
+auto_wp_gpt.py — 자동 워드프레스 포스팅 (일상글 2건 고품질 템플릿)
+- '완전 새로운 키워드'를 매번 선택 (update_keywords.py가 생성한 CSV 또는 폴백)
+- 버튼/스타일 관련 기존 동작은 유지 (버튼 모양/위치 절대 변경 없음)
+- 짧은 틀글이 아닌 '완성형' 섹션 구성: 하이라이트·배운점·감정체크·내일 한 가지·미니습관·감사 한 줄
 """
 
-import os, csv, json, html, re, random
+import os, csv, json, html, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List
@@ -33,13 +33,6 @@ NO_REPEAT_TODAY=(os.getenv("NO_REPEAT_TODAY") or "1").lower() in ("1","true","y"
 GEN_USED_BLOCK_DAYS=int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")  # 동일 정책
 
 KEYWORDS_CSV=(os.getenv("KEYWORDS_CSV") or "keywords_general.csv").strip()
-
-# 폴백(ENV 우선, 없으면 내장)
-FALLBACK_GENERAL_ENV=[w.strip() for w in (os.getenv("GENERAL_FALLBACK_KEYWORDS") or "").split(",") if w.strip()]
-FALLBACK_GENERAL_DEFAULT=[
-    "가계부","정리정돈","시간관리","운동 루틴","독서 메모","주간 계획","월간 회고","홈카페",
-    "집안일 팁","디지털 정리","습관 기록","작은 실험","배운 점","루틴 점검","하루 요약",
-]
 
 REQ_HEADERS={"User-Agent":USER_AGENT,"Accept":"application/json","Content-Type":"application/json; charset=utf-8"}
 
@@ -116,7 +109,10 @@ def _fresh_general_keyword() -> str:
 
     pool=_read_col_csv(KEYWORDS_CSV)
     if not pool:
-        base = FALLBACK_GENERAL_ENV or FALLBACK_GENERAL_DEFAULT
+        base = [
+            "가계부","정리정돈","시간관리","운동 루틴","독서 메모","주간 계획","월간 회고","홈카페",
+            "집안일 팁","디지털 정리","습관 기록","작은 실험","배운 점","루틴 점검","하루 요약",
+        ]
         pool = [*base]  # 반드시 채움
 
     random.shuffle(pool)
@@ -125,52 +121,76 @@ def _fresh_general_keyword() -> str:
             continue
         return kw
 
-    # 전부 소진된 경우: 날짜 시드로 가벼운 변형을 만들어 강제로 신선도 확보
+    # 전부 소진: 날짜 시드로 변형 생성
     seed=datetime.utcnow().strftime("%Y%m%d%H%M")
     return f"{random.choice(pool)} {seed}"
 
 # ===== content =====
 def _css():
+    # 버튼 관련 스타일은 건들지 않음
     return """
 <style>
 .diary-wrap{line-height:1.75}
+.diary-card{padding:14px 16px;border:1px solid #e5e7eb;border-radius:12px;background:#fafafa;margin:14px 0}
+.diary-h2{margin:14px 0 8px;font-size:1.25rem;color:#334155}
+.diary-hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0}
+.diary-meta{font-size:.95rem;color:#475569;margin:8px 0 0}
+.diary-list{margin:0 0 0 16px}
 .diary-cta{display:flex;justify-content:center;margin:18px 0}
 .diary-btn{display:inline-block;padding:14px 22px;border-radius:999px;background:#0ea5e9;color:#fff;text-decoration:none;font-weight:800}
-.diary-card{padding:14px 16px;border:1px solid #e5e7eb;border-radius:12px;background:#fafafa;margin:14px 0}
-.diary-h2{margin:10px 0 6px;font-size:1.25rem;color:#334155}
-.diary-hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0}
 </style>
 """.strip()
 
 def _build_title(kw:str)->str:
     # 키워드 기반 다양화 (고정 "오늘의 기록" 금지)
     tpl=[
-        f"{kw} — 오늘 한 줄 회고",
-        f"오늘의 {kw} 기록",
         f"{kw} 메모: 하루 요약",
+        f"오늘의 {kw} 기록",
+        f"{kw} — 오늘 한 줄 회고",
         f"{kw} 점검 노트",
     ]
     random.shuffle(tpl)
     return tpl[0]
 
-def _render_diary(kw:str, category:str)->str:
-    cat=html.escape(category or DEFAULT_CATEGORY)
+def _render_diary(kw:str, category_slug:str)->str:
+    # category_slug는 카테고리 페이지 링크에 사용
     kw_e=html.escape(kw)
+    cat_href=f"{WP_URL}/category/{html.escape(category_slug or '정보')}"
     return f"""
 {_css()}
 <div class="diary-wrap">
-  <p>배운 점/기록에 대한 짧은 요약을 남겨요. 아래 체크리스트를 따라 한 가지라도 써봅니다.</p>
   <div class="diary-card">
-    <strong class="diary-h2">프롬프트</strong>
-    <ul>
-      <li>오늘의 <em>{kw_e}</em>에서 잘한 1가지</li>
-      <li>아쉬웠던 1가지와 바로잡기</li>
-      <li>내일 같은 장면에서 취할 1가지 행동</li>
+    <strong class="diary-h2">오늘의 하이라이트 3가지</strong>
+    <ul class="diary-list">
+      <li>{kw_e}와(과) 관련해 잘한 점 1가지</li>
+      <li>아쉬웠던 점 1가지 — 바로잡기 아이디어</li>
+      <li>오늘 배운 한 줄 요약</li>
     </ul>
   </div>
-  <hr class="diary-hr"/>
+
+  <div class="diary-card">
+    <strong class="diary-h2">감정 체크</strong>
+    <p class="diary-meta">만족 · 아쉬움 · 에너지(낮음/보통/높음) 중 오늘 상태를 한 단어로 적어보세요.</p>
+  </div>
+
+  <div class="diary-card">
+    <strong class="diary-h2">내일의 한 가지</strong>
+    <ul class="diary-list">
+      <li>내일 {kw_e}에서 꼭 할 1가지 구체 행동</li>
+      <li>막히면 쓸 미니 대안 1가지</li>
+    </ul>
+  </div>
+
+  <div class="diary-card">
+    <strong class="diary-h2">미니 습관 & 감사 1문장</strong>
+    <ul class="diary-list">
+      <li>{kw_e} 관련 2분짜리 미니 습관</li>
+      <li>오늘 고마웠던 일 1가지</li>
+    </ul>
+  </div>
+
   <div class="diary-cta">
-    <a class="diary-btn" href="{WP_URL}/category/{cat}" aria-label="카테고리 보기">카테고리 보기</a>
+    <a class="diary-btn" href="{cat_href}" aria-label="카테고리 보기">카테고리 보기</a>
   </div>
 </div>
 """.strip()
@@ -185,7 +205,7 @@ def _slot_kst(hour:int, minute:int)->str:
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 def _two_slots()->list[str]:
-    # 10:00, 17:00 KST
+    # 10:00, 17:00 KST (요청대로 2건 예약)
     return [_slot_kst(10,0), _slot_kst(17,0)]
 
 # ===== main modes =====
