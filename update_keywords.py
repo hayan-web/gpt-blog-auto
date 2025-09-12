@@ -1,26 +1,43 @@
 # -*- coding: utf-8 -*-
 """
 update_keywords.py — 매 실행 '완전 새 키워드' 생성 + 밴/중복 제거 + 골든 선별 보장
-- 항상 기존 CSV를 백업(.bak-타임스탬프)하고 새로 작성
-- NAVER API 실패 시에도 폴백 제너레이터로 K개/Gold개 보장
-- BAN_KEYWORDS, .usage/ban_keywords_shopping.txt, used_* 로그를 반영
-- build_products_seed용 keywords.csv까지 생성(비어서 스킵되는 문제 차단)
+- 기존 CSV 백업(.bak-타임스탬프) 후 새로 작성
+- NAVER 실패 여부와 무관하게 폴백 제너레이터로 K개/Gold개 보장
+- BAN_KEYWORDS, .usage/ban_keywords_shopping.txt, used_* 로그 반영
+- build_products_seed용 keywords.csv까지 생성
+- CI 인자(--k/--gold/--shop-k/--shop-gold 등)도 받아들이도록 호환 처리
 """
 
-import os, csv, re, time, random, json
+import os, csv, time, random
 from datetime import datetime, timedelta
+import argparse
 
-# ===== env =====
-K_ALL   = int(os.getenv("K_ALL") or os.getenv("KEYWORDS_K") or "50")
-GOLD_ALL= int(os.getenv("GOLD_ALL") or "20")
+# ===== env + cli =====
+def _envflag(v: str|None, default=True)->bool:
+    if v is None: return default
+    return str(v).lower() in ("1","true","y","yes","on")
+
+def _parse_cli():
+    ap=argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--k", type=int)
+    ap.add_argument("--gold", type=int)
+    ap.add_argument("--shop-k", type=int)
+    ap.add_argument("--shop-gold", type=int)
+    ap.add_argument("--days", type=int)
+    # 불명 인자는 무시
+    args, _ = ap.parse_known_args()
+    return args
+
+_args=_parse_cli()
+
+K_ALL   = _args.k or int(os.getenv("K_ALL") or os.getenv("KEYWORDS_K") or "50")
+GOLD_ALL= _args.gold or int(os.getenv("GOLD_ALL") or "20")
+
 USAGE_DIR = os.getenv("USAGE_DIR") or ".usage"
-CACHE_DIR = os.getenv("CACHE_DIR") or ".cache"
+BACKUP_OLD = _envflag(os.getenv("BACKUP_OLD_KEYWORDS"), True)
 
 BAN_FROM_ENV = [s.strip() for s in (os.getenv("BAN_KEYWORDS") or "").split(",") if s.strip()]
 BAN_FILE = os.path.join(USAGE_DIR, "ban_keywords_shopping.txt")
-
-USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-keywords/1.3"
-BACKUP_OLD = (os.getenv("BACKUP_OLD_KEYWORDS") or "1").lower() in ("1","true","yes","on")
 
 # ===== paths =====
 P_GENERAL = "keywords_general.csv"
@@ -44,7 +61,7 @@ def _write_col(path:str, items:list[str]):
         w = csv.writer(f)
         w.writerow(["keyword"])
         for x in items:
-            w.writerow([x])
+            if x: w.writerow([x])
 
 def _read_used(path:str, days:int=365)->set[str]:
     used=set()
@@ -71,7 +88,7 @@ def _load_bans()->list[str]:
         for ln in open(BAN_FILE,"r",encoding="utf-8",errors="ignore"):
             ln=ln.strip()
             if ln: bans.add(ln)
-    # 하위어까지 포괄(부분문자열 매칭)
+    # 부분문자열 매칭을 위해 길이 긴 것부터
     return sorted(bans, key=len, reverse=True)
 
 def _ban_or_used(s:str, bans:list[str], used:set[str])->bool:
@@ -95,16 +112,16 @@ def _shuffle_daily(seq:list[str], salt:str="")->list[str]:
 
 # ===== fallback pools =====
 GENERAL_BASE = [
-    "가계부", "정리정돈", "주간 계획", "미니멀 라이프", "홈카페", "아침 루틴", "운동 기록",
-    "독서 메모", "식단 관리", "취미 일기", "프로젝트 회고", "배운 점 기록", "작은 습관",
-    "집안일 체크리스트", "시간 관리 팁", "스터디 노트", "여행 계획", "쇼핑 리스트",
-    "월간 점검", "작심삼일 탈출", "작업 공간 꾸미기", "디지털 디톡스", "마음챙김",
+    "가계부","정리정돈","주간 계획","미니멀 라이프","홈카페","아침 루틴","운동 기록",
+    "독서 메모","식단 관리","취미 일기","프로젝트 회고","배운 점 기록","작은 습관",
+    "집안일 체크리스트","시간 관리 팁","스터디 노트","여행 계획","쇼핑 리스트",
+    "월간 점검","작업 공간 꾸미기","디지털 디톡스","마음챙김",
 ]
 
 SHOP_CATEGORIES = [
-    "히터","전기요","전기장판","보조배터리","무선 청소기","전기포트","제습기","가습기 필터",
+    "히터","전기요","전기장판","보조배터리","무선 청소기","전기포트","제습기",
     "물걸레 청소기","탁상 조명","가열식 가습기","초음파 가습기","니트","가디건","스웨터",
-    "멀티탭","충전기","선정리", "서랍 정리함", "텀블러", "보온병"
+    "멀티탭","충전기","선정리","서랍 정리함","텀블러","보온병"
 ]
 SHOP_MODS = ["미니","컴팩트","저전력","저소음","가성비","프리미엄","USB","무선","스탠드","휴대용","대용량"]
 
@@ -115,10 +132,8 @@ def _generate_general(k:int, bans:list[str], used:set[str])->list[str]:
         if not _ban_or_used(x,bans,used):
             out.append(x)
         if len(out)>=k: break
-    # 부족 시 변형 생성
     i=1
     while len(out)<k:
-        seed = f"{_ts()}-{i}"
         cand = f"{random.choice(GENERAL_BASE)} {random.choice(['메모','정리','팁','노트','기록'])} {i}"
         if not _ban_or_used(cand,bans,used):
             out.append(cand)
@@ -134,7 +149,6 @@ def _generate_shopping(k:int, bans:list[str], used:set[str])->list[str]:
         if not _ban_or_used(x,bans,used):
             out.append(x)
         if len(out)>=k: break
-    # 부족하면 무조건 채우기(밴 회피된 조합 생성)
     i=1
     while len(out)<k:
         cand = f"{random.choice(SHOP_MODS)} {random.choice(SHOP_CATEGORIES)} {i}"
@@ -144,7 +158,6 @@ def _generate_shopping(k:int, bans:list[str], used:set[str])->list[str]:
     return out
 
 def _select_golden(pool:list[str], gold:int)->list[str]:
-    # 길이/다양성 가중 + 일자 섞기
     scored = []
     for s in pool:
         score = len(s) + (3 if " " in s else 0)
@@ -166,8 +179,8 @@ def main():
     for p in (P_GENERAL,P_SHOP,P_GOLD,P_ALL):
         _backup(p)
 
-    # 네이버 API는 실패해도 즉시 폴백으로 채우는 구조(안전성 우선)
-    gen = _generate_general(K_ALL, bans, used_g)
+    # NAVER 실패 여부와 무관하게 폴백 제너레이터로 즉시 채우는 구조(안전성 우선)
+    gen  = _generate_general(K_ALL, bans, used_g)
     shop = _generate_shopping(K_ALL, bans, used_s)
     gold = _select_golden(shop, GOLD_ALL)
 
