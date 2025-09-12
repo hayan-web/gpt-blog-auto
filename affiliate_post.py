@@ -13,14 +13,33 @@ from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
 # ===== optional rich templates =====
-HAVE_RICH = False
-try:
-    from rich_templates import build_affiliate_content  # 새 파일
-    HAVE_RICH = True
-except Exception:
-    HAVE_RICH = False
+button_html = _button_html(url, BUTTON_PRIMARY)  # 버튼 모양/위치 유지
 
-load_dotenv()
+if HAVE_RICH:
+    # 확보된 값이 없으면 빈 리스트 그대로 둬도 됨(템플릿이 폴백 문장 생성)
+    prod = {
+        "title": keyword,
+        "features": features if 'features' in locals() else [],
+        "pros":     pros if 'pros' in locals() else [],
+        "cons":     cons if 'cons' in locals() else [],
+        "tips":     tips if 'tips' in locals() else [],
+        "criteria": [
+            ["성능","공간/목적 대비 충분한지","과투자 방지"],
+            ["관리","세척·보관·소모품","난도/주기"],
+            ["비용","구매가 + 유지비","시즌 특가"],
+        ],
+        "specs": specs if 'specs' in locals() else [],
+        "faqs":  faqs if 'faqs' in locals() else [],
+    }
+
+    content_html = build_affiliate_content(
+        product=prod,
+        button_html=button_html,                 # ★ 버튼 그대로 삽입
+        disclosure_text=None,                    # 상단에 이미 고지문 있으면 None 유지
+        min_chars=int(os.getenv("MIN_AFFILIATE_CHARS", "1500")),  # ★ 길이 보장
+    )
+else:
+    content_html = render_affiliate_html(keyword, url)  # 기존 백업 경로
 
 # ===== ENV =====
 WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
