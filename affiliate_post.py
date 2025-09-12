@@ -3,7 +3,7 @@
 affiliate_post.py — Coupang Partners 자동 포스팅 (단일 CTA 버튼)
 - 상단 고지문 + 상단 광고(있을 때만)
 - 본문: H2(부제목) → 요약(짧게) → H3 섹션(구분선 <hr> 포함, 표 1개 이상) → 중간 광고(있을 때만) → 결론/추천
-- CTA: '제품 보기' 버튼 **1개만**, 상/하에 배치, **가운데 정렬**
+- CTA: '제품 보기' 버튼 1개만, 상/하에 배치, 정확히 가운데 정렬(테마 영향 무시)
 - 광고: AD_SHORTCODE 값이 있을 때만 그대로 삽입(스크립트 포함)
 """
 
@@ -13,15 +13,14 @@ from zoneinfo import ZoneInfo
 from typing import List, Tuple
 import requests
 from dotenv import load_dotenv
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote_plus
 
 load_dotenv()
 
 try:
-    from openai import OpenAI, BadRequestError
+    from openai import OpenAI
 except Exception:
     OpenAI = None
-    BadRequestError = Exception
 
 # ====== ENV / WP ======
 WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
@@ -62,7 +61,6 @@ _oai = OpenAI(api_key=_OPENAI_API_KEY) if (_OPENAI_API_KEY and OpenAI) else None
 
 AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "22"))
 AFF_TITLE_MAX = int(os.getenv("AFF_TITLE_MAX", "42"))
-AFF_TITLE_MODE = (os.getenv("AFF_TITLE_MODE") or "story-then-template").lower()
 AFF_BANNED_PHRASES = ("사용기","리뷰","후기","광고","테스트","예약됨","최저가","역대급","무조건","필구","대박")
 
 # ====== 광고 블록 ======
@@ -322,38 +320,53 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
     r.raise_for_status(); return r.json()
 
-# ====== 스타일/CSS & 컴포넌트 ======
+# ====== 스타일/CSS & 단일 버튼 컴포넌트 ======
 def _css_block()->str:
     return """
 <style>
+/* 공통 */
 .aff-wrap{font-family:inherit;line-height:1.65}
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #334155;background:#f1f5f9;color:#0f172a;border-radius:12px;font-size:.96rem}
 .aff-disclosure strong{color:#0f172a}
-
 .aff-sub{margin:10px 0 6px;font-size:1.2rem;color:#334155}
 .aff-hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0}
 
-.aff-cta{display:block;text-align:center;margin:18px auto}
-.aff-cta .btn-primary{display:inline-block;padding:14px 22px;border-radius:999px;text-decoration:none;font-weight:700;min-width:220px;background:#0ea5e9;color:#fff}
-.aff-cta .btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(0,0,0,.12)}
-@media (max-width:540px){.aff-cta .btn-primary{width:100%}}
+/* 🎯 단일 CTA 버튼: 정확히 가운데 + 크게 (테마 영향 무시) */
+.aff-cta-row{
+  display:flex !important; align-items:center !important; justify-content:center !important;
+  gap:14px; width:100%; margin:24px auto 18px; text-align:center !important;
+}
+.aff-btn{
+  display:inline-flex !important; align-items:center; justify-content:center;
+  padding:18px 30px; font-size:1.12rem; line-height:1;
+  min-width:300px; border-radius:9999px;
+  text-decoration:none; font-weight:800; box-sizing:border-box;
+  float:none !important; /* 일부 테마의 좌측 부유 제거 */
+}
+.aff-btn--primary{background:#0ea5e9; color:#fff}
+.aff-btn:hover{transform:translateY(-1px); box-shadow:0 8px 20px rgba(0,0,0,.12)}
+@media (max-width:540px){.aff-btn{width:100%; min-width:0}}
 
+/* 표 */
 .aff-table{width:100%;border-collapse:collapse;margin:8px 0 14px}
 .aff-table th,.aff-table td{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}
 .aff-table thead th{background:#f8fafc}
+
+/* 헤딩 여백 */
 .aff-wrap h2{margin:18px 0 6px}
 .aff-wrap h3{margin:16px 0 6px}
 </style>
-"""
-
-def _cta_single(url_main:str, label:str)->str:
-    u1=html.escape(url_main or "#")
-    l1=html.escape(label or "제품 보기")
-    return f"""
-<div class="aff-cta">
-  <a class="btn-primary" href="{u1}" target="_blank" rel="nofollow sponsored noopener" aria-label="{l1}">{l1}</a>
-</div>
 """.strip()
+
+def _cta_single(url:str, label:str)->str:
+    u=html.escape(url or "#")
+    l=html.escape(label or "제품 보기")
+    return (
+        f'<div class="aff-cta-row">'
+        f'  <a class="aff-btn aff-btn--primary" href="{u}" '
+        f'     target="_blank" rel="nofollow sponsored noopener" aria-label="{l}">{l}</a>'
+        f'</div>'
+    )
 
 # ====== 본문 렌더 ======
 def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str="쇼핑")->str:
@@ -368,7 +381,7 @@ def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str=
     )
 
     # 가격/가성비 표(3x3)
-    table_html=f"""
+    table_html="""
 <table class="aff-table">
   <thead><tr><th>항목</th><th>확인 포인트</th><th>비고</th></tr></thead>
   <tbody>
