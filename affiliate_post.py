@@ -257,19 +257,27 @@ def _consume_col_csv(path:str, kw:str)->bool:
     return True
 
 # ====== 키워드 선택 / URL ======
-def pick_affiliate_keyword()->str:
-    used_today=_load_used_set(1) if NO_REPEAT_TODAY else set()
-    used_block=_load_used_set(AFF_USED_BLOCK_DAYS)
-    gold=_read_col_csv("golden_shopping_keywords.csv")
-    shop=_read_col_csv("keywords_shopping.csv")
-    pool=[k for k in gold+shop if k and (k not in used_block)]
-    if NO_REPEAT_TODAY:
-        pool=[k for k in pool if k not in used_today]
-    recent=set(_read_recent_used(8))
-    pool=[k for k in pool if k not in recent]
-    if pool: return pool[0].strip()
-    fb=[x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
-    return fb[0] if fb else "미니 선풍기"
+def pick_affiliate_keyword() -> str:
+    used_today = _load_used_set(1) if NO_REPEAT_TODAY else set()
+    used_block = _load_used_set(AFF_USED_BLOCK_DAYS)
+    recent = set(_read_recent_used(12))
+
+    def _clean(seq):
+        return [k for k in seq
+                if k and k not in used_block
+                and (not NO_REPEAT_TODAY or k not in used_today)
+                and k not in recent]
+
+    gold = _clean(_read_col_csv("golden_shopping_keywords.csv"))
+    shop = _clean(_read_col_csv("keywords_shopping.csv"))
+    pool = gold + shop
+    if pool:
+        return pool[0].strip()
+
+    # ★ fallback도 동일한 필터를 적용
+    fb_raw = [x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
+    fb = _clean(fb_raw)
+    return fb[0] if fb else ""   # 없으면 빈 문자열 반환 → 슬롯 스킵
 
 def resolve_product_url(keyword:str)->str:
     if os.path.exists(PRODUCTS_SEED_CSV):
@@ -462,6 +470,10 @@ def rotate_sources(kw:str):
 def run_once():
     print(f"[USAGE] NO_REPEAT_TODAY={NO_REPEAT_TODAY}, AFF_USED_BLOCK_DAYS={AFF_USED_BLOCK_DAYS}")
     kw = pick_affiliate_keyword()
+    if not kw:
+        print("[AFFILIATE] SKIP: no fresh keyword (pool & fallback exhausted)")
+        return
+
     url = resolve_product_url(kw)
     when_gmt = _slot_affiliate()
     title = build_title(kw)
