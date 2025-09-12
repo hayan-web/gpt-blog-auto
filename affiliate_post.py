@@ -1,28 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-affiliate_post.py — Coupang Partners 자동 포스팅 (단일 CTA 버튼)
-- 상단 고지문 + 상단 광고(있을 때만)
-- 본문: H2(부제목) → 요약(짧게) → H3 섹션(구분선 <hr> 포함, 표 1개 이상) → 중간 광고(있을 때만) → 결론/추천
-- CTA: '제품 보기' 버튼 1개만, 상/하에 배치, 정확히 가운데 정렬(테마 영향 무시)
-- 광고: AD_SHORTCODE 값이 있을 때만 그대로 삽입(스크립트 포함)
+affiliate_post.py — Coupang Partners 자동 포스팅(단일 '제품 보기' 버튼, 스킵 금지)
+- 키워드: 풀 비어도 절대 스킵하지 않고 폴백/변형으로 1개 확보
+- 밴: .usage/ban_keywords_shopping.txt + BAN_KEYWORDS 동시 적용(부분문자열 매칭)
+- 사용한 키워드는 즉시 회전 & used_shopping.txt 기록
 """
-
-import os, re, csv, json, html, random
+import os, re, csv, json, html, random, requests
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List, Tuple
-import requests
-from dotenv import load_dotenv
 from urllib.parse import quote_plus
-
+from dotenv import load_dotenv
 load_dotenv()
 
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-# ====== ENV / WP ======
+# ===== ENV =====
 WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
 WP_USER=os.getenv("WP_USER") or ""
 WP_APP_PASSWORD=os.getenv("WP_APP_PASSWORD") or ""
@@ -30,12 +21,9 @@ WP_TLS_VERIFY=(os.getenv("WP_TLS_VERIFY") or "true").lower()!="false"
 POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()
 
 DEFAULT_CATEGORY=(os.getenv("AFFILIATE_CATEGORY") or "쇼핑").strip() or "쇼핑"
-DEFAULT_TAGS=(os.getenv("AFFILIATE_TAGS") or "").strip()
 DISCLOSURE_TEXT=(os.getenv("DISCLOSURE_TEXT") or "이 포스팅은 쿠팡 파트너스 활동의 일환으로, 이에 따른 일정액의 수수료를 제공합니다.").strip()
 
-# 버튼 라벨 (기본: '제품 보기')
 BUTTON_PRIMARY=(os.getenv("BUTTON_TEXT") or "제품 보기").strip()
-
 USE_IMAGE=((os.getenv("USE_IMAGE") or "").strip().lower() in ("1","true","y","yes","on"))
 AFFILIATE_TIME_KST=(os.getenv("AFFILIATE_TIME_KST") or "13:00").strip()
 
@@ -47,192 +35,58 @@ NO_REPEAT_TODAY=(os.getenv("NO_REPEAT_TODAY") or "1").lower() in ("1","true","y"
 AFF_USED_BLOCK_DAYS=int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")
 
 PRODUCTS_SEED_CSV=(os.getenv("PRODUCTS_SEED_CSV") or "products_seed.csv")
+BAN_FROM_ENV=[s.strip() for s in (os.getenv("BAN_KEYWORDS") or "").split(",") if s.strip()]
+AFF_FALLBACK=[s.strip() for s in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if s.strip()]
 
-REQ_HEADERS={
-    "User-Agent": USER_AGENT,
-    "Accept": "application/json",
-    "Content-Type": "application/json; charset=utf-8",
-}
+REQ_HEADERS={"User-Agent":USER_AGENT,"Accept":"application/json","Content-Type":"application/json; charset=utf-8"}
 
-# ====== OpenAI (제목·문장 톤 보강, 없어도 동작) ======
-_OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-_OPENAI_MODEL = (os.getenv("OPENAI_MODEL_LONG") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini")
-_oai = OpenAI(api_key=_OPENAI_API_KEY) if (_OPENAI_API_KEY and OpenAI) else None
-
-AFF_TITLE_MIN = int(os.getenv("AFF_TITLE_MIN", "22"))
-AFF_TITLE_MAX = int(os.getenv("AFF_TITLE_MAX", "42"))
-AFF_BANNED_PHRASES = ("사용기","리뷰","후기","광고","테스트","예약됨","최저가","역대급","무조건","필구","대박")
-
-# ====== 광고 블록 ======
-def _adsense_block()->str:
-    sc = (os.getenv("AD_SHORTCODE") or "").strip()
-    if not sc:
-        return ""
-    return f'<div class="ads-wrap" style="margin:16px 0">{sc}</div>'
-
-# ====== 유틸 ======
-def _normalize_title(s:str)->str:
-    s=(s or "").strip()
-    s=html.unescape(s)
-    s=s.replace("“","").replace("”","").replace("‘","").replace("’","").strip('"\' ')
-    s=re.sub(r"\s+"," ",s)
-    return s
-
-def _sanitize_title_text(s:str)->str:
-    s=_normalize_title(s)
-    for ban in AFF_BANNED_PHRASES:
-        s=s.replace(ban,"")
-    s=re.sub(r"\s+"," ",s).strip(" ,.-·")
-    return s
-
-def _bad_aff_title(t:str)->bool:
-    if not t: return True
-    if not (AFF_TITLE_MIN <= len(t) <= AFF_TITLE_MAX): return True
-    if any(p in t for p in AFF_BANNED_PHRASES): return True
-    return False
-
-def _has_jong(ch:str)->bool:
-    code=ord(ch)-0xAC00
-    return 0<=code<=11171 and (code%28)!=0
-
-def _josa(word:str, pair=("이","가"))->str:
-    return pair[0] if word and _has_jong(word[-1]) else pair[1]
-
-# 핵심 키워드 추출(간단)
-_CATS=["니트","스웨터","가디건","가습기","전기포트","선풍기","청소기","보조배터리","제습기","히터"]
-def _compress_keyword(keyword:str)->Tuple[str,str]:
-    toks=[t for t in re.sub(r"[^\w가-힣\s]"," ",keyword).split() if t]
-    cat=None
-    for c in _CATS:
-        if c in keyword: cat=c; break
-    core = cat or "아이템"
-    return core," ".join(toks)
-
-# ====== 제목 생성 ======
-def _aff_title_from_story(keyword:str)->str:
-    core,_=_compress_keyword(keyword)
-    seed=abs(hash(f"story|{core}|{keyword}|{datetime.utcnow().date()}"))%(2**32)
-    rnd=random.Random(seed)
-    subject = f"{core}{_josa(core,('은','는'))}"
-    pool=[
-        f"요즘 {subject} 확실히 편해졌어요, 돌려보면 차이가 나요",
-        f"아침마다 {subject} 손이 자꾸 가요, 써보면 이유를 알게 돼요",
-        f"{subject} 홈카페가 쉬워졌어요, 그래서 계속 쓰게 돼요",
-        f"한 번 써보면 {subject} 왜 편한지 알게 돼요"
-    ]
-    rnd.shuffle(pool)
-    for cand in pool:
-        cand=_sanitize_title_text(cand)
-        if not _bad_aff_title(cand):
-            return cand
-    return ""
-
-def _aff_title_from_llm(core:str, kw:str)->str:
-    if not _oai: return ""
-    try:
-        r=_oai.chat.completions.create(
-            model=_OPENAI_MODEL,
-            temperature=0.8,
-            max_tokens=60,
-            messages=[
-                {"role":"system","content":"너는 한국어 카피라이터다. 과장/낚시 없이 모바일 친화 한 줄 제목만 출력."},
-                {"role":"user","content":f"핵심:{core}\n원문:{kw}\n길이:{AFF_TITLE_MIN}~{AFF_TITLE_MAX}자, 과장·금지어 배제, 자연어 한 줄"}
-            ]
-        )
-        cand=_sanitize_title_text(r.choices[0].message.content or "")
-        return "" if _bad_aff_title(cand) else cand
-    except Exception:
-        return ""
-
-TEMPLATES=["{core} 이렇게 쓰니 편해요","지금 딱 {core}","한 번 쓰면 계속 찾는 {core}","가볍게 챙기는 {core}"]
-def _aff_title_from_templates(core:str, kw:str)->str:
-    for tpl in TEMPLATES:
-        cand=_sanitize_title_text(tpl.format(core=core))
-        if not _bad_aff_title(cand): return cand
-    return _sanitize_title_text(core)
-
-def build_title(keyword:str)->str:
-    core,_=_compress_keyword(keyword)
-    for fn in (_aff_title_from_story, lambda k:_aff_title_from_llm(core,k), lambda k:_aff_title_from_templates(core,k)):
-        t=fn(keyword)
-        if t: return t[:AFF_TITLE_MAX]
-    return _sanitize_title_text(keyword)[:AFF_TITLE_MAX]
-
-# ====== 슬롯 ======
-def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
-
-def _wp_future_exists_around(when_gmt_dt:datetime, tol_min:int=2)->bool:
-    url=f"{WP_URL}/wp-json/wp/v2/posts"
-    try:
-        r=requests.get(url, params={"status":"future","per_page":100,"orderby":"date","order":"asc","context":"edit"},
-                       headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
-        r.raise_for_status()
-        items=r.json()
-    except Exception:
-        return False
-    tgt=when_gmt_dt.astimezone(timezone.utc)
-    win=timedelta(minutes=max(1,int(tol_min)))
-    lo,hi=tgt-win,tgt+win
-    for it in items:
-        d=(it.get("date_gmt") or "").strip()
-        if not d: continue
-        try:
-            dt=datetime.fromisoformat(d.replace("Z","+00:00"))
-            dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
-        except Exception:
-            continue
-        if lo<=dt<=hi: return True
-    return False
-
-def _slot_affiliate()->str:
-    hh,mm=[int(x) for x in (AFFILIATE_TIME_KST.split(":")+["0"])[:2]]
-    now=_now_kst()
-    tgt=now.replace(hour=hh,minute=mm,second=0,microsecond=0)
-    if tgt<=now: tgt+=timedelta(days=1)
-    for _ in range(7):
-        utc=tgt.astimezone(timezone.utc)
-        if _wp_future_exists_around(utc,2):
-            tgt+=timedelta(days=1); continue
-        break
-    return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-
-# ====== 사용 로그 ======
-def _ensure_usage_dir(): os.makedirs(USAGE_DIR,exist_ok=True)
-
-def _load_used_set(days:int=30)->set:
-    _ensure_usage_dir()
-    if not os.path.exists(USED_FILE): return set()
-    cutoff=datetime.utcnow().date()-timedelta(days=days)
-    used=set()
-    with open(USED_FILE,"r",encoding="utf-8",errors="ignore") as f:
-        for line in f:
-            line=line.strip()
-            if not line: continue
-            try:
-                d_str,kw=line.split("\t",1)
-                if datetime.strptime(d_str,"%Y-%m-%d").date()>=cutoff:
-                    used.add(kw.strip())
-            except Exception:
-                used.add(line)
-    return used
+# ===== ban / used =====
+BAN_FILE=os.path.join(USAGE_DIR,"ban_keywords_shopping.txt")
+def _load_bans():
+    bans=set(BAN_FROM_ENV)
+    if os.path.exists(BAN_FILE):
+        for ln in open(BAN_FILE,"r",encoding="utf-8",errors="ignore"):
+            ln=ln.strip()
+            if ln: bans.add(ln)
+    return sorted(bans, key=len, reverse=True)
 
 def _read_recent_used(n:int=8)->list[str]:
-    try:
-        p=os.path.join(USAGE_DIR,"used_shopping.txt")
-        if not os.path.exists(p): return []
-        lines=[ln.strip() for ln in open(p,"r",encoding="utf-8").read().splitlines() if ln.strip()]
-        body=[ln.split("\t",1)[1] if "\t" in ln else ln for ln in lines]
-        return list(reversed(body[-n:]))
-    except Exception:
-        return []
+    p=USED_FILE
+    if not os.path.exists(p): return []
+    lines=[ln.strip() for ln in open(p,"r",encoding="utf-8").read().splitlines() if ln.strip()]
+    body=[ln.split("\t",1)[1] if "\t" in ln else ln for ln in lines]
+    return list(reversed(body[-n:]))
+
+def _load_used(days:int=365)->set[str]:
+    used=set()
+    if not os.path.exists(USED_FILE): return used
+    cutoff=datetime.utcnow().date()-timedelta(days=days)
+    with open(USED_FILE,"r",encoding="utf-8",errors="ignore") as f:
+        for ln in f:
+            ln=ln.strip()
+            if not ln: continue
+            if "\t" in ln:
+                d,k=ln.split("\t",1)
+                try:
+                    if datetime.strptime(d,"%Y-%m-%d").date()>=cutoff:
+                        used.add(k.strip())
+                except:
+                    used.add(k.strip())
+            else:
+                used.add(ln)
+    return used
 
 def _mark_used(kw:str):
-    _ensure_usage_dir()
+    os.makedirs(USAGE_DIR,exist_ok=True)
     with open(USED_FILE,"a",encoding="utf-8") as f:
         f.write(f"{datetime.utcnow().date():%Y-%m-%d}\t{kw.strip()}\n")
 
-# ====== CSV ======
-def _read_col_csv(path:str)->List[str]:
+def _banned_or_used(kw:str, bans:list[str], used:set[str])->bool:
+    if kw in used: return True
+    return any(b and b in kw for b in bans)
+
+# ===== csv utils =====
+def _read_col(path:str)->list[str]:
     if not os.path.exists(path): return []
     out=[]
     with open(path,"r",encoding="utf-8",newline="") as f:
@@ -243,7 +97,7 @@ def _read_col_csv(path:str)->List[str]:
             if row[0].strip(): out.append(row[0].strip())
     return out
 
-def _consume_col_csv(path:str, kw:str)->bool:
+def _consume_col(path:str, kw:str)->bool:
     if not os.path.exists(path): return False
     rows=list(csv.reader(open(path,"r",encoding="utf-8",newline="")))
     if not rows: return False
@@ -256,45 +110,66 @@ def _consume_col_csv(path:str, kw:str)->bool:
     csv.writer(open(path,"w",encoding="utf-8",newline="")).writerows(new_rows)
     return True
 
-# ====== 키워드 선택 / URL ======
-def pick_affiliate_keyword() -> str:
-    used_today = _load_used_set(1) if NO_REPEAT_TODAY else set()
-    used_block = _load_used_set(AFF_USED_BLOCK_DAYS)
-    recent = set(_read_recent_used(12))
+# ===== picker =====
+def _variants(base:str)->list[str]:
+    mods=["미니","컴팩트","저전력","저소음","가성비","프리미엄","USB","무선","휴대용","대용량"]
+    out=[f"{m} {base}" for m in mods] + [base]
+    return out
 
-    def _clean(seq):
-        return [k for k in seq
-                if k and k not in used_block
-                and (not NO_REPEAT_TODAY or k not in used_today)
-                and k not in recent]
+def pick_affiliate_keyword()->str:
+    bans=_load_bans()
+    used_today=_load_used(1) if NO_REPEAT_TODAY else set()
+    used_block=_load_used(AFF_USED_BLOCK_DAYS)
+    recent=set(_read_recent_used(8))
 
-    gold = _clean(_read_col_csv("golden_shopping_keywords.csv"))
-    shop = _clean(_read_col_csv("keywords_shopping.csv"))
-    pool = gold + shop
+    gold=_read_col("golden_shopping_keywords.csv")
+    shop=_read_col("keywords_shopping.csv")
+
+    pool=[]
+    for k in gold+shop:
+        if not k: continue
+        if _banned_or_used(k,bans,used_block): continue
+        if NO_REPEAT_TODAY and k in used_today: continue
+        if k in recent: continue
+        pool.append(k)
+
     if pool:
-        return pool[0].strip()
+        return pool[0]
 
-    # ★ fallback도 동일한 필터를 적용
-    fb_raw = [x.strip() for x in (os.getenv("AFF_FALLBACK_KEYWORDS") or "").split(",") if x.strip()]
-    fb = _clean(fb_raw)
-    return fb[0] if fb else ""   # 없으면 빈 문자열 반환 → 슬롯 스킵
+    # 폴백에서도 무조건 하나 만든다
+    bases = [b for b in AFF_FALLBACK if b and not any(ban in b for ban in bans)]
+    if not bases:  # 안전한 내장 폴백
+        bases = ["히터","제습기","보조배터리","무선 청소기","전기포트"]
 
+    for b in bases:
+        for cand in _variants(b):
+            if not _banned_or_used(cand,bans,used_block|used_today|recent):
+                return cand
+
+    # 마지막 보호 — 그래도 없으면 금지어를 회피하는 임의 조합 생성
+    i=1
+    while True:
+        cand = f"저전력 {random.choice(bases)} {i}"
+        if not _banned_or_used(cand,bans,used_block|used_today|recent):
+            return cand
+        i+=1
+
+# ===== URL =====
 def resolve_product_url(keyword:str)->str:
-    if os.path.exists(PRODUCTS_SEED_CSV):
+    p="products_seed.csv"
+    if os.path.exists(p):
         try:
-            rd=csv.DictReader(open(PRODUCTS_SEED_CSV,"r",encoding="utf-8"))
-            for r in rd:
+            for r in csv.DictReader(open(p,"r",encoding="utf-8")):
                 if (r.get("keyword") or "").strip()==keyword and (r.get("url") or "").strip():
                     return r["url"].strip()
                 if (r.get("product_name") or "").strip()==keyword and (r.get("url") or "").strip():
                     return r["url"].strip()
                 if (r.get("raw_url") or "").strip() and (r.get("product_name") or "").strip()==keyword:
                     return r["raw_url"].strip()
-        except Exception:
-            pass
+        except: pass
     return f"https://www.coupang.com/np/search?q={quote_plus(keyword)}"
 
-# ====== 워드프레스 ======
+# ===== WP =====
 def _ensure_term(kind:str, name:str)->int:
     r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}",
                    params={"search":name,"per_page":50,"context":"edit"},
@@ -310,177 +185,123 @@ def post_wp(title:str, html_body:str, when_gmt:str, category:str, tag:str)->dict
     cat_id=_ensure_term("categories", category or DEFAULT_CATEGORY)
     tag_ids=[]
     if tag:
-        try:
-            tid=_ensure_term("tags", tag); tag_ids=[tid]
-        except Exception:
-            pass
+        try: tag_ids=[_ensure_term("tags", tag)]
+        except: pass
     payload={
-        "title": title,
-        "content": html_body,
-        "status": POST_STATUS,
-        "categories": [cat_id],
-        "tags": tag_ids,
-        "comment_status": "closed",
-        "ping_status": "closed",
-        "date_gmt": when_gmt
+        "title": title, "content": html_body, "status": POST_STATUS,
+        "categories": [cat_id], "tags": tag_ids,
+        "comment_status": "closed","ping_status": "closed","date_gmt": when_gmt
     }
     r=requests.post(f"{WP_URL}/wp-json/wp/v2/posts", json=payload,
                     auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20, headers=REQ_HEADERS)
     r.raise_for_status(); return r.json()
 
-# ====== 스타일/CSS & 단일 버튼 컴포넌트 ======
+def _now_kst(): from zoneinfo import ZoneInfo; return datetime.now(ZoneInfo("Asia/Seoul"))
+def _wp_future_exists_around(when_gmt_dt, tol_min:int=2)->bool:
+    try:
+        r=requests.get(f"{WP_URL}/wp-json/wp/v2/posts",
+            params={"status":"future","per_page":100,"orderby":"date","order":"asc","context":"edit"},
+            headers=REQ_HEADERS, auth=(WP_USER,WP_APP_PASSWORD), verify=WP_TLS_VERIFY, timeout=20)
+        r.raise_for_status(); items=r.json()
+    except: return False
+    tgt=when_gmt_dt.astimezone(timezone.utc); win=timedelta(minutes=max(1,int(tol_min)))
+    lo,hi=tgt-win,tgt+win
+    for it in items:
+        d=(it.get("date_gmt") or "").strip()
+        if not d: continue
+        try:
+            dt=datetime.fromisoformat(d.replace("Z","+00:00"))
+            dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+        except: continue
+        if lo<=dt<=hi: return True
+    return False
+
+def _slot_affiliate()->str:
+    hh,mm=[int(x) for x in (AFFILIATE_TIME_KST.split(":")+["0"])[:2]]
+    now=_now_kst()
+    tgt=now.replace(hour=hh,minute=mm,second=0,microsecond=0)
+    if tgt<=now: tgt+=timedelta(days=1)
+    for _ in range(7):
+        utc=tgt.astimezone(timezone.utc)
+        if _wp_future_exists_around(utc,2):
+            tgt+=timedelta(days=1); continue
+        break
+    return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+
+# ===== style / html =====
 def _css_block()->str:
     return """
 <style>
-/* 공통 */
 .aff-wrap{font-family:inherit;line-height:1.65}
 .aff-disclosure{margin:0 0 16px;padding:12px 14px;border:2px solid #334155;background:#f1f5f9;color:#0f172a;border-radius:12px;font-size:.96rem}
-.aff-disclosure strong{color:#0f172a}
 .aff-sub{margin:10px 0 6px;font-size:1.2rem;color:#334155}
 .aff-hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0}
-
-/* 🎯 단일 CTA 버튼: 정확히 가운데 + 크게 (테마 영향 무시) */
-.aff-cta-row{
-  display:flex !important; align-items:center !important; justify-content:center !important;
-  gap:14px; width:100%; margin:24px auto 18px; text-align:center !important;
-}
-.aff-btn{
-  display:inline-flex !important; align-items:center; justify-content:center;
-  padding:18px 30px; font-size:1.12rem; line-height:1;
-  min-width:300px; border-radius:9999px;
-  text-decoration:none; font-weight:800; box-sizing:border-box;
-  float:none !important; /* 일부 테마의 좌측 부유 제거 */
-}
-.aff-btn--primary{background:#0ea5e9; color:#fff}
-.aff-btn:hover{transform:translateY(-1px); box-shadow:0 8px 20px rgba(0,0,0,.12)}
-@media (max-width:540px){.aff-btn{width:100%; min-width:0}}
-
-/* 표 */
+.aff-cta-row{display:flex;align-items:center;justify-content:center;gap:14px;width:100%;margin:24px auto 18px;text-align:center}
+.aff-btn{display:inline-flex !important;align-items:center;justify-content:center;padding:16px 28px;font-size:1.08rem;line-height:1;min-width:280px;border-radius:9999px;text-decoration:none;font-weight:800;box-sizing:border-box}
+.aff-btn--primary{background:#0ea5e9;color:#fff}
+.aff-btn:hover{transform:translateY(-1px);box-shadow:0 8px 20px rgba(0,0,0,.12)}
+@media (max-width:540px){.aff-btn{width:100%;min-width:0}}
 .aff-table{width:100%;border-collapse:collapse;margin:8px 0 14px}
 .aff-table th,.aff-table td{border:1px solid #e5e7eb;padding:8px 10px;text-align:left}
 .aff-table thead th{background:#f8fafc}
-
-/* 헤딩 여백 */
-.aff-wrap h2{margin:18px 0 6px}
-.aff-wrap h3{margin:16px 0 6px}
+.aff-wrap h2{margin:18px 0 6px}.aff-wrap h3{margin:16px 0 6px}
 </style>
-""".strip()
+"""
 
 def _cta_single(url:str, label:str)->str:
-    u=html.escape(url or "#")
-    l=html.escape(label or "제품 보기")
-    return (
-        f'<div class="aff-cta-row">'
-        f'  <a class="aff-btn aff-btn--primary" href="{u}" '
-        f'     target="_blank" rel="nofollow sponsored noopener" aria-label="{l}">{l}</a>'
-        f'</div>'
-    )
+    u=html.escape(url or "#"); l=html.escape(label or "제품 보기")
+    return f'<div class="aff-cta-row"><a class="aff-btn aff-btn--primary" href="{u}" target="_blank" rel="nofollow sponsored noopener" aria-label="{l}">{l}</a></div>'
 
-# ====== 본문 렌더 ======
-def render_affiliate_html(keyword:str, url:str, image:str="", category_name:str="쇼핑")->str:
-    disc=html.escape(DISCLOSURE_TEXT)
-    kw_esc=html.escape(keyword)
-
-    # 서브제목 & 요약
-    subtitle=f"{kw_esc} 한 눈에 보기"
-    summary=(
-        f"{kw_esc}를 중심으로 핵심만 간단히 정리했어요. 과장 없이 실제 사용 맥락을 바탕으로 선택 기준과 활용 팁을 담았습니다. "
-        f"읽고 바로 비교·결정할 수 있도록 요약-분석-가격/가성비-장단점-추천 순서로 구성했습니다."
-    )
-
-    # 가격/가성비 표(3x3)
+def render_affiliate_html(keyword:str, url:str)->str:
+    disc=html.escape(DISCLOSURE_TEXT); kw=html.escape(keyword)
     table_html="""
 <table class="aff-table">
   <thead><tr><th>항목</th><th>확인 포인트</th><th>비고</th></tr></thead>
   <tbody>
-    <tr><td>성능</td><td>공간/목적 대비 충분한지</td><td>필요 이상 과투자 방지</td></tr>
-    <tr><td>관리</td><td>세척·보관·소모품</td><td>난도/주기 체크</td></tr>
-    <tr><td>비용</td><td>구매가 + 유지비</td><td>시즌 특가/묶음 혜택</td></tr>
+    <tr><td>성능</td><td>공간/목적 대비 충분한지</td><td>과투자 방지</td></tr>
+    <tr><td>관리</td><td>세척·보관·소모품</td><td>난도/주기</td></tr>
+    <tr><td>비용</td><td>구매가 + 유지비</td><td>시즌 특가</td></tr>
   </tbody>
 </table>
 """.strip()
-
-    # 이미지(선택)
-    img_html=""
-    if image and USE_IMAGE:
-        img_html=f'<figure style="margin:0 0 18px"><img src="{html.escape(image)}" alt="{kw_esc}" loading="lazy" decoding="async" style="max-width:100%;height:auto;border-radius:12px"></figure>'
-
-    # 중간 광고
-    mid_ads=_adsense_block()
-
     body=f"""
 {_css_block()}
 <div class="aff-wrap">
   <p class="aff-disclosure"><strong>{disc}</strong></p>
-  {_adsense_block()}
-  {img_html}
-
-  <h2 class="aff-sub">{subtitle}</h2>
-  <p>{summary}</p>
+  <h2 class="aff-sub">{kw} 한 눈에 보기</h2>
+  <p>{kw}를 중심으로 핵심만 간단히 정리했어요. 요약→선택 기준→팁→장단점 순서예요.</p>
   <hr class="aff-hr">
-
   {_cta_single(url, BUTTON_PRIMARY)}
-
-  <h3>왜 이 제품을 찾게 되었나</h3>
-  <p>생활 동선에서 자잘한 불편이 반복될 때 가장 먼저 손이 가는 도구가 됩니다. {kw_esc}도 마찬가지예요. 사용 환경을 먼저 정리하면 스펙을 과감하게 덜어낼 수 있고, 핵심은 오히려 또렷해집니다.</p>
-  <hr class="aff-hr">
-
-  <h3>핵심 기능만 딱 추리기</h3>
-  <p>모든 기능을 챙기기보다 자주 쓰는 두세 가지만 선명하게. 전원 방식, 휴대성, 활용 모드처럼 “매일 만지는 요소”가 사용자 경험을 좌우합니다.</p>
-  <hr class="aff-hr">
-
-  <h3>선택 기준 3가지</h3>
-  <p>공간/목적, 관리 난도, 총비용. 이 세 가지 기준을 표로 정리해 두면 다른 모델과도 바로 비교가 됩니다.</p>
-  {table_html}
-  <hr class="aff-hr">
-
-  <h3>실전 사용 팁</h3>
-  <p>환경 소음·바람길·전원 위치 같은 사소한 변수만 다듬어도 체감 만족도가 크게 달라집니다. 기본은 가볍게, 필요할 때만 모드를 올리세요.</p>
-  <hr class="aff-hr">
-
-  {mid_ads}
-
-  <h3>장점</h3>
-  <p>간편한 접근성, 부담 없는 유지비, 상황별 확장성. 한 번 익숙해지면 밖에서도 같은 사용 리듬을 이어가기 쉬워집니다.</p>
-  <hr class="aff-hr">
-
-  <h3>단점</h3>
-  <p>배터리·소모품 주기, 상위급 대비 세밀한 성능 한계. 사용 목적을 확실히 좁히면 체감되는 단점은 줄어듭니다.</p>
-  <hr class="aff-hr">
-
-  <h3>이런 분께 추천</h3>
-  <p>여행·서브·선물용으로 무난한 선택지를 찾는 분, 가볍게 시작해 보고 필요하면 단계 업그레이드를 생각하는 분께 특히 잘 맞습니다.</p>
-
+  <h3>선택 기준 3가지</h3><p>공간/목적, 관리 난도, 총비용.</p>{table_html}<hr class="aff-hr">
+  <h3>장점</h3><p>간편한 접근성, 부담 없는 유지비, 상황별 확장성.</p><hr class="aff-hr">
+  <h3>단점</h3><p>소모품/배터리 주기, 상위급 대비 성능 한계.</p><hr class="aff-hr">
+  <h3>추천</h3><p>가볍게 시작하고 필요하면 업그레이드하려는 분께 적합.</p>
   {_cta_single(url, BUTTON_PRIMARY)}
 </div>
 """.strip()
-
     return body
 
-# ====== 회전 & 실행 ======
+# ===== rotate & run =====
 def rotate_sources(kw:str):
     changed=False
-    if _consume_col_csv("golden_shopping_keywords.csv",kw):
-        print(f"[ROTATE] removed '{kw}' from golden_shopping_keywords.csv"); changed=True
-    if _consume_col_csv("keywords_shopping.csv",kw):
-        print(f"[ROTATE] removed '{kw}' from keywords_shopping.csv"); changed=True
-    if not changed:
-        print("[ROTATE] nothing removed (maybe already rotated)")
+    if _consume_col("golden_shopping_keywords.csv",kw): changed=True
+    if _consume_col("keywords_shopping.csv",kw): changed=True
+    print("[ROTATE] rotated" if changed else "[ROTATE] nothing removed")
+
+def _build_title(kw:str)->str:
+    t = re.sub(r"\s+"," ", f"{kw} 이렇게 쓰니 편해요").strip()
+    return t[:42]
 
 def run_once():
-    print(f"[USAGE] NO_REPEAT_TODAY={NO_REPEAT_TODAY}, AFF_USED_BLOCK_DAYS={AFF_USED_BLOCK_DAYS}")
     kw = pick_affiliate_keyword()
-    if not kw:
-        print("[AFFILIATE] SKIP: no fresh keyword (pool & fallback exhausted)")
-        return
-
     url = resolve_product_url(kw)
     when_gmt = _slot_affiliate()
-    title = build_title(kw)
-    body = render_affiliate_html(kw, url, image="", category_name=DEFAULT_CATEGORY)
-    res = post_wp(title, body, when_gmt, category=DEFAULT_CATEGORY, tag=kw)
-    print(json.dumps({"post_id":res.get("id") or 0,"link":res.get("link"),"status":res.get("status"),
-                      "date_gmt":res.get("date_gmt"),"title":title,"keyword":kw}, ensure_ascii=False))
+    title = _build_title(kw)
+    html_body = render_affiliate_html(kw, url)
+    res = post_wp(title, html_body, when_gmt, category=DEFAULT_CATEGORY, tag=kw)
+    print(json.dumps({"post_id":res.get("id") or 0,"link":res.get("link"),
+                      "status":res.get("status"),"date_gmt":res.get("date_gmt"),
+                      "title":title,"keyword":kw}, ensure_ascii=False))
     _mark_used(kw)
     rotate_sources(kw)
 
