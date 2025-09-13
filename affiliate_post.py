@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-affiliate_post.py — 쿠팡 글 자동 발행 (기사형, 내부광고 포함)
-- 섹션: 1) 내부광고 2) 요약 3) 버튼 4) 본문1 5) 썸네일 주석 6) 버튼 7) 내부광고 8) 본문2
-- 버튼 모양은 기존 함수 유지, 중앙정렬 래퍼만 추가
-- 1500자 보강: FAQ/체크리스트/가이드로 자연 보강(과잉 반복 금지)
-- 쿠팡 링크: 검색 결과 딥링크 우선, 실패 시 일반 검색 URL
+affiliate_post.py — 쿠팡 글 자동 발행 (기사형)
+- rich_templates.build_affiliate_content 사용(있으면) + 광고/버튼/섹션은 여기서 조립
+- 버튼 모양은 그대로, 외곽 래퍼로 '중앙정렬'만 적용
+- 섹션 순서: 1) 내부광고 2) 요약 3) 버튼 4) 본문1 5) 썸네일(주석) 6) 버튼 7) 내부광고 8) 본문2
+- 본문은 공백 제외 1500자 이상 보장(무한 반복 금지, 자연스러운 보강)
 """
 
 from __future__ import annotations
@@ -14,13 +14,11 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
 import requests
 from dotenv import load_dotenv
-
-# 딥링크 유틸 (검색 페이지 전용)
-from coupang_api import deeplink_for_search as coupang_deeplink, coupang_search_url
+from coupang_api import deeplink_for_query  # 딥링크 시도
 
 load_dotenv()
 
-# ====== Rich 템플릿(선택) ======
+# ===== Rich 템플릿 여부 =====
 HAVE_RICH = False
 try:
     from rich_templates import build_affiliate_content
@@ -28,7 +26,7 @@ try:
 except Exception:
     HAVE_RICH = False
 
-# ====== ENV ======
+# ===== ENV =====
 WP_URL=(os.getenv("WP_URL") or "").strip().rstrip("/")
 WP_USER=os.getenv("WP_USER") or ""
 WP_APP_PASSWORD=os.getenv("WP_APP_PASSWORD") or ""
@@ -36,12 +34,8 @@ VERIFY_TLS=(os.getenv("WP_TLS_VERIFY") or "true").lower()!="false"
 
 POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()
 AFFILIATE_CATEGORY=(os.getenv("AFFILIATE_CATEGORY") or "쇼핑").strip() or "쇼핑"
-
-# 내부 광고(숏코드 등)
-AD_SHORTCODE = (os.getenv("AD_SHORTCODE") or "").strip()            # 상단 광고
-AD_INSERT_MIDDLE = (os.getenv("AD_INSERT_MIDDLE") or "").strip()    # 중간/하단 광고 (없으면 상단과 동일 코드 사용)
-
 DISCLOSURE_TEXT=os.getenv("DISCLOSURE_TEXT") or ""
+AD_SHORTCODE=os.getenv("AD_SHORTCODE") or ""
 
 USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
 USED_SHOP=os.path.join(USAGE_DIR,"used_shopping.txt")
@@ -56,20 +50,6 @@ REQ_HEADERS={
     "Content-Type":"application/json; charset=utf-8"
 }
 
-# ====== 스타일(박스 X, 소제목만 살짝) ======
-def _css():
-    return """
-<style>
-.aff { line-height:1.8; letter-spacing:-.01em }
-.aff h2{font-size:1.6em;margin:1.2em 0 .5em;font-weight:800;letter-spacing:-.02em}
-.aff h3{font-size:1.15em;margin:1.0em 0 .4em;font-weight:700}
-.aff ul{padding-left:1.2em}
-.aff table{width:100%;border-collapse:collapse;margin:.6em 0}
-.aff table th,.aff table td{border:1px solid #e5e7eb;padding:.55em .6em;text-align:left}
-</style>
-""".strip()
-
-# ====== 유틸 ======
 def _esc(s: Optional[str])->str:
     return html.escape((s or "").strip())
 
@@ -113,28 +93,35 @@ def _nchars_no_space(html_text:str)->int:
     return len(re.sub(r"\s+","",_strip_tags(html_text)))
 
 def _ensure_min_chars(body_html:str, min_chars:int=1500)->str:
-    """자연스러운 섹션만 추가(FAQ/체크리스트/가이드). 과도 반복 금지."""
+    """채워넣기 문구는 다양화하고 중복을 피함."""
     if _nchars_no_space(body_html) >= min_chars:
         return body_html
-
     fillers = [
-        "<h3>구매 체크리스트</h3><ul><li>사용 공간/용도 정하기</li><li>관리 난도(세척/보관/소모품)</li><li>총비용(구매가+유지비)</li></ul>",
-        "<h3>활용 가이드</h3><p>기본 기능을 먼저 익힌 뒤, 자주 쓰는 장면에 맞춰 보조 기능을 단계적으로 추가하세요.</p>",
-        "<h3>FAQ</h3><p><b>Q.</b> 사양이 높을수록 좋은가요?<br><b>A.</b> 목적 대비 과사양은 비용과 관리 부담을 키웁니다. 실제 사용 시나리오와 균형이 핵심입니다.</p>",
+        "<h3>구매 체크리스트</h3><p>내 공간·예산·소음 허용치를 먼저 정의하고, 꼭 필요한 기능부터 우선순위를 매기세요.</p>",
+        "<h3>활용 팁</h3><p>처음엔 기본 모드만 익히고, 자주 쓰는 장면에 맞춰 보조 기능을 단계적으로 추가하세요.</p>",
+        "<h3>유지관리</h3><p>소모품 주기와 세척 난도를 미리 확인해 캘린더에 기록해두면 번거로움이 줄어듭니다.</p>",
+        "<h3>FAQ</h3><p><b>Q.</b> 고사양이 항상 유리할까요? <b>A.</b> 목적 대비 과사양은 비용/관리 부담을 키울 수 있습니다.</p>",
+        "<h3>비교 포인트</h3><p>성능·관리·비용을 표로 정리하면 선택이 쉬워집니다.</p>",
     ]
+    used=set()
     buf = body_html
     for add in fillers:
         if _nchars_no_space(buf) >= min_chars: break
-        if add not in buf:
+        if add not in used and add not in buf:
             buf += "\n" + add
-
-    # 여전히 부족하면 한 번만 노트 추가
-    if _nchars_no_space(buf) < min_chars:
-        buf += "\n<p>실사용 기준으로 기능-관리-비용 균형을 확인하면 선택이 빨라집니다.</p>"
-
+            used.add(add)
+    # 그래도 부족하면 짧은 문단만 최대 3회 추가
+    tail = (
+        "실사용 기준으로 자주 쓰는 기능과 관리 난도를 먼저 확인하면 만족도가 높습니다. "
+        "총비용은 구매가 + 유지비(전기/소모품/시간)로 계산해보세요."
+    )
+    cnt = 0
+    while _nchars_no_space(buf) < min_chars and cnt < 3:
+        buf += f"\n<p>{tail}</p>"
+        cnt += 1
     return buf
 
-# ====== WP ======
+# ===== WP =====
 def _ensure_term(kind:str, name:str)->int:
     r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}",
                    params={"search":name,"per_page":50,"context":"edit"},
@@ -164,8 +151,8 @@ def post_wp(title:str, content:str, when_gmt:str, category:str)->dict:
     r.raise_for_status()
     return r.json()
 
-# ====== 시간대 ======
-def _now_kst(): 
+# ===== 시간대/슬롯 =====
+def _now_kst():
     return datetime.now(ZoneInfo("Asia/Seoul"))
 
 def _slot_to_utc(kst_hm:str)->str:
@@ -175,7 +162,7 @@ def _slot_to_utc(kst_hm:str)->str:
     if tgt<=now: tgt+=timedelta(days=1)
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-# ====== 버튼: 기존 모양 유지 + 중앙 래퍼 ======
+# ===== 버튼: 원형 유지 + 중앙 정렬 래퍼 =====
 def _button_html_local(url: str, label: str = "바로 보기") -> str:
     u = html.escape(url); l = html.escape(label or "바로 보기")
     return (f'<a href="{u}" target="_blank" rel="nofollow sponsored noopener" '
@@ -184,6 +171,7 @@ def _button_html_local(url: str, label: str = "바로 보기") -> str:
             f'{l}</a>')
 
 def _get_button_core(url: str) -> str:
+    # 기존 프로젝트 버튼 함수가 있으면 그대로 사용
     try:
         return _button_html(url, BUTTON_PRIMARY)  # type: ignore  # noqa: F821
     except Exception:
@@ -194,93 +182,112 @@ def _get_button_core(url: str) -> str:
             return _button_html_local(url, label)
 
 def _center_wrap(html_btn: str) -> str:
-    return f'<div style="text-align:center;margin:16px 0">{html_btn}</div>'
+    # 모양은 그대로, 위치만 중앙
+    return f'<div class="rt-center" style="text-align:center;margin:16px 0">{html_btn}</div>'
 
 def _get_button_html(url: str) -> str:
     return _center_wrap(_get_button_core(url))
 
-# ====== 링크 ======
-def resolve_affiliate_url(keyword: str) -> str:
-    # 검색 페이지 딥링크 우선
-    try:
-        if REQUIRE_COUPANG_API:
-            u = coupang_deeplink(keyword)
+# ===== 링크 해결 =====
+def coupang_search_url(query: str) -> str:
+    from urllib.parse import quote_plus
+    return f"https://search.shopping.coupang.com/search?component=&q={quote_plus(query)}&channel=rel"
+
+def resolve_affiliate_url(product_title: str) -> str:
+    if REQUIRE_COUPANG_API:
+        try:
+            u = deeplink_for_query(product_title)  # 내부에서 실패 시 예외 발생/None → 폴백
             if isinstance(u, str) and u:
                 return u
-    except Exception:
-        pass
-    # 폴백
-    return coupang_search_url(keyword)
+        except Exception:
+            pass
+    return coupang_search_url(product_title)
 
-# ====== 콘텐츠 ======
+# ===== 콘텐츠 =====
 def _build_product_skeleton(keyword:str)->Dict:
     k = keyword.strip()
     return {
         "title": k,
-        "summary": f"{k} 선택 시, 성능·관리·비용의 균형을 빠르게 점검할 수 있도록 핵심만 정리합니다.",
+        "features": [],
+        "pros": [],
+        "cons": [],
+        "tips": [],
+        "criteria": [],
+        "specs": [],
+        "faqs": [],
+        "summary": f"{k} 선택 시, 성능·관리·비용 균형을 빠르게 점검할 수 있도록 핵심만 정리합니다."
     }
 
-def _render_legacy(product:Dict, url:str)->str:
-    k = _esc(product.get("title") or "추천 제품")
-    summary = _esc(product.get("summary") or "")
-    btn = _get_button_html(url)
+def _css_headings()->str:
+    return """
+<style>
+.ax h2{font-size:1.6em;margin:1.1em 0 .5em;font-weight:800;letter-spacing:-.02em}
+.ax h3{font-size:1.15em;margin:.9em 0 .35em;font-weight:700}
+.ax table{border-collapse:collapse;width:100%;margin:.6em 0}
+.ax table th,.ax table td{border:1px solid #e5e7eb;padding:.55em .6em}
+.ax table thead th{background:#f8fafc;font-weight:700}
+.ax p{line-height:1.8}
+</style>
+""".strip()
 
-    ad_top = AD_SHORTCODE or ""
-    ad_mid = AD_INSERT_MIDDLE or AD_SHORTCODE or ""
-
-    parts = [
-        _css(),
-        '<div class="aff">',
-        # 1) 내부광고(상단)
-        ad_top,
-        # 2) 요약
-        "<h2>요약</h2>",
-        f"<p>{summary}</p>",
-        # 3) 버튼
-        btn,
-        # 4) 본문1 (짧게)
-        "<h2>핵심 한 단락</h2>",
-        "<p>실사용 장면에서 가장 자주 쓰는 기능이 무엇인지, 관리 난도(세척·보관·소모품)를 감당할 수 있는지를 먼저 확인하세요.</p>",
-        # 5) 썸네일(안정화되면 추가) → 자리만 유지
-        "<!-- 썸네일 자리: 안정화 후 이미지 삽입 예정 -->",
-        # 6) 버튼
-        btn,
-        # 7) 내부광고(중간/하단)
-        ad_mid,
-        # 8) 본문2(나머지)
-        "<h2>상세 비교</h2>",
+def _render_core_section(product:Dict, url:str)->str:
+    """rich 템플릿이 있으면 코어 본문만 생성, 없으면 간단 예비 본문."""
+    bh = _get_button_html(url)
+    if HAVE_RICH:
+        # 광고 인자(ad_top/ad_middle 등) 전달 금지 → 시그니처 불일치 방지
+        return build_affiliate_content(
+            product=product,
+            button_html=bh,
+            disclosure_text=DISCLOSURE_TEXT or None,
+        )
+    # Legacy 코어
+    return (
+        "<h3>핵심 비교</h3>"
         "<table><thead><tr><th>항목</th><th>확인 포인트</th><th>비고</th></tr></thead>"
         "<tbody>"
         "<tr><td>성능</td><td>공간/목적 대비 충분</td><td>과투자 방지</td></tr>"
         "<tr><td>관리</td><td>세척·보관·소모품</td><td>난도/주기</td></tr>"
         "<tr><td>비용</td><td>구매가 + 유지비</td><td>시즌 특가</td></tr>"
-        "</tbody></table>",
-        "</div>",
-    ]
-    return _ensure_min_chars("\n".join(p for p in parts if p), 1500)
+        "</tbody></table>"
+    )
 
-def _render_rich(product:Dict, url:str)->str:
-    """rich_templates가 있다면 같은 섹션 배치를 보장하도록 인자 전달."""
-    btn = _get_button_html(url)
-    ad_top = AD_SHORTCODE or ""
-    ad_mid = AD_INSERT_MIDDLE or AD_SHORTCODE or ""
+def _assemble_article(product:Dict, url:str)->str:
+    """구성: 1 광고 / 2 요약 / 3 버튼 / 4 본문1 / 5 썸네일 주석 / 6 버튼 / 7 광고 / 8 본문2"""
+    k = _esc(product.get("title") or "추천 제품")
+    summary = _esc(product.get("summary") or "")
+    bh = _get_button_html(url)
+    core = _render_core_section(product, url)
 
-    if HAVE_RICH:
-        html_body = build_affiliate_content(
-            product=product,
-            button_html=btn,
-            disclosure_text=DISCLOSURE_TEXT or None,
-            ad_top=ad_top or None,
-            ad_middle=ad_mid or None,
-            css_override=_css(),
-            layout_order=["ad_top","summary","button","body_short","thumb","button","ad_middle","body_long"],
-        )
-    else:
-        html_body = _render_legacy(product, url)
+    body1 = (
+        "<h2>요약</h2>"
+        f"<p>{summary}</p>"
+        f"{bh}"
+        "<h2>본문 1</h2>"
+        "<p>실사용 관점에서 자주 쓰는 기능과 관리 난도를 먼저 확인하면 선택이 쉬워집니다. "
+        "공간·소음·예산을 기준으로 필요한 수준만 고르는 것이 핵심입니다.</p>"
+    )
+    thumb_comment = "<!-- 썸네일 자리: 안정화되면 이미지 삽입 예정 -->"
+    body2 = (
+        f"{bh}"
+        f"{AD_SHORTCODE or ''}"
+        "<h2>본문 2</h2>"
+        "<p>성능·관리·비용의 균형을 표로 정리하고, 내 환경에 맞는 기준을 체크하세요. "
+        "초기구매가뿐 아니라 유지비(전기/소모품/시간)까지 합산하면 체감 만족도를 예측할 수 있습니다.</p>"
+        f"{core}"
+    )
 
-    return _ensure_min_chars(html_body, 1500)
+    article = "\n".join([
+        _css_headings(),
+        '<div class="ax">',
+        (AD_SHORTCODE or ""),  # 1) 내부광고(상)
+        body1,                 # 2) 요약 + 3) 버튼 + 4) 본문1
+        thumb_comment,         # 5) 썸네일(주석)
+        body2,                 # 6) 버튼(상단에 이미 포함) + 7) 내부광고 + 8) 본문2(+core)
+        '</div>'
+    ])
+    return _ensure_min_chars(article, 1500)
 
-# ====== 키워드 ======
+# ===== 키워드 =====
 def _pick_keyword()->Optional[str]:
     pool=_read_col_csv(P_GOLD)
     return pool[0] if pool else None
@@ -289,7 +296,7 @@ def _rotate_after_use():
     _rotate_csv_head_to_tail(P_GOLD)
     print("[ROTATE] rotated")
 
-# ====== 메인 ======
+# ===== 메인 =====
 def main():
     if not (WP_URL and WP_USER and WP_APP_PASSWORD):
         raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
@@ -304,7 +311,7 @@ def main():
 
     url = resolve_affiliate_url(kw)
     prod = _build_product_skeleton(kw)
-    content_html = _render_rich(prod, url)
+    content_html = _assemble_article(prod, url)
 
     when_gmt = _slot_to_utc(slot)
     title = f"{kw} 이렇게 쓰니 편해요"
