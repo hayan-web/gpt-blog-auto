@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
 import requests
 from dotenv import load_dotenv
+from coupang_api import deeplink_for_query  # NEW
 
 load_dotenv()
 
@@ -323,7 +324,15 @@ def main():
         return
 
     # 링크 URL: 딥링크 함수가 있다면 resolve_affiliate_url로 연결, 기본은 검색 URL
-    url = resolve_affiliate_url(kw)
+    try:
+    # 딥링크 우선
+    url = deeplink_for_query(kw)
+except Exception as e:
+    # 실패 시 안전 폴백
+    from urllib.parse import quote
+    url = f"https://search.shopping.coupang.com/search?component=&q={quote(kw)}&channel=rel"
+    print(f"[AFFILIATE] deeplink fallback: {e}")
+
 
     prod = _build_product_skeleton(kw)
     content_html = _render_rich(prod, url)   # 버튼/위치 불변 + 1500자 보장
