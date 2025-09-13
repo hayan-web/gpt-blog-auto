@@ -265,7 +265,7 @@ def _two_slots()->list[str]:
 # ===== main modes =====
 def _post_one_diary():
     kw=_fresh_general_keyword()
-    title=_build_title(kw)
+    title=sanitize_title(_build_title(kw))
     body=_render_diary_long(kw, DEFAULT_CATEGORY)
     when_gmt=_slot_kst(10,0)
     res=post_wp(title, body, when_gmt, DEFAULT_CATEGORY)
@@ -298,3 +298,11 @@ def main():
 
 if __name__=="__main__":
     main()
+
+
+def sanitize_title(title: str) -> str:
+    # remove leading markers like "예약", "예약17", etc.
+    t = re.sub(r'^\s*예약\d*\s*[:：-]\s*', '', title)
+    t = re.sub(r'^\s*예약\d*\s*', '', t)
+    t = t.replace("예약 ", "").strip()
+    return t
