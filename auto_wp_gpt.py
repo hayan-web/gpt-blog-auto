@@ -1,12 +1,13 @@
 ﻿# -*- coding: utf-8 -*-
 """
-auto_wp_gpt.py — 자동 워드프레스 포스팅 (일상글 2건 고품질 템플릿)
-- '완전 새로운 키워드'를 매번 선택 (update_keywords.py가 생성한 CSV 또는 폴백)
-- 버튼/스타일 관련 기존 동작은 유지 (버튼 모양/위치 절대 변경 없음)
-- 짧은 틀글이 아닌 '완성형' 섹션 구성: 하이라이트·배운점·감정체크·내일 한 가지·미니습관·감사 한 줄
+auto_wp_gpt.py — 자동 워드프레스 포스팅 (일상글 2건)
+- 일반(일상) 글은 매 플로우마다 '완전 새로운 키워드'로 작성
+- keywords_general.csv가 비어도 폴백 풀/ENV로 반드시 2건 생성
+- 최근 사용/당일 중복 방지(.usage/used_general.txt)
+- 공백 제외 MIN_DIARY_CHARS(기본 1500) 이상 보장
 """
 
-import os, csv, json, html, random
+import os, csv, json, html, re, random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List
@@ -25,14 +26,15 @@ POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()
 DEFAULT_CATEGORY=(os.getenv("DEFAULT_CATEGORY") or "정보").strip() or "정보"
 EXISTING_CATEGORIES=[c.strip() for c in (os.getenv("EXISTING_CATEGORIES") or "").split(",") if c.strip()]
 
-USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-auto/diary-2.0"
+USER_AGENT=os.getenv("USER_AGENT") or "gpt-blog-auto/diary-2.2"
 USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
 USED_GENERAL=os.path.join(USAGE_DIR,"used_general.txt")
 
 NO_REPEAT_TODAY=(os.getenv("NO_REPEAT_TODAY") or "1").lower() in ("1","true","y","yes","on")
-GEN_USED_BLOCK_DAYS=int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")  # 동일 정책
+GEN_USED_BLOCK_DAYS=int(os.getenv("AFF_USED_BLOCK_DAYS") or "30")
 
 KEYWORDS_CSV=(os.getenv("KEYWORDS_CSV") or "keywords_general.csv").strip()
+MIN_DIARY_CHARS=int(os.getenv("MIN_DIARY_CHARS") or "1500")
 
 REQ_HEADERS={"User-Agent":USER_AGENT,"Accept":"application/json","Content-Type":"application/json; charset=utf-8"}
 
@@ -109,11 +111,11 @@ def _fresh_general_keyword() -> str:
 
     pool=_read_col_csv(KEYWORDS_CSV)
     if not pool:
-        base = [
+        base=[w.strip() for w in (os.getenv("GENERAL_FALLBACK_KEYWORDS") or "").split(",") if w.strip()] or [
             "가계부","정리정돈","시간관리","운동 루틴","독서 메모","주간 계획","월간 회고","홈카페",
             "집안일 팁","디지털 정리","습관 기록","작은 실험","배운 점","루틴 점검","하루 요약",
         ]
-        pool = [*base]  # 반드시 채움
+        pool = [*base]
 
     random.shuffle(pool)
     for kw in pool:
@@ -121,79 +123,131 @@ def _fresh_general_keyword() -> str:
             continue
         return kw
 
-    # 전부 소진: 날짜 시드로 변형 생성
     seed=datetime.utcnow().strftime("%Y%m%d%H%M")
     return f"{random.choice(pool)} {seed}"
 
 # ===== content =====
 def _css():
-    # 버튼 관련 스타일은 건들지 않음
     return """
 <style>
-.diary-wrap{line-height:1.75}
-.diary-card{padding:14px 16px;border:1px solid #e5e7eb;border-radius:12px;background:#fafafa;margin:14px 0}
-.diary-h2{margin:14px 0 8px;font-size:1.25rem;color:#334155}
-.diary-hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0}
-.diary-meta{font-size:.95rem;color:#475569;margin:8px 0 0}
-.diary-list{margin:0 0 0 16px}
+.diary-wrap{line-height:1.85}
 .diary-cta{display:flex;justify-content:center;margin:18px 0}
 .diary-btn{display:inline-block;padding:14px 22px;border-radius:999px;background:#0ea5e9;color:#fff;text-decoration:none;font-weight:800}
+.diary-card{padding:14px 16px;border:1px solid #e5e7eb;border-radius:12px;background:#fafafa;margin:14px 0}
+.diary-h2{margin:10px 0 6px;font-size:1.25rem;color:#334155}
+.diary-hr{border:0;border-top:1px solid #e5e7eb;margin:16px 0}
+.diary-small{font-size:.95rem;color:#64748b}
 </style>
 """.strip()
 
+def _chars_no_space(s: str) -> int:
+    return len(re.sub(r"\s+", "", s or ""))
+
 def _build_title(kw:str)->str:
-    # 키워드 기반 다양화 (고정 "오늘의 기록" 금지)
     tpl=[
-        f"{kw} 메모: 하루 요약",
-        f"오늘의 {kw} 기록",
         f"{kw} — 오늘 한 줄 회고",
+        f"오늘의 {kw} 기록",
+        f"{kw} 메모: 하루 요약",
         f"{kw} 점검 노트",
     ]
     random.shuffle(tpl)
     return tpl[0]
 
-def _render_diary(kw:str, category_slug:str)->str:
-    # category_slug는 카테고리 페이지 링크에 사용
+def _section(title:str, body_html:str)->str:
+    return f'<div class="diary-card"><strong class="diary-h2">{html.escape(title)}</strong>{body_html}</div>'
+
+def _p(text:str)->str:
+    return f"<p>{html.escape(text)}</p>"
+
+def _ul(items:List[str])->str:
+    xs=[i for i in items if i and i.strip()]
+    if not xs: return ""
+    return "<ul>" + "".join(f"<li>{html.escape(i)}</li>" for i in xs) + "</ul>"
+
+def _ensure_min_diary_chars(body_html:str, min_chars:int=MIN_DIARY_CHARS)->str:
+    """공백 제외 글자수 보강: 섹션을 단계적으로 추가해 자연스럽게 1500자 이상을 보장."""
+    if _chars_no_space(body_html) >= min_chars:
+        return body_html
+
+    fillers = [
+        _section("하루 에피소드",
+                 _p("오늘의 핵심 장면을 5W1H(누가, 언제, 어디서, 무엇을, 왜, 어떻게)로 짧게 써서 사건의 뼈대를 세웁니다.") +
+                 _p("그 장면이 주제와 연결되는 이유를 한 문장으로 정리해요.")),
+        _section("실행 로그",
+                 _ul(["시작 시간/중단 시간 기록", "집중을 방해한 요인 1가지 제거", "끝나고 3줄 회고 작성"]) +
+                 _p("결과보다 과정을 데이터로 남기면 다음 개선점이 또렷해집니다.")),
+        _section("관련 자료",
+                 _ul(["참고한 글/도구/영상 1~2개", "대체 선택지 1개와 포기 이유"]) +
+                 _p("근거를 남겨두면 이후 재사용성이 생깁니다.")),
+        _section("내일을 위한 질문",
+                 _ul(["무엇을 계속할 것인가?", "무엇을 줄일 것인가?", "무엇을 시작할 것인가?"]) +
+                 _p("질문이 다음 행동을 당깁니다.")),
+    ]
+    buf = body_html
+    for ex in fillers:
+        if _chars_no_space(buf) >= min_chars: break
+        buf += "\n" + ex
+
+    # 그래도 부족하면 가벼운 베이스 문단 추가(중복 표현 최소화)
+    base = ("기록은 선택을 선명하게 만듭니다. 오늘의 선택이 왜 합리적이었는지 근거를 남기면 "
+            "내일은 더 빠르게 같은 품질의 결정을 내릴 수 있습니다. 작은 반복이 누적되어 변화를 만듭니다.")
+    i = 0
+    while _chars_no_space(buf) < min_chars and i < 6:
+        buf += "\n" + _p(base)
+        i += 1
+    return buf
+
+def _render_diary_long(kw:str, category:str)->str:
+    cat=html.escape(category or DEFAULT_CATEGORY)
     kw_e=html.escape(kw)
-    cat_href=f"{WP_URL}/category/{html.escape(category_slug or '정보')}"
-    return f"""
-{_css()}
-<div class="diary-wrap">
-  <div class="diary-card">
-    <strong class="diary-h2">오늘의 하이라이트 3가지</strong>
-    <ul class="diary-list">
-      <li>{kw_e}와(과) 관련해 잘한 점 1가지</li>
-      <li>아쉬웠던 점 1가지 — 바로잡기 아이디어</li>
-      <li>오늘 배운 한 줄 요약</li>
-    </ul>
-  </div>
 
-  <div class="diary-card">
-    <strong class="diary-h2">감정 체크</strong>
-    <p class="diary-meta">만족 · 아쉬움 · 에너지(낮음/보통/높음) 중 오늘 상태를 한 단어로 적어보세요.</p>
-  </div>
+    parts=[_css(), '<div class="diary-wrap">']
+    parts.append(_p("하루를 짧게 넘기지 않기 위해 핵심만 또렷하게 남깁니다. 요약 → 배운 점 → 실행 계획 → 지표/체크리스트 순서로 정리해요."))
 
-  <div class="diary-card">
-    <strong class="diary-h2">내일의 한 가지</strong>
-    <ul class="diary-list">
-      <li>내일 {kw_e}에서 꼭 할 1가지 구체 행동</li>
-      <li>막히면 쓸 미니 대안 1가지</li>
-    </ul>
-  </div>
+    parts.append(_section("요약",
+        _p(f"오늘의 주제는 ‘{kw_e}’였습니다. 가장 의미 있었던 한 장면을 떠올려 핵심 전환점을 문장 하나로 남깁니다.") +
+        _p("왜 이런 결과가 나왔는지, 운과 실력, 시스템 중 어디의 영향이 컸는지 구분합니다.")
+    ))
 
-  <div class="diary-card">
-    <strong class="diary-h2">미니 습관 & 감사 1문장</strong>
-    <ul class="diary-list">
-      <li>{kw_e} 관련 2분짜리 미니 습관</li>
-      <li>오늘 고마웠던 일 1가지</li>
-    </ul>
-  </div>
+    parts.append(_section("하이라이트 3",
+        _ul(["가장 잘한 선택 1가지","의외의 장애물 1가지","내일도 반복하고 싶은 습관 1가지"])
+    ))
 
-  <div class="diary-cta">
-    <a class="diary-btn" href="{cat_href}" aria-label="카테고리 보기">카테고리 보기</a>
-  </div>
-</div>
-""".strip()
+    parts.append(_section("배운 점",
+        _p("사실/해석/감정이 섞이지 않도록, 관찰한 사실 → 해석 → 선택지 순으로 나눠 적습니다.") +
+        _p("같은 상황이 오면 어떤 기준으로 빠르게 결정할지 한 문장으로 정의합니다.")
+    ))
+
+    parts.append(_section("실행 계획",
+        _ul([
+            "내일 당장 적용: 5분 이내로 시작할 수 있는 첫 행동",
+            "중기 계획: 2주 동안 지켜볼 지표 하나",
+            "차단 규칙: 하지 않을 것 1가지"
+        ])
+    ))
+
+    parts.append(_section("지표/체크리스트",
+        _ul(["집중 시간(분)", "피드백 횟수", "완료/보류 항목", "수면/수분/운동"]) +
+        _p("숫자는 솔직하게 적고, 비교는 어제의 나와만 합니다.")
+    ))
+
+    parts.append(_section("회고 문단",
+        _p("오늘은 작은 진동이 누적된 날이었어요. 즉각적 성과는 크지 않아도 방향이 올바르면 다음 선택이 쉬워집니다.") +
+        _p("기록은 기억의 편집점을 만들어 줍니다. 다음 번 같은 갈림길에서 망설임을 줄이기 위해 문장을 남깁니다.")
+    ))
+
+    # 하단 CTA (카테고리 이동)
+    parts.append('<hr class="diary-hr"/>')
+    parts.append(f'<div class="diary-cta"><a class="diary-btn" href="{WP_URL}/category/{cat}" aria-label="카테고리 보기">카테고리 보기</a></div>')
+    parts.append('</div>')  # .diary-wrap
+
+    body="\n".join(parts)
+
+    # 길이 보정(공백 제외)
+    if _chars_no_space(body) < MIN_DIARY_CHARS:
+        body = _ensure_min_diary_chars(body, MIN_DIARY_CHARS)
+
+    return body
 
 # ===== scheduling =====
 def _now_kst(): return datetime.now(ZoneInfo("Asia/Seoul"))
@@ -205,14 +259,14 @@ def _slot_kst(hour:int, minute:int)->str:
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 def _two_slots()->list[str]:
-    # 10:00, 17:00 KST (요청대로 2건 예약)
+    # 10:00, 17:00 KST
     return [_slot_kst(10,0), _slot_kst(17,0)]
 
 # ===== main modes =====
 def _post_one_diary():
     kw=_fresh_general_keyword()
     title=_build_title(kw)
-    body=_render_diary(kw, DEFAULT_CATEGORY)
+    body=_render_diary_long(kw, DEFAULT_CATEGORY)
     when_gmt=_slot_kst(10,0)
     res=post_wp(title, body, when_gmt, DEFAULT_CATEGORY)
     print(json.dumps({"id":res.get("id"),"title":title,"date_gmt":res.get("date_gmt"),"link":res.get("link")}, ensure_ascii=False))
@@ -223,7 +277,7 @@ def _post_two_diaries():
     for when in slots:
         kw=_fresh_general_keyword()
         title=_build_title(kw)
-        body=_render_diary(kw, DEFAULT_CATEGORY)
+        body=_render_diary_long(kw, DEFAULT_CATEGORY)
         res=post_wp(title, body, when, DEFAULT_CATEGORY)
         print(json.dumps({"id":res.get("id"),"title":title,"date_gmt":res.get("date_gmt"),"link":res.get("link")}, ensure_ascii=False))
         _mark_used(kw)
