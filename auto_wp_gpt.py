@@ -13,7 +13,15 @@ from zoneinfo import ZoneInfo
 from typing import Dict, Optional
 import requests
 from dotenv import load_dotenv
-from python_slugify import slugify
+
+# slugify import (package name: python-slugify)
+try:
+    from slugify import slugify          # 정상 import 이름
+except ImportError:
+    try:
+    from slugify import slugify
+except ImportError:
+    from python_slugify import slugify   # 환경에 따라 대비
 
 load_dotenv()
 
@@ -154,3 +162,4 @@ if __name__=="__main__":
     import sys
     mode=sys.argv[sys.argv.index("--mode")+1] if "--mode" in sys.argv else "two-posts"
     main(mode)
+
