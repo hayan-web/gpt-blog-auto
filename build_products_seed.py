@@ -1,72 +1,119 @@
 # -*- coding: utf-8 -*-
 """
-build_products_seed.py — 자동으로 products_seed.csv 채우기
-- keywords.csv 의 상위 키워드 1~2개를 사용
-- Coupang Partners "products/search"로 최대 10개씩 가져와서 CSV로 저장
-- ENV:
-    COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY  (필수)
-    PRODUCTS_SEED_CSV=products_seed.csv     (기본값)
-    MAX_PER_KEYWORD=8
-    USE_KEYWORDS_N=2
+build_products_seed.py
+- golden_shopping_keywords.csv의 상위 키워드로 씨드 CSV(products_seed.csv) 생성
+- REQUIRE_COUPANG_API=1 이고 키/채널 설정이 있으면 coupang_api.deeplink_for_query()로 딥링크 생성
+- 실패 시 Coupang 검색 URL로 폴백하여 행을 채워, 이후 단계가 끊기지 않게 보장
+- 출력 스키마: product_name,raw_url,pros,cons,keyword,title,url,image
 """
-import os, csv, sys
-from typing import List, Dict
-from coupang_search import search_products
 
-CSV_PATH = os.getenv("PRODUCTS_SEED_CSV","products_seed.csv")
-MAX_PER_KEYWORD = int(os.getenv("MAX_PER_KEYWORD","8"))
-USE_KEYWORDS_N = int(os.getenv("USE_KEYWORDS_N","2"))
-ACCESS = os.getenv("COUPANG_ACCESS_KEY","").strip()
-SECRET = os.getenv("COUPANG_SECRET_KEY","").strip()
+from __future__ import annotations
+import os, csv, sys, html, traceback
+from typing import List, Optional
+from dotenv import load_dotenv
 
-def read_keywords(path="keywords.csv", n=2) -> List[str]:
+load_dotenv()
+
+# ===== ENV =====
+PRODUCTS_SEED_CSV = os.getenv("PRODUCTS_SEED_CSV", "products_seed.csv")
+P_GOLD = "golden_shopping_keywords.csv"
+
+REQUIRE_COUPANG_API = (os.getenv("REQUIRE_COUPANG_API") or "0").strip().lower() in ("1", "true", "yes", "on")
+COUNT = int(os.getenv("SEED_COUNT") or "12")  # 한 번에 뽑을 키워드 수 (원하면 .env에서 조정)
+COUPANG_DEBUG = (os.getenv("COUPANG_DEBUG") or "0").strip().lower() in ("1", "true", "yes", "on")
+
+# ===== Optional import (API 사용 조건일 때만) =====
+DEEPLINK_AVAILABLE = False
+if REQUIRE_COUPANG_API:
+    try:
+        from coupang_api import deeplink_for_query  # 우리가 만든 모듈
+        DEEPLINK_AVAILABLE = True
+    except Exception:
+        DEEPLINK_AVAILABLE = False
+
+def _read_col_csv(path: str) -> List[str]:
     if not os.path.exists(path):
         return []
-    with open(path, "r", encoding="utf-8") as f:
-        line = f.readline().strip()
-    parts = [x.strip() for x in line.split(",") if x.strip()]
-    return parts[:max(1,n)]
+    out: List[str] = []
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        rd = csv.reader(f)
+        for i, row in enumerate(rd):
+            if not row:
+                continue
+            if i == 0 and row[0].strip().lower() in ("keyword", "title"):
+                continue
+            s = row[0].strip()
+            if s:
+                out.append(s)
+    return out
 
-def build_rows(keyword: str) -> List[Dict[str,str]]:
-    items = search_products(keyword, ACCESS, SECRET, limit=MAX_PER_KEYWORD, sort="salesVolume")
-    rows = []
-    for it in items[:MAX_PER_KEYWORD]:
-        rows.append({
-            "keyword": keyword,
-            "product_name": it["productName"],
-            "raw_url": it["productUrl"],  # 딥링크는 affiliate_post 단계에서 처리
-            "pros": "",
-            "cons": ""
-        })
-    return rows
+def _coupang_search_url(q: str) -> str:
+    from urllib.parse import quote_plus
+    return f"https://search.shopping.coupang.com/search?component=&q={quote_plus(q)}&channel=rel"
 
-def main()->int:
-    if not (ACCESS and SECRET):
-        print("[build_products_seed] SKIP: COUPANG_ACCESS_KEY/SECRET_KEY 가 비어있음")
-        return 0
-    kws = read_keywords("keywords.csv", n=USE_KEYWORDS_N)
-    if not kws:
-        print("[build_products_seed] SKIP: keywords.csv 가 비어있음")
-        return 0
-    all_rows: List[Dict[str,str]] = []
-    for kw in kws:
+def _safe_deeplink(q: str) -> str:
+    """
+    딥링크를 우선 시도하고, 실패 시 검색 URL 반환.
+    """
+    if REQUIRE_COUPANG_API and DEEPLINK_AVAILABLE:
         try:
-            rows = build_rows(kw)
-            print(f"[build_products_seed] '{kw}' -> {len(rows)}개")
-            all_rows.extend(rows)
+            return deeplink_for_query(q)
         except Exception as e:
-            print(f"[build_products_seed] WARN: '{kw}' 실패: {e}")
-    if not all_rows:
+            if COUPANG_DEBUG:
+                print(f"[build_products_seed] deeplink error: {type(e).__name__}: {e}", file=sys.stderr)
+                traceback.print_exc()
+    return _coupang_search_url(q)
+
+def _ensure_header(path: str):
+    # 항상 헤더부터 씀(덮어쓰기). 다운스트림에서 헤더를 기대하므로 명시적으로 재작성.
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(["product_name", "raw_url", "pros", "cons", "keyword", "title", "url", "image"])
+
+def _append_row(path: str, row: List[str]):
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        wr = csv.writer(f)
+        wr.writerow(row)
+
+def main():
+    pool = _read_col_csv(P_GOLD)
+    if not pool:
+        print("[build_products_seed] WARN: golden_shopping_keywords.csv 비어 있음(헤더만 있거나 파일 없음)")
+        _ensure_header(PRODUCTS_SEED_CSV)
         print("[build_products_seed] 생성된 행이 없습니다.")
-        return 0
-    # 헤더 쓰기
-    with open(CSV_PATH, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["keyword","product_name","raw_url","pros","cons"])
-        w.writeheader()
-        for r in all_rows:
-            w.writerow(r)
-    print(f"[build_products_seed] 저장: {CSV_PATH} ({len(all_rows)}행)")
-    return 0
+        return
+
+    # 뽑을 수 만큼 슬라이스(맨 위부터)
+    picks = pool[:max(1, COUNT)]
+
+    _ensure_header(PRODUCTS_SEED_CSV)
+    inserted = 0
+
+    for kw in picks:
+        # 우선 딥링크 → 실패 시 검색 URL
+        url = _safe_deeplink(kw)
+
+        # seed CSV 스키마에 맞춰 채우기
+        product_name = kw
+        raw_url = _coupang_search_url(kw)  # 원본 검색 URL(딥링크 전)
+        pros = ""   # 나중에 풍부화 가능
+        cons = ""   # 나중에 풍부화 가능
+        title = kw  # 기본 타이틀(본문 단계에서 대체됨)
+        image = ""  # 이미지 선택 로직이 없으므로 빈칸
+
+        _append_row(PRODUCTS_SEED_CSV, [
+            product_name, raw_url, pros, cons, kw, title, url, image
+        ])
+        inserted += 1
+
+    print(f"[build_products_seed] OK: {inserted} rows -> {PRODUCTS_SEED_CSV}")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        main()
+    except Exception as e:
+        print(f"[build_products_seed] FATAL: {type(e).__name__}: {e}", file=sys.stderr)
+        if os.getenv("CI"):
+            # CI에서는 non-zero로 실패해도 워크플로 전체를 끊지 않게 상위 스텝에서 || true 처리 권장
+            sys.exit(1)
+        raise

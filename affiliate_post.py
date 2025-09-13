@@ -10,7 +10,7 @@ affiliate_post.py — 쿠팡 글 자동 발행
 """
 
 from __future__ import annotations
-import os, csv, json, re, html, random
+import os, csv, json, re, html
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Optional
@@ -41,7 +41,7 @@ DISCLOSURE_TEXT = os.getenv("DISCLOSURE_TEXT") or ""
 USAGE_DIR = os.getenv("USAGE_DIR") or ".usage"
 USED_SHOP = os.path.join(USAGE_DIR, "used_shopping.txt")
 
-REQUIRE_COUPANG_API = (os.getenv("REQUIRE_COUPANG_API") or "0").strip() in ("1", "true", "yes", "on")
+REQUIRE_COUPANG_API = (os.getenv("REQUIRE_COUPANG_API") or "0").strip().lower() in ("1", "true", "yes", "on")
 
 # 파일 경로
 P_GOLD = "golden_shopping_keywords.csv"
@@ -323,16 +323,13 @@ def main():
         print("[AFFILIATE] SKIP: no keyword")
         return
 
-    # 링크 URL: 딥링크 함수가 있다면 resolve_affiliate_url로 연결, 기본은 검색 URL
+    # 링크 URL: 딥링크 우선 시도, 실패 시 안전 폴백(검색 URL)
     try:
-    # 딥링크 우선
-    url = deeplink_for_query(kw)
-except Exception as e:
-    # 실패 시 안전 폴백
-    from urllib.parse import quote
-    url = f"https://search.shopping.coupang.com/search?component=&q={quote(kw)}&channel=rel"
-    print(f"[AFFILIATE] deeplink fallback: {e}")
-
+        url = deeplink_for_query(kw)
+    except Exception as e:
+        from urllib.parse import quote
+        url = f"https://search.shopping.coupang.com/search?component=&q={quote(kw)}&channel=rel"
+        print(f"[AFFILIATE] deeplink fallback: {e}")
 
     prod = _build_product_skeleton(kw)
     content_html = _render_rich(prod, url)   # 버튼/위치 불변 + 1500자 보장
