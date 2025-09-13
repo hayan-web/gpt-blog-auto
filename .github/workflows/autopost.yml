@@ -104,7 +104,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git pull --rebase origin "${GITHUB_REF_NAME:-main}" || true
-          git add -f golden_shopping_keywords.csv keywords_shopping.csv .usage/ || true
+          git add -f golden_shopping_keywords.csv keywords_shopping.csv keywords_general.csv .usage/ || true
           if git diff --cached --quiet; then
             echo "[INFO] nothing to commit"
           else
