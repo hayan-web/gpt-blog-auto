@@ -10,18 +10,9 @@ from __future__ import annotations
 import os, json, re, html
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Dict, Optional
+from typing import Optional
 import requests
 from dotenv import load_dotenv
-
-# slugify import (package name: python-slugify)
-try:
-    from slugify import slugify          # 정상 import 이름
-except ImportError:
-    try:
-    from slugify import slugify
-except ImportError:
-    from python_slugify import slugify   # 환경에 따라 대비
 
 load_dotenv()
 
@@ -151,7 +142,7 @@ def main(mode: str="two-posts"):
         ["에너지 높였던 순간 1가지","실패에서 배운 것 1가지","다음에 개선할 것 1가지"],
     ]
 
-    for i,(hh,tt,hl) in enumerate(zip(slots, titles, highlights)):
+    for hh,tt,hl in zip(slots, titles, highlights):
         html_body=_build_diary_html(tt, hl)
         html_body=_ensure_min_chars(html_body, 1500)
         when=_slot_to_utc(hh)
@@ -162,4 +153,3 @@ if __name__=="__main__":
     import sys
     mode=sys.argv[sys.argv.index("--mode")+1] if "--mode" in sys.argv else "two-posts"
     main(mode)
-
