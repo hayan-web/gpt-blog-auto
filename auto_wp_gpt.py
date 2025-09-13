@@ -1,17 +1,17 @@
 ﻿# -*- coding: utf-8 -*-
 """
 auto_wp_gpt.py — 일상글 2건 예약
-- 소제목 '요약글' 제거(본문만 보이게)
-- 모든 소제목(h2/h3) 녹색 포인트 일관 적용(.dx 네임스페이스)
-- CTA 버튼 복구(녹색 pill), 상단/중단 광고 삽입(AD_SHORTCODE)
+- KEYWORDS_CSV에서 상위 2개 키워드를 사용해 제목 생성, 사용 후 CSV 회전(head→tail)
+- 사용 로그 .usage/used_general.txt 기록
+- 소제목 '요약글' 제거, 모든 소제목 녹색 포인트, CTA 버튼, AD 상/중
 - 1500자 보강: 중복 금지, 최대 3블록
 """
 
 from __future__ import annotations
-import os, json, re, html
+import os, csv, json, re, html
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Optional, List
 import requests
 from dotenv import load_dotenv
 
@@ -24,11 +24,15 @@ VERIFY_TLS=(os.getenv("WP_TLS_VERIFY") or "true").lower()!="false"
 POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()
 DEFAULT_CATEGORY=(os.getenv("DEFAULT_CATEGORY") or "정보").strip() or "정보"
 
+KEYWORDS_CSV=(os.getenv("KEYWORDS_CSV") or "keywords_general.csv").strip()
+USAGE_DIR=os.getenv("USAGE_DIR") or ".usage"
+USED_GENERAL=os.path.join(USAGE_DIR,"used_general.txt")
+
 AD_SHORTCODE=os.getenv("AD_SHORTCODE") or ""
 READMORE_URL=(os.getenv("READMORE_URL") or WP_URL or "").strip()
 
 REQ_HEADERS={
-    "User-Agent": os.getenv("USER_AGENT") or "gpt-blog-auto/diary-2.1",
+    "User-Agent": os.getenv("USER_AGENT") or "gpt-blog-auto/diary-2.2",
     "Accept":"application/json",
     "Content-Type":"application/json; charset=utf-8"
 }
@@ -52,26 +56,27 @@ def _css()->str:
 def _esc(s: Optional[str])->str:
     return html.escape((s or "").strip())
 
-def _strip_tags(s:str)->str:
+def _strip_tags(s: str) -> str:
     return re.sub(r"<[^>]+>", "", s or "")
 
-def _nchars(x:str)->int:
+def _nchars(x: str) -> int:
     return len(re.sub(r"\s+","",_strip_tags(x)))
 
-def _ensure_min_chars(body:str, min_chars:int=1500)->str:
-    if _nchars(body)>=min_chars:
+def _ensure_min_chars(body: str, min_chars: int = 1500) -> str:
+    if _nchars(body) >= min_chars:
         return body
-    fillers=[
-        "<h3>작은 한 걸음</h3><p>완벽보다 빈도가 중요합니다. 측정 가능한 지표 한 줄을 정하고 다음 행동을 캘린더에 바로 배치하세요.</p>",
-        "<h3>되돌아보기</h3><p>오늘의 결정이 1주 뒤에도 같은 결정을 돕는지 확인합니다. 재사용 가능한 문장 한 줄을 남겨두면 실행이 쉬워집니다.</p>",
-        "<h3>방해요소 차단</h3><p>내일 아침 30분만 환경을 단순화하세요. 알림/탭/물건을 치우고 핵심 도구만 남기면 집중이 쉬워집니다.</p>",
+    fillers = [
+        "<h3>작은 한 걸음</h3><p>완벽보다 빈도가 중요합니다. 측정 가능한 지표 한 줄을 정하고, 다음 행동을 캘린더에 바로 배치하세요.</p>",
+        "<h3>되돌아보기</h3><p>오늘의 결정이 1주 후에도 같은 결정을 돕는지 확인합니다. 재사용 가능한 문장 한 줄을 남겨두면 실행이 쉬워집니다.</p>",
+        "<h3>방해요소 차단</h3><p>내일 아침 30분 동안 환경을 단순화하세요. 불필요한 알림/탭/물건을 치우고 핵심 도구만 남기면 집중이 쉬워집니다.</p>",
     ]
     used=set()
     buf=body
     for b in fillers:
-        if _nchars(buf)>=min_chars: break
+        if _nchars(buf) >= min_chars: break
         if b not in used and b not in buf:
-            buf+="\n"+b; used.add(b)
+            buf += "\n" + b
+            used.add(b)
     return buf
 
 def _cta()->str:
@@ -80,23 +85,22 @@ def _cta()->str:
     u=_esc(READMORE_URL)
     return f'<div class="btn-wrap"><a class="btn" href="{u}" target="_blank" rel="noopener">정보 글 더 보기</a></div>'
 
-def _build_diary_html(title:str, highlights:list[str])->str:
-    hls="".join(f"<li>{_esc(x)}</li>" for x in highlights[:3])
-    parts=[
+def _build_diary_html(title: str, highlight: list[str]) -> str:
+    hls = "".join(f"<li>{_esc(x)}</li>" for x in highlight[:3])
+    parts = [
         _css(),
         '<div class="dx">',
-        (AD_SHORTCODE or ""),                               # 상단 광고
-        # '요약글' 소제목 제거 — 바로 요약 문단
+        (AD_SHORTCODE or ""),  # 상단 광고
+        # 요약 소제목 제거 — 바로 박스 요약
         f'<div class="callout"><p>오늘의 기록—‘{_esc(title)}’—을 한 단락으로 정리합니다. 핵심만 간결하게 남겨두면 복기가 빨라집니다.</p></div>',
         _cta(),
         '<h2>하이라이트</h2>',
         f'<ul>{hls}</ul>',
-        (AD_SHORTCODE or ""),                               # 중단 광고
+        (AD_SHORTCODE or ""),  # 중간 광고
         '<h2>실행</h2>',
         '<ul><li>내일 5분 안에 시작할 첫 행동</li><li>2주간 유지할 지표 1개</li><li>하지 않을 것 1가지</li></ul>',
         '<h2>지표/회고</h2>',
         '<p>집중 시간, 피드백 횟수, 완료/보류 항목을 간단히 기록합니다. 작은 진동의 누적이 다음 선택의 난이도를 낮춥니다.</p>',
-        # 이하 하위 소제목도 h3로 녹색 포인트 유지
         '<h3>작은 한 걸음</h3><p>지표 한 줄 + 다음 행동을 일정에 바로 배치해 주세요.</p>',
         '<h3>되돌아보기</h3><p>오늘의 결정이 같은 맥락에서 다시 도움이 될지 점검합니다.</p>',
         '<h3>방해요소 차단</h3><p>알림/탭/물건을 치우고 핵심 도구만 남기면 집중이 쉬워집니다.</p>',
@@ -104,6 +108,42 @@ def _build_diary_html(title:str, highlights:list[str])->str:
     ]
     return "\n".join(p for p in parts if p)
 
+# ---------- 키워드 회전 ----------
+def _read_col_csv(path:str)->List[str]:
+    if not os.path.exists(path): return []
+    out=[]
+    with open(path,"r",encoding="utf-8",newline="") as f:
+        for i,row in enumerate(csv.reader(f)):
+            if not row: continue
+            if i==0 and row[0].strip().lower() in ("keyword","title"): continue
+            s=row[0].strip()
+            if s: out.append(s)
+    return out
+
+def _rotate_csv_head_to_tail_n(path:str, n:int):
+    if not os.path.exists(path) or n<=0: return
+    with open(path,"r",encoding="utf-8",newline="") as f:
+        rows=list(csv.reader(f))
+    if len(rows)<2: return
+    header,data=rows[0],rows[1:]
+    n=min(n,len(data))
+    head=data[:n]; rest=data[n:]
+    data=rest+head
+    with open(path,"w",encoding="utf-8",newline="") as f:
+        wr=csv.writer(f); wr.writerow(header); wr.writerows(data)
+
+def _pick_keywords(n:int=2)->List[str]:
+    pool=_read_col_csv(KEYWORDS_CSV)
+    if not pool: return []
+    return pool[:n]
+
+def _mark_used_general(kws:List[str]):
+    os.makedirs(USAGE_DIR, exist_ok=True)
+    with open(USED_GENERAL,"a",encoding="utf-8") as f:
+        for kw in kws:
+            f.write(f"{datetime.utcnow().date():%Y-%m-%d}\t{kw}\n")
+
+# ---------- WP ----------
 def _ensure_term(kind:str, name:str)->int:
     r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}",
                    params={"search":name,"per_page":50,"context":"edit"},
@@ -142,12 +182,21 @@ def _slot_to_utc(hh:int)->str:
     if tgt<=now: tgt+=timedelta(days=1)
     return tgt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
-def main(mode:str="two-posts"):
+# ---------- 메인 ----------
+def main(mode: str="two-posts"):
     if not (WP_URL and WP_USER and WP_APP_PASSWORD):
         raise RuntimeError("WP_URL/WP_USER/WP_APP_PASSWORD 필요")
 
     slots=[10,17]
-    titles=["프로젝트 회고 점검 노트","작은 습관 정리 메모"]
+    kws=_pick_keywords(2)
+
+    if len(kws)>=2:
+        titles=[f"{kws[0]} 회고 점검 노트", f"{kws[1]} 작은 습관 정리 메모"]
+    elif len(kws)==1:
+        titles=[f"{kws[0]} 회고 점검 노트", "작은 습관 정리 메모"]
+    else:
+        titles=["프로젝트 회고 점검 노트","작은 습관 정리 메모"]  # 완전 비상시
+
     highlights=[
         ["가장 좋았던 선택 1가지","의외의 장애물 1가지","내일도 반복할 습관 1가지"],
         ["에너지 높였던 순간 1가지","실패에서 배운 점 1가지","다음에 개선할 것 1가지"],
@@ -160,7 +209,12 @@ def main(mode:str="two-posts"):
         res=_post_wp(tt, html_body, when, DEFAULT_CATEGORY)
         print(json.dumps({"id":res.get("id"),"title":tt,"date_gmt":res.get("date_gmt")}, ensure_ascii=False))
 
+    # 키워드 사용/회전 처리
+    if kws:
+        _mark_used_general(kws)
+        _rotate_csv_head_to_tail_n(KEYWORDS_CSV, len(kws))
+
 if __name__=="__main__":
     import sys
-    mode=sys.argv[sys.argv.index("--mode")+1] if "--mode" in sys.argv else "two-posts"
+    mode=sys.argv[self.__doc__ and "--mode" in sys.argv and sys.argv.index("--mode")+1 or -1] if "--mode" in sys.argv else "two-posts"
     main(mode)

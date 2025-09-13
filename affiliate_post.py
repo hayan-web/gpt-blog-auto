@@ -2,11 +2,9 @@
 """
 affiliate_post.py — 쿠팡 글 자동 발행 (기사형/녹색 포인트)
 - 대가성 문구 최상단(강조 블록)
-- '요약글' 소제목 제거(요약 본문만 보이게)
-- 모든 소제목(h2/h3) 동일한 녹색 포인트 스타일
-- 버튼: 기존 프로젝트 _button_html/BUTTON_PRIMARY 우선, 없으면 로컬 폴백 + 중앙 정렬
-- 내부광고(AD_SHORTCODE) 상/중 삽입
-- 본문 보강: 중복 금지, 최대 3블록
+- 요약을 '박스(callout)'로 노출(일상글과 톤 통일)
+- 모든 소제목(h2/h3) 녹색 포인트 스타일
+- 버튼 중앙 정렬, AD 상/중, 보강은 중복 금지·최대 3블록
 """
 
 from __future__ import annotations
@@ -38,7 +36,7 @@ REQUIRE_COUPANG_API=(os.getenv("REQUIRE_COUPANG_API") or "0").strip().lower() in
 P_GOLD="golden_shopping_keywords.csv"
 
 REQ_HEADERS={
-    "User-Agent": os.getenv("USER_AGENT") or "gpt-blog-auto/aff-2.2",
+    "User-Agent": os.getenv("USER_AGENT") or "gpt-blog-auto/aff-2.3",
     "Accept":"application/json",
     "Content-Type":"application/json; charset=utf-8"
 }
@@ -52,6 +50,7 @@ def _css()->str:
 .dx h3{font-size:1.18em;font-weight:700}
 .dx .disclosure{background:#ecfdf5;border:1px solid #16a34a33;color:#065f46;padding:.8em 1em;
                border-radius:.75rem;font-weight:700;margin:0 0 1em}
+.dx .callout{background:#f1f5f9;border-left:3px solid #94a3b8;padding:.9em 1em;border-radius:.6rem;margin:.25em 0 1em}
 .dx .btn-wrap{text-align:center;margin:16px 0}
 .dx table{width:100%;border-collapse:collapse}
 .dx th,.dx td{border:1px solid #e5e7eb;padding:.6em .75em}
@@ -190,8 +189,8 @@ def _render_body(product:Dict, url:str)->str:
         '<div class="dx">',
         f'<div class="disclosure">{_esc(DISCLOSURE_TEXT) or "이 글은 파트너스 활동으로 수수료를 받을 수 있습니다."}</div>',
         (AD_SHORTCODE or ""),                         # 광고(상)
-        # '요약글' 소제목 없이 요약 문단만
-        f'<p class="lead">{summary}</p>',
+        # 요약: 박스 형태
+        f'<div class="callout"><p>{summary}</p></div>',
         bh,
         '<h2>정보 글</h2>',
         '<p>실사용 관점에서 자주 쓰는 기능과 관리 난도를 먼저 확인하면 선택이 쉬워집니다. 공간·소음·예산을 기준으로 필요한 수준만 고르세요.</p>',
@@ -207,7 +206,7 @@ def _render_body(product:Dict, url:str)->str:
     ]
     return "\n".join(parts)
 
-# ---------- 키워드 ----------
+# ---------- 키워드/회전 ----------
 def _read_col_csv(path:str)->List[str]:
     if not os.path.exists(path): return []
     out=[]
@@ -263,11 +262,9 @@ def main():
     when_gmt=_slot_to_utc(slot)
     title=f"{kw} 이렇게 쓰니 편해요"
     res=post_wp(title, body, when_gmt, AFFILIATE_CATEGORY)
-    print(json.dumps({
-        "post_id":res.get("id"),"link":res.get("link"),
-        "status":res.get("status"),"date_gmt":res.get("date_gmt"),
-        "title":title,"keyword":kw
-    }, ensure_ascii=False))
+    print(json.dumps({"post_id":res.get("id"),"link":res.get("link"),
+                      "status":res.get("status"),"date_gmt":res.get("date_gmt"),
+                      "title":title,"keyword":kw}, ensure_ascii=False))
 
     _mark_used(kw)
     _rotate_after_use()
