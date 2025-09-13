@@ -1,16 +1,16 @@
 ﻿# -*- coding: utf-8 -*-
 """
-auto_wp_gpt.py — 일상글 2건 예약(10시/17시), 녹색 포인트 스타일
-- 기사형 섹션 구조 + .dx 네임스페이스 CSS
-- AD 상/중 삽입
-- 1500자 보강: 중복 없이 최대 3블록
+auto_wp_gpt.py — 일상글 2건 예약(10시/17시)
+- .dx 네임스페이스: 모든 h2/h3 녹색 포인트 스타일
+- 대가성 문구는 없음(일상글) / 내부 광고 상+중 삽입
+- 1500자 보강은 컨테이너 내부에서만 (스타일 유지)
 """
 
 from __future__ import annotations
 import os, json, re, html
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Dict, Optional
+from typing import Optional
 import requests
 from dotenv import load_dotenv
 
@@ -22,8 +22,7 @@ WP_APP_PASSWORD=os.getenv("WP_APP_PASSWORD") or ""
 VERIFY_TLS=(os.getenv("WP_TLS_VERIFY") or "true").lower()!="false"
 POST_STATUS=(os.getenv("POST_STATUS") or "future").strip()
 DEFAULT_CATEGORY=(os.getenv("DEFAULT_CATEGORY") or "정보").strip() or "정보"
-AD_SHORTCODE=os.getenv("AD_SHORTCODE") or ""
-AD_INSERT_MIDDLE=os.getenv("AD_INSERT_MIDDLE") or AD_SHORTCODE
+AD_SHORTCODE=os.getenv("AD_SHORTCODE") or ""   # 상/중 동일 사용
 
 REQ_HEADERS={
     "User-Agent": os.getenv("USER_AGENT") or "gpt-blog-auto/diary-2.1",
@@ -34,13 +33,12 @@ REQ_HEADERS={
 def _css():
     return """
 <style>
-.dx { line-height:1.8; letter-spacing:-.01em }
-.dx h2{font-size:1.6em;margin:1.2em 0 .5em;font-weight:800}
-.dx h2 .bar{display:inline-block;width:.32em;height:.9em;margin-right:.45em;background:#16a34a;border-radius:.2em;vertical-align:-.1em}
-.dx .callout{background:#f8fafc;border-left:3px solid #94a3b8;padding:.9em 1em;border-radius:.6rem}
-.dx .cta-wrap{ text-align:center; margin:18px 0 }
-.dx .cta{ display:inline-block; padding:14px 26px; border-radius:9999px; background:#16a34a; color:#fff; font-weight:800; text-decoration:none }
-.dx .muted{ color:#64748b }
+.dx{line-height:1.85;letter-spacing:-.01em}
+.dx h2{font-size:1.6em;margin:1.2em 0 .55em;font-weight:800;letter-spacing:-.02em}
+.dx h2::before{content:"";display:inline-block;width:.42em;height:.95em;background:#16a34a;border-radius:.22em;margin-right:.45em;vertical-align:-.08em}
+.dx h3{font-size:1.15em;margin:1.0em 0 .4em;font-weight:700}
+.dx .callout{background:#f8fafc;border-left:3px solid #94a3b8;padding:.9em 1em;border-radius:.7rem}
+.dx .btnwrap{text-align:center;margin:16px 0}
 </style>
 """.strip()
 
@@ -53,41 +51,35 @@ def _strip_tags(s: str) -> str:
 def _nchars(x: str) -> int:
     return len(re.sub(r"\s+","",_strip_tags(x)))
 
-def _ensure_min_chars(body: str, min_chars: int = 1500) -> str:
-    if _nchars(body) >= min_chars:
-        return body
+def _ensure_min_chars_inner(inner: str, min_chars: int = 1500) -> str:
+    if _nchars(inner) >= min_chars:
+        return inner
     fillers = [
-        "<h3>작은 한 걸음</h3><p>완벽보다 빈도가 중요합니다. 측정 가능한 지표를 한 줄로 정리하고, 다음 행동을 캘린더에 바로 배치하세요.</p>",
-        "<h3>되돌아보기</h3><p>오늘의 결정이 1주 후에도 같은 결정을 돕는가를 확인합니다. 재사용 가능한 문장 한 줄을 남겨두면 다음 실행이 쉬워집니다.</p>",
-        "<h3>방해요소 차단</h3><p>내일 아침 30분 동안 환경을 단순화해보세요. 불필요한 알림/탭/물건을 치우고 핵심 도구만 남기면 집중이 쉬워집니다.</p>",
+        "<h3>작은 한 걸음</h3><p>완벽보다 빈도가 중요합니다. 측정 가능한 지표 한 줄과 다음 행동을 캘린더에 바로 배치하세요.</p>",
+        "<h3>되돌아보기</h3><p>오늘 결정이 1주 후에도 같은 결정을 돕는가를 확인합니다. 재사용 문장 한 줄을 남겨두세요.</p>",
+        "<h3>방해요소 차단</h3><p>내일 아침 30분만 환경을 단순화해 보세요. 알림/탭/물건을 치우고 핵심 도구만 남기면 집중이 쉬워집니다.</p>",
     ]
-    buf=body
-    used=0
+    used=set()
+    buf=inner
     for b in fillers:
         if _nchars(buf) >= min_chars: break
-        buf += "\n" + b
-        used+=1
-        if used>=3: break
+        if b not in used and b not in buf:
+            buf += "\n" + b
+            used.add(b)
     return buf
 
-def _build_diary_html(title: str, highlight: list[str]) -> str:
+def _build_diary_inner(title: str, highlight: list[str]) -> str:
     hls = "".join(f"<li>{_esc(x)}</li>" for x in highlight[:3])
-    parts = [
-        _css(),
-        '<div class="dx">',
-        (AD_SHORTCODE or ""),  # 상단 광고
-        f'<h2><span class="bar"></span>요약글</h2>',
-        f'<div class="callout"><p>오늘의 기록—‘{_esc(title)}’—을 한 단락으로 정리합니다. 핵심만 간결하게 남겨 두면 복기가 빨라집니다.</p></div>',
-        f'<h2><span class="bar"></span>하이라이트</h2>',
-        f'<ul>{hls}</ul>',
-        (AD_INSERT_MIDDLE or ""),  # 중간 광고
-        f'<h2><span class="bar"></span>실행</h2>',
-        '<ul><li>내일 5분 안에 시작할 첫 행동</li><li>2주 유지할 지표 1개</li><li>하지 않을 것 1가지</li></ul>',
-        f'<h2><span class="bar"></span>지표/회고</h2>',
-        '<p class="muted">집중 시간, 피드백 횟수, 완료/보류 항목을 간단히 기록합니다. 작은 진동의 누적이 다음 선택의 난이도를 낮춥니다.</p>',
-        '</div>'
-    ]
-    return "\n".join(p for p in parts if p)
+    parts = []
+    if AD_SHORTCODE:
+        parts.append(AD_SHORTCODE)   # 상단 광고
+    parts.append(f'<h2>요약글</h2><div class="callout"><p>오늘의 기록—‘{_esc(title)}’—을 한 단락으로 정리합니다. 핵심만 간결하게 남겨두면 복기가 빨라집니다.</p></div>')
+    parts.append(f'<h2>하이라이트</h2><ul>{hls}</ul>')
+    if AD_SHORTCODE:
+        parts.append(AD_SHORTCODE)   # 중간 광고
+    parts.append('<h2>실행</h2><ul><li>내일 5분 안에 시작할 첫 행동</li><li>2주 유지할 지표 1개</li><li>하지 않을 것 1가지</li></ul>')
+    parts.append('<h2>지표/회고</h2><p>집중 시간, 피드백 횟수, 완료/보류 항목을 간단히 기록합니다. 작은 진동의 누적이 다음 선택의 난이도를 낮춥니다.</p>')
+    return "\n".join(parts)
 
 def _ensure_term(kind:str, name:str)->int:
     r=requests.get(f"{WP_URL}/wp-json/wp/v2/{kind}",
@@ -139,8 +131,9 @@ def main(mode: str="two-posts"):
     ]
 
     for hh,tt,hl in zip(slots, titles, highlights):
-        html_body=_build_diary_html(tt, hl)
-        html_body=_ensure_min_chars(html_body, 1500)
+        inner=_build_diary_inner(tt, hl)
+        inner=_ensure_min_chars_inner(inner, 1500)
+        html_body=_css() + f'\n<div class="dx">\n{inner}\n</div>'
         when=_slot_to_utc(hh)
         res=_post_wp(tt, html_body, when, DEFAULT_CATEGORY)
         print(json.dumps({"id":res.get("id"),"title":tt,"date_gmt":res.get("date_gmt")}, ensure_ascii=False))
