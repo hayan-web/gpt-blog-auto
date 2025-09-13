@@ -22,6 +22,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -31,7 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-            - name: Write .env from secrets
+      - name: Write .env from secrets
         run: |
           cat > .env <<'EOF'
           WP_URL=${{ secrets.WP_URL }}
@@ -56,7 +57,7 @@ jobs:
           USAGE_DIR=.usage
           LLM_LOG_FILENAME=llm.log
           AFFILIATE_TIMES_KST=${{ env.AFFILIATE_TIMES_KST }}
-          AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}      # ← 추가
+          AD_SHORTCODE=${{ secrets.AD_SHORTCODE }}
           EOF
 
       - name: Update keywords (optional)
