@@ -1,231 +1,138 @@
 # -*- coding: utf-8 -*-
 """
-coupang_api.py — Coupang Partners OpenAPI v1 딥링크 유틸
-- CEA(HMAC-SHA256) 서명
-- GET 시도 후 실패하면 POST로 재시도(듀얼 경로)
-- 단건 키워드→검색URL 딥링크(deeplink_for_query)
-- 다건 URL 딥링크(deeplink_for_urls)
-
-환경변수(.env / GitHub Secrets)
-- COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY, COUPANG_CHANNEL_ID (필수)
-- COUPANG_SUBID_PREFIX=auto (선택)
-- COUPANG_DEBUG=1 (선택, 서명/쿼리 디버그 출력)
-- WP_TLS_VERIFY=true (선택, 기본 true)
+coupang_api.py — Coupang Partners 딥링크 유틸 (검색 페이지 전용)
+- 환경변수:
+  COUPANG_ACCESS_KEY, COUPANG_SECRET_KEY, COUPANG_CHANNEL_ID(옵션),
+  COUPANG_SUBID_PREFIX(기본 auto), REQUIRE_COUPANG_API(1/true면 API 시도)
+- 기능:
+  1) coupang_search_url(keyword): 쿠팡 검색 결과 URL(일반)
+  2) api_create_deeplink(urls, sub_id): API로 딥링크(단축링크) 생성
+  3) deeplink_for_search(keyword, sub_id=None): 검색 URL → 딥링크(실패시 일반 URL)
+  4) deeplink_for_query(keyword): 기존 호환용(= deeplink_for_search)
 """
 
 from __future__ import annotations
-import os, hmac, hashlib, base64, time, json
+import os, json, hmac, hashlib, base64
 from datetime import datetime, timezone
-from typing import Iterable, List, Tuple
-from urllib.parse import quote, quote_plus
+from typing import List, Optional
+from urllib.parse import quote_plus
 import requests
+from dotenv import load_dotenv
 
-COUPANG_ACCESS_KEY = (os.getenv("COUPANG_ACCESS_KEY") or "").strip()
-COUPANG_SECRET_KEY = (os.getenv("COUPANG_SECRET_KEY") or "").strip()
-COUPANG_CHANNEL_ID = (os.getenv("COUPANG_CHANNEL_ID") or "").strip()
-COUPANG_SUBID_PREFIX = (os.getenv("COUPANG_SUBID_PREFIX") or "auto").strip()
+load_dotenv()
 
-VERIFY_TLS = (os.getenv("WP_TLS_VERIFY") or "true").lower() != "false"
-USER_AGENT = os.getenv("USER_AGENT") or "gpt-blog-auto/aff-2.0"
-COUPANG_DEBUG = (os.getenv("COUPANG_DEBUG") or "0").strip().lower() in ("1","true","yes","on")
+API_HOST = "https://api-gateway.coupang.com"
+DEEPLINK_PATH = "/v2/providers/affiliate_open_api/apis/open/api/v1/deeplink"
 
-HOST = "https://api-gateway.coupang.com"
-DEEPLINK_PATH = "/v2/providers/affiliate_open_api/apis/openapi/v1/deeplink"
+ACCESS_KEY = (os.getenv("COUPANG_ACCESS_KEY") or "").strip()
+SECRET_KEY = (os.getenv("COUPANG_SECRET_KEY") or "").strip()
+CHANNEL_ID = (os.getenv("COUPANG_CHANNEL_ID") or "").strip()  # 옵션
+SUBID_PREFIX = (os.getenv("COUPANG_SUBID_PREFIX") or "auto").strip() or "auto"
+REQUIRE_COUPANG_API = (os.getenv("REQUIRE_COUPANG_API") or "0").strip().lower() in ("1", "true", "yes", "on")
 
+UA = os.getenv("USER_AGENT") or "gpt-blog-auto/coupang-api-1.0"
 
-# -----------------------------
-# 내부 유틸
-# -----------------------------
-def _utc_signed_date() -> str:
-    # 예: 20250107T120102Z
-    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+def _now_utc() -> str:
+    # e.g., 2025-09-14T00:00:00Z
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _rfc3986(s: str) -> str:
-    # RFC3986 안전 문자만 허용(-_.~)하고 나머지는 퍼센트 인코딩
-    return quote(s, safe="-_.~")
-
-def _canonical_query(params: dict) -> str:
-    if not params:
-        return ""
-    items = []
-    for k in sorted(params.keys()):
-        v = "" if params[k] is None else str(params[k])
-        items.append(f"{_rfc3986(k)}={_rfc3986(v)}")
-    return "&".join(items)
-
-def _string_to_sign(method: str, path: str, query: str, signed_date: str, access_key: str) -> str:
-    # Coupang 문서 규칙:
-    # method + \n + path + \n + query + \n + signed-date + \n + access-key
-    return "\n".join([method.upper(), path, query, signed_date, access_key])
-
-def _signature_b64(sts: str, secret_key: str) -> str:
-    mac = hmac.new(secret_key.encode("utf-8"), sts.encode("utf-8"), hashlib.sha256).digest()
-    return base64.b64encode(mac).decode("utf-8")
-
-def _cea_header(access_key: str, signed_date: str, signature_b64: str) -> str:
-    return f"CEA algorithm=HmacSHA256, access-key={access_key}, signed-date={signed_date}, signature={signature_b64}"
-
-def _check_credentials():
-    if not (COUPANG_ACCESS_KEY and COUPANG_SECRET_KEY and COUPANG_CHANNEL_ID):
-        raise RuntimeError("Coupang credentials missing (COUPANG_ACCESS_KEY/SECRET_KEY/CHANNEL_ID)")
-
-
-# -----------------------------
-# HTTP 호출 (GET 우선 → 실패 시 POST)
-# -----------------------------
-def _deeplink_request_get(urls: List[str], sub_id: str) -> List[str]:
+def _auth_headers(method: str, path_with_query: str) -> dict:
     """
-    GET 방식:
-      params = {subId, channelId, coupangUrls(콤마구분 단건/다건)}
+    Coupang CEA 서명 헤더 생성.
+    message = x-coupang-date + \n + method + \n + path + \n + query
     """
-    method = "GET"
-    signed_date = _utc_signed_date()
-    params = {
-        "subId": sub_id,
-        "channelId": COUPANG_CHANNEL_ID,
-        "coupangUrls": ",".join(urls),
-    }
-    query = _canonical_query(params)
-    sts = _string_to_sign(method, DEEPLINK_PATH, query, signed_date, COUPANG_ACCESS_KEY)
-    sig = _signature_b64(sts, COUPANG_SECRET_KEY)
-    auth = _cea_header(COUPANG_ACCESS_KEY, signed_date, sig)
+    if not (ACCESS_KEY and SECRET_KEY):
+        raise RuntimeError("COUPANG_ACCESS_KEY/SECRET_KEY 누락")
 
-    headers = {
-        "Authorization": auth,
-        "X-Authorization-Date": signed_date,  # 일부 환경에서 필요
-        "User-Agent": USER_AGENT,
+    dt = _now_utc()
+    # path_with_query는 '/v2/.../deeplink' 또는 '/v2/.../deeplink?param=...' 형태
+    if "?" in path_with_query:
+        path, query = path_with_query.split("?", 1)
+        query = "?" + query
+    else:
+        path, query = path_with_query, ""
+
+    msg = f"{dt}\n{method.upper()}\n{path}\n{query}"
+    sig = base64.b64encode(
+        hmac.new(SECRET_KEY.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+
+    return {
+        "Authorization": f"CEA algorithm=HmacSHA256, access-key={ACCESS_KEY}, signed-date={dt}, signature={sig}",
+        "x-coupang-date": dt,
         "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": UA,
     }
 
-    if COUPANG_DEBUG:
-        print("[COUPANG DEBUG][GET] path:", DEEPLINK_PATH)
-        print("[COUPANG DEBUG][GET] query:", query)
-        print("[COUPANG DEBUG][GET] signed_date:", signed_date)
-        print("[COUPANG DEBUG][GET] sts:", sts)
-        print("[COUPANG DEBUG][GET] sig:", sig)
+def coupang_search_url(keyword: str) -> str:
+    """쿠팡 'www' 도메인의 안정적인 검색 페이지 URL(트래킹 파라미터 없음)."""
+    return f"https://www.coupang.com/np/search?component=&q={quote_plus(keyword)}&channel=rel"
 
-    resp = requests.get(f"{HOST}{DEEPLINK_PATH}", params=params, headers=headers, timeout=20, verify=VERIFY_TLS)
-    return _parse_response(resp, urls)
+def _gen_subid(base: Optional[str] = None) -> str:
+    ts = datetime.now(timezone.utc).strftime("%y%m%d%H%M%S")
+    prefix = (base or SUBID_PREFIX or "auto").strip()
+    return f"{prefix}-{ts}"
 
-def _deeplink_request_post(urls: List[str], sub_id: str) -> List[str]:
+def api_create_deeplink(urls: List[str], sub_id: Optional[str] = None) -> List[str]:
     """
-    POST 방식:
-      body = {"subId": "...", "channelId": "...", "coupangUrls": ["...", "..."]}
-      (서명은 query string 기준이므로 보통 query=빈문자열)
+    Coupang Partners 'deeplink' API로 단축/트래킹 링크 생성.
+    - urls: 원본 쿠팡 URL 리스트(검색 페이지 포함 가능)
+    - sub_id: 퍼포먼스 추적용 서브아이디(옵션)
+    반환: shortenUrl 또는 landingUrl 리스트
     """
-    method = "POST"
-    signed_date = _utc_signed_date()
-    query = ""  # POST는 보통 쿼리 없음
-    sts = _string_to_sign(method, DEEPLINK_PATH, query, signed_date, COUPANG_ACCESS_KEY)
-    sig = _signature_b64(sts, COUPANG_SECRET_KEY)
-    auth = _cea_header(COUPANG_ACCESS_KEY, signed_date, sig)
+    if not REQUIRE_COUPANG_API:
+        raise RuntimeError("REQUIRE_COUPANG_API 비활성")
 
-    headers = {
-        "Authorization": auth,
-        "X-Authorization-Date": signed_date,
-        "User-Agent": USER_AGENT,
-        "Content-Type": "application/json; charset=utf-8",
-    }
+    if not urls:
+        return []
+
     body = {
-        "subId": sub_id,
-        "channelId": COUPANG_CHANNEL_ID,
-        "coupangUrls": urls,  # 배열
+        "coupangUrls": urls,
+        # subId는 옵션. 채널 구분 원하면 사용.
+        "subId": (sub_id or _gen_subid())[:50],  # 길이 안전
     }
+    # 일부 환경에서 channelId를 요구할 수 있어 옵션으로 전달
+    if CHANNEL_ID:
+        body["channelId"] = CHANNEL_ID
 
-    if COUPANG_DEBUG:
-        print("[COUPANG DEBUG][POST] path:", DEEPLINK_PATH)
-        print("[COUPANG DEBUG][POST] signed_date:", signed_date)
-        print("[COUPANG DEBUG][POST] sts:", sts)
-        print("[COUPANG DEBUG][POST] sig:", sig)
-        print("[COUPANG DEBUG][POST] body:", json.dumps(body, ensure_ascii=False))
+    headers = _auth_headers("POST", DEEPLINK_PATH)
+    resp = requests.post(API_HOST + DEEPLINK_PATH, headers=headers, data=json.dumps(body), timeout=20)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"[deeplink] HTTP {resp.status_code}: {resp.text[:200]}")
 
-    resp = requests.post(f"{HOST}{DEEPLINK_PATH}", json=body, headers=headers, timeout=20, verify=VERIFY_TLS)
-    return _parse_response(resp, urls)
-
-def _parse_response(resp: requests.Response, fallback_urls: List[str]) -> List[str]:
-    if COUPANG_DEBUG:
-        print("[COUPANG DEBUG] status:", resp.status_code)
-        ct = resp.headers.get("content-type", "")
-        print("[COUPANG DEBUG] content-type:", ct)
-        try:
-            print("[COUPANG DEBUG] raw text:", resp.text[:800])
-        except Exception:
-            pass
-
-    if resp.status_code != 200:
-        raise RuntimeError(f"Coupang API {resp.status_code}: {resp.text}")
-
-    data = {}
-    try:
-        if resp.headers.get("content-type", "").lower().startswith("application/json"):
-            data = resp.json()
-    except Exception as e:
-        raise RuntimeError(f"Coupang API invalid JSON: {e}")
-
-    # 응답 예시 가정
-    # { "rCode": "0", "data": [ {"originUrl":"...","shortenUrl":"..."} ] }
-    arr = (data or {}).get("data") or []
-    if not isinstance(arr, list) or not arr:
-        # 비어 있으면 폴백
-        return fallback_urls
-
+    data = resp.json()
+    # 예상 구조: {"rCode":"OK","data":[{"originUrl":"...","shortenUrl":"https://link.coupang.com/a/...","landingUrl":"..."}]}
     out: List[str] = []
-    for i, item in enumerate(arr):
-        if not isinstance(item, dict):
-            out.append(fallback_urls[i] if i < len(fallback_urls) else fallback_urls[-1])
-            continue
-        u = item.get("shortenUrl") or item.get("landingUrl") or item.get("deeplinkUrl")
-        if not u:
-            u = fallback_urls[i] if i < len(fallback_urls) else fallback_urls[-1]
-        out.append(u)
+    for item in (data.get("data") or []):
+        u = item.get("shortenUrl") or item.get("landingUrl")
+        if isinstance(u, str) and u:
+            out.append(u)
     return out
 
-
-# -----------------------------
-# 퍼블릭 API
-# -----------------------------
-def deeplink_for_urls(urls: Iterable[str], sub_id: str | None = None) -> List[str]:
+def deeplink_for_search(keyword: str, *, sub_id: Optional[str] = None) -> str:
     """
-    주어진 원본 URL 목록(상품/검색)을 쿠팡 파트너스 딥링크로 변환.
-    - 1) GET 시도 → 2) 실패하면 POST 시도
-    - 둘 다 실패하면 예외 발생
+    '검색 결과 페이지' 딥링크를 우선 생성.
+    - API 사용 가능 → 검색 URL을 딥링크로 변환(트래킹 유지, 404 리스크 최소)
+    - 실패/비활성 → 일반 검색 URL 반환
     """
-    _check_credentials()
-    urls = [str(u) for u in urls if str(u).strip()]
-    if not urls:
-        raise ValueError("urls is empty")
+    search = coupang_search_url(keyword)
+    if REQUIRE_COUPANG_API and (ACCESS_KEY and SECRET_KEY):
+        try:
+            dl = api_create_deeplink([search], sub_id=sub_id or _gen_subid())
+            if dl and isinstance(dl[0], str):
+                return dl[0]
+        except Exception as e:
+            # 문제 시 즉시 안전 폴백
+            print(f"[deeplink_for_search] fallback to search URL: {e}")
+    return search
 
-    sub = sub_id or f"{COUPANG_SUBID_PREFIX}-{int(time.time())}"
+def deeplink_for_query(keyword: str) -> str:
+    """기존 호환용 별칭(검색 페이지 딥링크 우선)."""
+    return deeplink_for_search(keyword)
 
-    # 1st: GET
-    try:
-        return _deeplink_request_get(urls, sub)
-    except Exception as e_get:
-        if COUPANG_DEBUG:
-            print(f"[COUPANG DEBUG] GET failed → fallback to POST: {e_get}")
-
-    # 2nd: POST
-    return _deeplink_request_post(urls, sub)
-
-def deeplink_for_query(keyword: str, sub_id: str | None = None) -> str:
-    """
-    키워드를 쿠팡 검색 URL로 만든 뒤, 그 URL을 딥링크로 변환하여 반환.
-    실패 시 예외 발생(호출측에서 폴백 권장).
-    """
-    _check_credentials()
-    base_url = f"https://search.shopping.coupang.com/search?component=&q={quote_plus(keyword)}&channel=rel"
-    dl = deeplink_for_urls([base_url], sub_id=sub_id)
-    return dl[0] if dl else base_url
-
-
-# -----------------------------
-# 모듈 단독 테스트
-# -----------------------------
-if __name__ == "__main__":
-    import sys
-    what = " ".join(sys.argv[1:]).strip() or "무선 청소기"
-    try:
-        print("TRY deeplink_for_query:", what)
-        print(deeplink_for_query(what))
-    except Exception as e:
-        print("ERROR:", e)
+__all__ = [
+    "coupang_search_url",
+    "api_create_deeplink",
+    "deeplink_for_search",
+    "deeplink_for_query",
+]
